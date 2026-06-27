@@ -2,146 +2,246 @@
 
 ## Architecture Goal
 
-The first architecture should make Vurctne OS useful before it becomes complex.
+The first architecture for Vurctne OS should be simple, local-first, and useful before it becomes automated.
 
-The system starts with local files, explicit workflows, and reusable skills. It should avoid a heavy orchestration runtime until the team knows which parts of the workflow repeat often enough to automate.
+The system should begin as a project-folder operating layer for AI creative work. It should use files, workflows, memory, and skills as the foundation. MCP, plugins, and GUI layers should arrive later, after the local workflow proves itself.
 
-## Layer Model
+## High-Level Flow
 
 ```text
-Creator Project
-  -> Workspace File Layer
-  -> Workflow and Skill Layer
-  -> Memory Layer
-  -> Tool Adapter Layer
-  -> Orchestration Layer
-  -> Interface Layer
+User
+  -> Vurctne OS
+  -> Project Context
+  -> Agent Roles
+  -> Workflows
+  -> Memory
+  -> Skills
+  -> Outputs
 ```
 
-Only the first three layers are required for the MVP.
+## Layer Diagram
 
-## 1. Workspace File Layer
+```text
+Interface Layer
+  CLI now, GUI later
 
-The workspace file layer is the foundation. Every creative project should have a local folder with predictable files and folders.
+Subscription-First Execution Layer
+  official logins, copy-ready prompts, file handoff
 
-Expected responsibilities:
+Skill Layer
+  reusable workflow modules learned from repeated work
 
-- hold scripts, outlines, shot lists, prompts, assets, outputs, notes, and decisions
-- expose context to humans and agents without a private database requirement
-- support git or simple file backup
-- make failed automation easy to inspect
+Workflow Layer
+  markdown workflow definitions and prompt-pack processes
 
-Early project example:
+Memory Layer
+  profile, project memory, workflow memory, style memory, decision memory
+
+Agent Role Layer
+  Claude Code, Codex, Gemini, ChatGPT, Hermes Agent
+
+Project Context Layer
+  local files, folders, inputs, frames, analysis, prompts, outputs
+```
+
+## Local-First Project Folder System
+
+The local project folder is the source of truth.
+
+Each creative project should be understandable from files alone. A human, coding agent, or future MCP server should be able to open the folder and know:
+
+- what the project is
+- what input assets exist
+- what has been analyzed
+- what prompts were created
+- which outputs were produced
+- what decisions were made
+- what the system learned
+
+Starter folder:
 
 ```text
 project/
-  project.md
-  brief.md
-  script/
-  shots/
+  AGENTS.md
+  MEMORY.md
+  PROFILE.md
+  task.md
+  README.md
+  input/
+  frames/
+  analysis/
   prompts/
-  assets/
-  outputs/
-  memory/
-  decisions/
+  images/
+  videos/
+  final/
 ```
 
-## 2. Workflow And Skill Layer
+## Agent Roles
 
-Workflows describe repeatable production paths. Skills describe repeatable operations.
+Vurctne OS should define roles before it tries to automate orchestration.
+
+### Claude Code
+
+Role: CTO, executor, project automation engineer.
+
+Responsibilities:
+
+- create and modify project files
+- build simple scripts when needed
+- automate repeated local steps
+- keep implementation practical
+- avoid overbuilding
+
+### Codex
+
+Role: code review, implementation review, consistency checking.
+
+Responsibilities:
+
+- review architecture and implementation choices
+- check repo consistency
+- find missing docs and quality gaps
+- verify changes before completion
+
+### Gemini
+
+Role: video analysis and long-context research.
+
+Responsibilities:
+
+- analyze long videos and transcripts
+- compare references
+- extract structure from large context
+- support research-heavy workflow steps
+
+### ChatGPT
+
+Role: creative direction, prompt writing, visual judgment.
+
+Responsibilities:
+
+- write creative prompts
+- judge concept strength
+- improve scene and shot language
+- help with visual direction
+
+### Hermes Agent
+
+Role: future memory and self-learning layer.
+
+Responsibilities:
+
+- capture repeated decisions
+- summarize workflow learnings
+- update memory files
+- recommend new skills from repeated work
+
+Hermes Agent is a future concept, not part of the first implementation.
+
+## Memory Layer
+
+The memory layer should start as readable files.
+
+Memory types:
+
+- `PROFILE.md`: stable user and project preferences
+- `MEMORY.md`: accumulated project memory
+- project memory: facts and constraints for this project
+- workflow memory: what happened in the current workflow
+- style memory: recurring taste and visual rules
+- decision memory: why choices were made
+
+The system should learn decision patterns, not only facts.
+
+## Workflow Layer
+
+Workflows are repeatable production paths.
+
+The first flagship workflow is:
+
+```text
+Viral Video Reverse Engineering Workflow
+```
+
+It turns one viral video into a structured prompt pack through frame extraction, video analysis, shot breakdown, image prompts, video prompts, captions, and final packaging.
+
+Workflows should be markdown-first until repeated steps justify scripts.
+
+## Skill Layer
+
+Skills are reusable workflows learned from repeated work.
+
+Early skill examples:
+
+- Viral Video Analysis Skill
+- Kling Prompt Skill
+- AI Ad Film Skill
+- Vibe Coding Setup Skill
+- School Finance Automation Skill
+
+The first repository should document skill concepts before building a skill runtime.
+
+## Subscription-First Execution Layer
+
+The execution layer should prefer official subscription login workflows where possible.
 
 Examples:
 
-- turn a short-drama concept into a five-episode outline
-- convert a scene into a shot list
-- generate image prompts from character and location references
-- prepare video-generation prompts for Kling or Runway
-- review generated shots against continuity rules
+- Claude Code login for coding execution
+- Codex and ChatGPT login for review and creative prompting
+- Gemini CLI login for analysis and research
+- web subscriptions for Kling, Runway, Veo, Hailuo, and similar tools
 
-Workflows should be plain files first. A workflow can later be executed by scripts, agents, or MCP tools.
+The first version can create copy-ready prompts and file handoff instructions. API keys may be supported later but should not be required now.
 
-## 3. Memory Layer
+## Future MCP Layer
 
-Memory captures reusable learning from projects.
+MCP should be added after the local project model is stable.
 
-Memory should store:
+Future MCP capabilities:
 
-- creator preferences
-- project-specific decisions
-- prompt patterns that worked
-- tool-specific constraints
-- visual continuity notes
-- quality checklists
+- expose project context to agents
+- query memory safely
+- run approved workflow steps
+- package outputs
+- connect tool adapters
+- enforce permission boundaries
 
-Memory must be inspectable and editable. The first version can use markdown or JSON files before introducing a database.
+MCP should not replace the local file system as the source of truth.
 
-## 4. Tool Adapter Layer
+## Future Plugin Layer
 
-Tool adapters represent integrations with external AI tools.
+Plugins can eventually support:
 
-First-stage adapters should be conservative:
+- new workflow packs
+- new tool adapters
+- new skill packs
+- import and export formats
+- community integrations
 
-- generate copy-ready prompts
-- prepare files for upload
-- record expected output locations
-- support browser or desktop handoff
+The plugin layer should wait until workflows and skills are stable enough to extend.
 
-Later adapters may automate browser sessions or APIs where allowed.
+## Future GUI Layer
 
-## 5. Orchestration Layer
+A GUI can eventually help non-technical creators:
 
-MCP should be added after the file and workflow model is stable.
+- create projects
+- inspect memory
+- run workflows
+- view frames and prompts
+- package final outputs
 
-MCP can eventually provide:
-
-- tool discovery
-- structured context access
-- controlled execution
-- long-running workflow coordination
-- safe boundaries between local project data and external tools
-
-MCP is not required for the first MVP.
-
-## 6. Interface Layer
-
-The interface layer can be a desktop app, local web UI, CLI, or editor integration.
-
-The MVP should not depend on a polished interface. A thin UI can help users browse project context, run workflows, and inspect memory, but the durable system of record remains the project folder.
-
-## Future Package Boundaries
-
-Potential package boundaries:
-
-- `packages/core` for shared domain types and validation
-- `packages/workspace` for project-folder templates and file operations
-- `packages/workflows` for workflow definitions and runners
-- `packages/skills` for reusable skill packaging
-- `packages/adapters` for tool-specific handoff logic
-- `packages/memory` for memory capture and retrieval
-- `packages/ui` for a future desktop or web shell
-
-These are placeholders, not immediate implementation requirements.
+The first version should not build a GUI. The local project folder and docs should come first.
 
 ## Security And Privacy
 
-Vurctne OS will handle creative IP, account sessions, and potentially private files. The architecture should assume:
+Vurctne OS will handle creative IP and local project files.
 
-- no secrets committed to git
-- no API keys required for the first workflow
-- no hidden upload of project files
-- clear user consent before using browser automation or external services
-- local-first storage by default
+Rules:
 
-## First AI Video Flow
-
-The first end-to-end workflow should look like this:
-
-1. User creates a local AI video project.
-2. Vurctne OS stores the brief, script, references, and constraints.
-3. A workflow produces scene breakdowns and shot prompts.
-4. The user hands prompts and assets to subscribed tools.
-5. Generated outputs are saved back into the project folder.
-6. The system records what worked as project memory and reusable skill improvements.
-
-This flow is intentionally simple. It proves the operating model before adding heavy automation.
-
+- do not commit secrets
+- do not store account sessions in project files
+- do not upload files without explicit user intent
+- do not require API keys for the first workflow
+- keep memory inspectable and editable
+- make external handoff clear to the user

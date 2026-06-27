@@ -1,74 +1,132 @@
 # Vision
 
-## Thesis
+## The Big Idea
 
-AI creators already pay for powerful tools, but those tools do not behave like a coordinated team. Each product has its own chat history, file model, memory, prompt style, and output format. The creator becomes the integration layer by copying context, rewriting prompts, tracking versions, and remembering what worked.
+Vurctne OS is not just a workflow tool.
 
-Vurctne OS exists to make that integration layer explicit, local, reusable, and eventually automated.
+It is intended to become a personal AI operating system that learns how the user thinks, works, creates, decides, and improves.
 
-## Product Promise
+The first version starts with local folders and markdown because that is the smallest reliable foundation. The long-term goal is larger: an AI creative team that can remember project context, understand user style, reuse proven workflows, and coordinate existing AI subscriptions without making the user copy-paste everything manually.
 
-Vurctne OS turns a creator's existing AI subscriptions into a self-learning creative team.
+## Personal AI OS
 
-It should help a creator:
+A personal AI operating system is not a new model. It is the layer that coordinates the models and tools a person already uses.
 
-- keep project context in durable local files
-- reuse production workflows instead of rewriting prompts
-- hand off work between AI tools with less copy-paste
-- learn from completed projects
-- preserve ownership of project memory and creative assets
-- add deeper orchestration later without locking the system to one vendor
+For creators, that means Vurctne OS should know:
 
-## First Users
+- the user's creative taste
+- the user's preferred structure for projects
+- the user's prompt style
+- the user's visual standards
+- the user's editing and publishing habits
+- the user's repeated decision patterns
+- the current state of every active project
 
-The first users are AI video creators who use tools such as ChatGPT, Claude, Gemini, Codex, Kling, Runway, Midjourney, ComfyUI, CapCut, and related products.
+This memory should live in files first, not hidden inside a private cloud.
 
-They are not asking for another model. They need a production layer that remembers the project, coordinates tools, and keeps creative work moving.
+## AI Creative Team
 
-## Strategic Positioning
+Vurctne OS treats AI tools like team members:
 
-Vurctne OS should not compete with foundation-model products directly. It should sit above them as a local creative operating layer.
+- ChatGPT can act as creative director, prompt writer, and visual judge.
+- Claude Code can act as CTO, executor, and project automation engineer.
+- Codex can act as implementation reviewer, code reviewer, and consistency checker.
+- Gemini can act as video analyst, long-context researcher, and source reviewer.
+- Runway, Kling, Veo, Hailuo, and ComfyUI can act as image and video production systems.
+- Hermes Agent can become the future memory and self-learning layer.
 
-The system should treat AI tools like team members with different strengths:
+The user remains the director. Vurctne OS makes the team remember the brief, the rules, the files, the workflow, and the lessons learned.
 
-- writing and reasoning tools for scripts, breakdowns, plans, and reviews
-- coding agents for project automation and local tooling
-- image and video tools for visual generation
-- editing and packaging tools for production delivery
+## Self-Learning Workflows
 
-## Core Principles
+Most AI work repeats.
 
-### Subscription First
+A creator may repeatedly:
 
-Many creators already pay for web subscriptions. The first product should respect that reality. Prefer login-based workflows and browser/app handoff where practical, while avoiding brittle or policy-hostile automation.
+- analyze viral videos
+- extract frames
+- identify shot structure
+- build image prompts
+- build video prompts
+- compare generated outputs
+- rewrite captions
+- package final prompt packs
 
-### Files First
+Vurctne OS should make repeated work visible, then turn it into reusable workflows and skills.
 
-Files are the first stable protocol. A project folder can be read by humans, agents, scripts, and future MCP servers. It is debuggable, portable, versionable, and resilient.
+The goal is not to automate everything immediately. The goal is to capture what is repeatable, test it, and promote it into a skill only when it is useful.
 
-### Memory That Can Be Inspected
+## Memory
 
-Memory should not be a hidden black box. The user should be able to see what the system learned, edit it, delete it, and reuse it across projects.
+Memory is more than remembering facts.
 
-### Skills Over One-Off Prompts
+Vurctne OS should learn how the user makes decisions:
 
-Repeated creative operations should become named skills or workflows. A good skill captures input format, process, quality gates, output format, and examples.
+- what the user rejects
+- what the user repeats
+- what style rules matter
+- which prompts work for which tools
+- which output defects happen often
+- which workflow steps are worth automating
 
-### Modular Before Platform
+This memory should be readable, editable, and portable.
 
-The system should start as a small set of clear modules. A marketplace, plugin platform, and heavy orchestration layer can come later if the MVP proves demand.
+## Skills
 
-## Long-Term Vision
+A skill is a reusable workflow learned from repeated work.
 
-Vurctne OS becomes a personal AI studio that can:
+Examples:
 
-- understand a creator's style and production preferences
-- coordinate multiple AI tools through local files, browser handoff, and MCP
-- maintain project memory across scripts, scenes, shots, prompts, assets, and edits
-- package repeatable workflows as open-source skills
-- let creators own their production process instead of being trapped inside isolated chats
+- Viral Video Analysis Skill
+- Kling Prompt Skill
+- AI Ad Film Skill
+- Vibe Coding Setup Skill
+- School Finance Automation Skill
 
-## Success Definition
+Skills should start as documents and templates. Later, they can become executable modules, MCP tools, or marketplace packages.
 
-Vurctne OS succeeds if a creator can finish more production work with less context loss, fewer repeated prompts, and a clearer record of decisions and outputs.
+## Creator-First Direction
 
+The first target user is an AI creator or creator-entrepreneur who produces videos, ads, cinematic prompts, social content, and lightweight software tools.
+
+The product should prioritize the reality of creative work:
+
+- messy inputs
+- many tools
+- many versions
+- fast iteration
+- subjective judgment
+- style consistency
+- deadlines
+- local files
+- reusable project memory
+
+Vurctne OS should help creators finish work, not force them into a rigid enterprise workflow.
+
+## Subscription-First Direction
+
+Many creators already pay for AI subscriptions. The first version should respect that.
+
+Vurctne OS should prefer official login workflows where practical:
+
+- Claude Code login
+- Codex and ChatGPT login
+- Gemini CLI login
+- web subscriptions for video tools
+
+API keys can be supported later, but they should not be required for the first version.
+
+## Long-Term Potential
+
+If the foundation works, Vurctne OS can grow into:
+
+- a local project brain for creators
+- a skill system for repeatable AI workflows
+- a memory layer that learns decision patterns
+- an orchestration layer that connects AI tools through MCP
+- a plugin layer for community workflows
+- a GUI for non-technical creators
+- a Vurctne Skills ecosystem for workflow packs
+- the open-source AI operating system layer underneath VI Studio
+
+The path starts small: one local project, one flagship workflow, one useful prompt pack.

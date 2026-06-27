@@ -1,74 +1,145 @@
 # Vurctne OS
 
-Vurctne OS is an open-source personal AI operating system for creators who already use tools like ChatGPT, Claude, Gemini, Codex, Kling, Runway, and other AI products.
+Vurctne OS is an open-source personal AI operating system that turns existing AI subscriptions into a self-learning creative team.
 
-The goal is simple: turn existing AI subscriptions into a self-learning creative team without forcing creators to copy-paste context between every tool.
+It is for creators and builders who already use ChatGPT, Claude, Gemini, Codex, Runway, Kling, ComfyUI, Veo, Hailuo, CapCut, DaVinci Resolve, and other AI tools, but are tired of manually copying context between them.
 
-## Current Status
+## The Problem
 
-This repository is in foundation design mode.
+Modern AI creators do not use one tool. They use many:
 
-There is no production app, no full runtime, and no automation system yet. The first version should define the operating model clearly, then build the smallest useful workflow for AI video production.
+- ChatGPT for creative direction, prompt writing, and visual judgment
+- Claude Code for execution, project automation, and vibe coding
+- Codex for code review, implementation review, and consistency checking
+- Gemini for video understanding, long-context analysis, and research
+- Runway, Kling, Veo, Hailuo, and similar platforms for video generation
+- ComfyUI for local image and video workflows
+- DaVinci Resolve, Premiere, or CapCut for editing and publishing
 
-## Principles
+These tools are powerful, but they do not share context, memory, project state, or workflow history. The creator becomes the operating system by copying prompts, re-explaining decisions, moving files, and remembering what worked.
 
-1. Prefer subscription login workflows over API keys where practical and permitted.
-2. Use files and local project context as the first stable communication layer.
-3. Add MCP later as the orchestration layer, not as the first dependency.
-4. Support self-learning memory and reusable skills.
-5. Start with AI video production workflows.
-6. Keep modules separable and open-source friendly.
-7. Do not overbuild the first version.
+Vurctne OS exists to remove that friction.
 
-## First Project Structure
+## What Vurctne OS Is
+
+Vurctne OS is a local-first operating layer for AI creative work.
+
+The first version is not a complex app. It is a clear project structure, documentation system, workflow format, memory model, and starter template for AI video production.
+
+The first public demo is the **Viral Video Reverse Engineering Workflow**:
+
+```text
+viral video input
+  -> frame extraction
+  -> video analysis
+  -> shot breakdown
+  -> image prompts
+  -> Kling / Runway prompts
+  -> publishing captions
+  -> final prompt pack
+```
+
+## What It Is Not
+
+Vurctne OS is not:
+
+- another generic agent framework
+- a chatbot replacement
+- a full desktop OS
+- a GUI-first product
+- a marketplace in version one
+- an API-key-first automation framework
+- a complete MCP orchestration system yet
+- a tool that replaces ChatGPT, Claude, Gemini, Codex, Kling, Runway, or ComfyUI
+
+The first version should stay small enough to understand, run, and improve.
+
+## Core Principles
+
+1. Prefer official subscription login workflows where possible.
+2. Do not require API keys for the first version unless absolutely necessary.
+3. Use local files and project context as the stable communication layer.
+4. Add MCP orchestration later, after the local foundation works.
+5. Learn from repeated work and turn workflows into reusable skills.
+6. Remember user preferences, style, project rules, and decision patterns.
+7. Keep the system modular, open-source friendly, and easy to extend.
+8. Start with AI video production workflows.
+9. Do not overbuild the first public demo.
+
+## Founder Brand Context
+
+Vurctne OS sits underneath the Vurctne ecosystem:
+
+- **Vurctne**: parent developer and creator brand
+- **Vurctne OS**: open-source personal AI operating system
+- **VI Studio**: AI video creation and advertising workflow layer, full name Vurctne Imagination
+- **Vurctne Skills**: future workflow and skill marketplace
+
+The open-source foundation should be useful on its own, while also supporting future Vurctne creative products.
+
+## Current Project Status
+
+This repository is in foundation mode.
+
+Created now:
+
+- project vision and manifesto
+- architecture outline
+- phased roadmap
+- tight MVP definition
+- agent instructions
+- contribution guide
+- documentation pages
+- flagship workflows
+- local project template
+- script and example placeholders
+
+Not created yet:
+
+- production CLI
+- dependency setup
+- GUI
+- MCP server
+- marketplace
+- browser automation
+- cloud sync
+
+## Repository Structure
 
 ```text
 VurctneOS/
   README.md
   VISION.md
+  MANIFESTO.md
   ARCHITECTURE.md
   ROADMAP.md
   MVP.md
   AGENTS.md
+  CONTRIBUTING.md
+  LICENSE
   docs/
-    decisions/
-  examples/
-    video-production/
   workflows/
-  skills/
-  packages/
+  templates/project-template/
+  scripts/
+  examples/
 ```
 
-The empty directories are placeholders for later work. They should stay light until the MVP proves which abstractions are actually needed.
+## Planned Roadmap
 
-## Document Map
+- Phase 0: foundation documentation and repository structure
+- Phase 1: local project workflow
+- Phase 2: viral video reverse engineering workflow
+- Phase 3: memory and skill capture
+- Phase 4: agent orchestration
+- Phase 5: MCP integration
+- Phase 6: creator workflow packs
+- Phase 7: community and open-source ecosystem
+- Phase 8: marketplace and commercial layers
 
-- `VISION.md` explains why Vurctne OS exists and what it should become.
-- `ARCHITECTURE.md` defines the first technical boundaries.
-- `ROADMAP.md` lays out staged delivery without overbuilding.
-- `MVP.md` defines the first useful product slice.
-- `AGENTS.md` gives coding-agent instructions for future work in this repository.
+See `ROADMAP.md` for detail.
 
-## Initial MVP Theme
+## Early-Stage Disclaimer
 
-The first MVP is an AI video production workspace:
+Vurctne OS is an early-stage open-source project. The architecture, license, workflow format, and implementation details may change as the first real creator workflow is tested.
 
-- one local project folder per creative project
-- durable context files for script, shots, assets, prompts, decisions, and outputs
-- reusable workflow templates for common video-production jobs
-- simple memory capture from completed work
-- manual or semi-automated handoff into subscription-based AI tools
-
-## Non-Goals For The First Version
-
-- A full desktop operating system.
-- A universal agent marketplace.
-- Full MCP orchestration.
-- Browser automation for every AI website.
-- Replacing ChatGPT, Claude, Gemini, Kling, Runway, or Codex.
-- Requiring paid API keys before there is a proven creator workflow.
-
-## License
-
-License is not selected yet. Before the first public release, choose a real open-source license and add `LICENSE`.
-
+The foundation is intentionally practical: local files first, subscription-first execution, memory that humans can inspect, and automation only where it proves useful.

@@ -1,127 +1,171 @@
 # Roadmap
 
-## Phase 0: Foundation
+## Phase 0: Foundation Documentation And Repo Structure
 
-Goal: define the project clearly without building the full system.
-
-Deliverables:
-
-- repository and documentation structure
-- vision, architecture, roadmap, and MVP definition
-- initial agent instructions
-- decision log folder
-- first AI video production example folder
-
-Exit criteria:
-
-- a contributor can explain what Vurctne OS is
-- the MVP scope is clear
-- non-goals are explicit
-- no large runtime has been started prematurely
-
-## Phase 1: File-Based AI Video MVP
-
-Goal: prove that a local project workspace can reduce copy-paste and context loss.
+Goal: create a clear open-source foundation without building the full system.
 
 Deliverables:
 
-- project-folder template for AI video production
-- workflow templates for brief, script, scene, shot, prompt, output, and review
-- simple memory files for creator preferences and project learnings
-- manual handoff instructions for subscribed tools
-- validation checklist for completed workflows
+- README, vision, manifesto, architecture, roadmap, MVP, and agent instructions
+- contribution guide and license placeholder
+- docs for getting started, creator workflow, memory, skills, and subscription-first direction
+- workflows for viral video reverse engineering and vibe coding
+- local project template
+- scripts and examples placeholders
 
-Exit criteria:
+Success criteria:
 
-- one real AI video project can run through the workflow
-- outputs are traceable to prompts and source context
-- useful project memory is captured without a database
+- a stranger on GitHub can understand Vurctne OS in less than 60 seconds
+- the first MVP is clearly limited
+- the repo has no unnecessary dependencies
+- the project structure supports future work without overbuilding
 
-## Phase 2: Assisted Handoff
+## Phase 1: Local Project Workflow
 
-Goal: make external tool handoff faster while staying conservative.
-
-Deliverables:
-
-- prompt packaging for major tool categories
-- file preparation helpers
-- output intake conventions
-- optional browser or desktop handoff experiments where allowed
-
-Exit criteria:
-
-- creator spends less time preparing prompts and files
-- handoff remains inspectable and reversible
-- no fragile automation becomes a core dependency
-
-## Phase 3: Skills And Memory
-
-Goal: turn repeated work into reusable skills.
+Goal: make the local project folder usable for one real creator project.
 
 Deliverables:
 
-- skill format
-- examples for AI video tasks
-- memory update process
-- quality gates for workflow outputs
-- import/export of skills and memory packs
+- finalized project template
+- project creation instructions
+- task file convention
+- memory update convention
+- prompt pack convention
+- manual validation checklist
 
-Exit criteria:
+Success criteria:
 
-- users can reuse a skill across projects
-- memory can improve future workflows
+- a user can copy the template and start a project
+- agents can understand the project from files alone
+- project context stays local and readable
+
+## Phase 2: Viral Video Reverse Engineering Workflow
+
+Goal: run the flagship workflow from one input video to one final prompt pack.
+
+Deliverables:
+
+- input video placement rules
+- frame extraction step description
+- video analysis prompts
+- shot breakdown format
+- image prompt format
+- Kling and Runway prompt format
+- caption output format
+- final prompt pack format
+
+Success criteria:
+
+- one input video produces a structured prompt pack
+- each output can be traced to source context
+- manual and semi-automated steps are clearly separated
+
+## Phase 3: Memory And Skill Capture
+
+Goal: capture what the system learns from repeated creative work.
+
+Deliverables:
+
+- memory file schema
+- project memory examples
+- style memory examples
+- decision memory examples
+- skill template
+- first reusable skill drafts
+
+Success criteria:
+
+- completed work updates memory in a readable way
+- repeated steps can become skills
 - users can inspect and edit what was learned
 
-## Phase 4: MCP Orchestration
+## Phase 4: Agent Orchestration
 
-Goal: add structured orchestration only after file workflows are proven.
+Goal: define practical cooperation between Claude Code, Codex, Gemini, ChatGPT, and future Hermes Agent.
 
 Deliverables:
 
-- local MCP server for project context
+- agent role playbooks
+- handoff files between agents
+- review workflow
+- consistency checks
+- orchestration rules that avoid overbuilding
+
+Success criteria:
+
+- each agent role has a clear job
+- project files remain the shared context
+- handoffs reduce copy-paste instead of adding complexity
+
+## Phase 5: MCP Integration
+
+Goal: add MCP only after the local workflow is proven.
+
+Deliverables:
+
+- local MCP server design
+- project context tools
+- memory query tools
 - workflow execution tools
-- memory query and update tools
-- tool-adapter discovery
-- permission boundaries
+- permission model
 
-Exit criteria:
+Success criteria:
 
-- MCP improves workflow reliability
+- MCP improves reliability and ergonomics
 - local files remain the source of truth
-- orchestration does not hide project state
+- users understand what each MCP tool can access
 
-## Phase 5: Open-Source Ecosystem
+## Phase 6: Creator Workflow Packs
 
-Goal: let the community extend Vurctne OS safely.
+Goal: package repeatable creator workflows for reuse.
 
 Deliverables:
 
-- contribution guide
-- plugin or skill publishing model
-- example workflows
-- test fixtures
-- security and privacy review process
+- AI video workflow pack
+- AI ad film workflow pack
+- short drama workflow pack
+- vibe coding workflow pack
+- import and export conventions
 
-Exit criteria:
+Success criteria:
 
-- contributors can add workflows without changing core runtime
-- users can trust what a skill or adapter can access
-- project governance is clear
+- users can reuse workflows across projects
+- workflows include prompts, folder rules, memory rules, and output standards
+- workflow packs remain readable and versionable
 
-## Near-Term Priorities
+## Phase 7: Community And Open-Source Ecosystem
 
-1. Finalize license choice.
-2. Create the first AI video project template.
-3. Define the workflow file format.
-4. Define the memory file format.
-5. Run one real production project through the manual MVP.
-6. Only then decide which helpers should become code.
+Goal: make contribution practical and safe.
 
-## Open Questions
+Deliverables:
 
-- Which license best supports an open-source personal AI OS and commercial creator use?
-- Should the first interface be CLI, local web UI, desktop app, or editor-first?
-- Which AI video workflow should be the first reference example?
-- Which subscription tools should be supported by handoff templates first?
-- What memory format is simplest while staying future-proof?
+- contribution process
+- issue templates
+- workflow contribution standards
+- skill contribution standards
+- review checklist
+- governance notes
 
+Success criteria:
+
+- contributors can add docs, workflows, and skills without touching core runtime
+- project direction remains coherent
+- licensing is settled before serious public release
+
+## Phase 8: Marketplace And Commercial Layers
+
+Goal: explore Vurctne Skills and commercial layers after the open-source foundation is useful.
+
+Deliverables:
+
+- skill package model
+- quality standard for paid workflow packs
+- compatibility rules
+- creator attribution model
+- commercial boundary document
+
+Success criteria:
+
+- open-source core remains useful
+- commercial layers do not compromise local-first principles
+- users understand what is free, open, paid, or proprietary

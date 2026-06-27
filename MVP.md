@@ -2,138 +2,121 @@
 
 ## MVP Name
 
-Vurctne OS AI Video Workspace
+Vurctne OS Viral Video Reverse Engineering MVP
 
-## MVP Objective
+## Tight Definition
 
-Help an AI video creator move one project from idea to generated assets with less context loss and less repeated prompting.
+The MVP is not the whole OS.
 
-The MVP should prove the operating model:
+The MVP is a local CLI or folder workflow that turns one input video into a structured prompt pack.
 
-- files as shared context
-- workflows as repeatable production paths
-- skills as reusable operations
-- memory as inspectable learning
-- subscription tools as external team members
+The first implementation can be mostly manual. The important part is that the project folder, workflow files, memory files, and output files make the process repeatable.
 
-## Target User
+## User Story
 
-An AI creator producing short films, short dramas, ads, music videos, or social video content with a mix of chat, image, video, coding, and editing tools.
+As an AI video creator, I want to place one viral reference video into a project folder and turn it into a structured prompt pack, so I can recreate the creative pattern with tools like ChatGPT, Gemini, Kling, Runway, and Claude Code without losing context.
 
-## Core User Story
+## Inputs
 
-As an AI video creator, I want one local project workspace that keeps my brief, script, characters, scenes, prompts, generated assets, decisions, and learnings together, so I can move between AI tools without rebuilding context every time.
+Required:
 
-## MVP Scope
+- one input video file
+- project brief or intent
+- target platform, for example TikTok, YouTube Shorts, Reels, or ad creative
+- target style or product context
 
-### In Scope
+Optional:
 
-- local project-folder convention
-- markdown-first project files
-- AI video workflow templates
-- reusable prompt and skill templates
-- project memory file
-- creator preference file
-- manual handoff to subscription tools
-- output intake convention
-- quality review checklist
+- transcript
+- screenshots
+- brand notes
+- creator preferences
+- reference images
+- previous prompt examples
 
-### Out Of Scope
+## Outputs
 
-- full desktop OS
-- full browser automation
-- universal MCP orchestration
-- account/session management
-- payments
-- cloud sync
-- multi-user collaboration
+The MVP should produce:
+
+- frame selection notes
+- video analysis summary
+- hook and structure breakdown
+- shot-by-shot breakdown
+- visual style notes
+- image generation prompts
+- Kling or Runway video prompts
+- publishing caption options
+- final prompt pack
+- memory update notes
+
+## Included
+
+- local project template
+- markdown workflow instructions
+- manual frame extraction slot
+- analysis file format
+- prompt file format
+- final pack format
+- profile and memory templates
+- clear agent roles
+
+## Excluded
+
+- full GUI
 - marketplace
-- production plugin system
-- required API integrations
+- cloud sync
+- complex MCP orchestration
+- automatic account login
+- required API keys
+- full video editor integration
+- production-grade browser automation
+- multi-user collaboration
 
-## Minimal Project Folder
+## Manual Steps
 
-```text
-my-video-project/
-  project.md
-  brief.md
-  preferences.md
-  memory.md
-  script/
-    outline.md
-    scenes.md
-  production/
-    shot-list.md
-    continuity.md
-  prompts/
-    image-prompts.md
-    video-prompts.md
-    review-prompts.md
-  assets/
-    references/
-    generated/
-  outputs/
-  decisions/
-```
+The user or agent may manually:
 
-## First Workflow
+1. Create the project from the template.
+2. Place the input video in `input/`.
+3. Extract representative frames into `frames/`.
+4. Ask Gemini or another video-capable tool to analyze the video.
+5. Ask ChatGPT or Claude to create creative prompts.
+6. Paste prompts into Kling, Runway, or another video tool.
+7. Save outputs into `images/`, `videos/`, or `final/`.
 
-1. Create project brief.
-2. Capture creator preferences.
-3. Draft or import script.
-4. Break script into scenes.
-5. Convert scenes into shot list.
-6. Generate image and video prompts.
-7. Hand prompts and assets to subscribed tools.
-8. Save outputs into the project folder.
-9. Review outputs against continuity and style rules.
-10. Record what worked into project memory.
+## Semi-Automated Steps
 
-## First Skills
+The first lightweight scripts may later help:
 
-Potential first skills:
+1. create a new project folder
+2. generate starter task files
+3. collect frame names
+4. assemble prompt files into a final prompt pack
+5. package outputs
 
-- `script-to-scenes`
-- `scene-to-shot-list`
-- `character-continuity-check`
-- `shot-to-image-prompt`
-- `shot-to-video-prompt`
-- `output-review`
-- `memory-update`
+No dependencies should be added until a step is repeated enough to justify automation.
 
-These should start as documented templates, not a heavy execution runtime.
+## Success Criteria
 
-## Data Model
+The MVP succeeds when:
 
-The MVP data model should be plain files:
+- one input video produces one complete prompt pack
+- the prompt pack is usable in Kling or Runway
+- the project can be understood from local files alone
+- the workflow captures useful memory about decisions and style
+- a second project can reuse the same workflow with less effort
 
-- markdown for human-readable context
-- JSON only where structured validation is clearly useful
-- file naming conventions instead of a database
-- links between files by relative path
+## Demo Script
 
-## Handoff Model
-
-The first handoff model is copy-ready and file-ready:
-
-- prepare prompt blocks for each target tool
-- list required reference files
-- describe expected output naming
-- record where outputs should be saved
-
-Browser automation and MCP orchestration can come later.
-
-## Validation
-
-The MVP is valid when:
-
-- a creator can run one real AI video project through the folder workflow
-- another agent or human can understand the project state from files alone
-- outputs can be traced back to prompts and source context
-- at least one repeated operation becomes a reusable skill
-- project memory improves the next workflow pass
-
-## Build Rule
-
-Do not build a full platform before this MVP is proven. Add code only when a repeated manual step has become clear enough to automate.
-
+1. Copy `templates/project-template/` into a new project folder.
+2. Rename the project and fill in `README.md`, `PROFILE.md`, and `task.md`.
+3. Add the reference video to `input/`.
+4. Extract or manually save key frames into `frames/`.
+5. Use `workflows/viral-video-reverse-engineering.md` to guide analysis.
+6. Save video analysis in `analysis/video-analysis.md`.
+7. Save shot breakdown in `analysis/shot-breakdown.md`.
+8. Save image prompts in `prompts/image-prompts.md`.
+9. Save Kling or Runway prompts in `prompts/video-prompts.md`.
+10. Save publishing captions in `prompts/captions.md`.
+11. Save final assembled pack in `final/prompt-pack.md`.
+12. Update `MEMORY.md` with what worked, what failed, and what should become reusable.

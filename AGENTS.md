@@ -2,11 +2,17 @@
 
 This repository is the foundation for Vurctne OS, an open-source personal AI operating system for AI creators.
 
+## Project Purpose
+
+Vurctne OS turns existing AI subscriptions into a self-learning creative team.
+
+The first public direction is AI video production, starting with the Viral Video Reverse Engineering Workflow.
+
 ## Current Phase
 
-The project is in foundation and MVP-design mode.
+The project is in foundation mode.
 
-Do not start building the full system unless the user explicitly asks for implementation. Prefer clear documents, small validated prototypes, and file-first workflow templates.
+Do not build the full system yet. Prefer clear markdown, simple project templates, workflow definitions, and small scripts only when a repeated manual step is obvious.
 
 ## Required Reading
 
@@ -14,50 +20,73 @@ Before making substantive changes, read:
 
 - `README.md`
 - `VISION.md`
+- `MANIFESTO.md`
 - `ARCHITECTURE.md`
 - `MVP.md`
 - `ROADMAP.md`
+- `docs/subscription-first.md`
+- `docs/memory-system.md`
+- `docs/skills-system.md`
 
-## Product Principles
+## Brand Rules
 
-- Prefer subscription login workflows over API keys where practical and permitted.
-- Use files and local project context as the first stable communication layer.
-- Add MCP later as the orchestration layer.
-- Support inspectable memory and reusable skills.
-- Start with AI video production workflows.
-- Keep modules small, separable, and open-source friendly.
-- Do not overbuild the first version.
+- Vurctne is the parent developer and creator brand.
+- Vurctne OS is the open-source personal AI operating system.
+- VI Studio is the AI video creation and advertising workflow layer.
+- VI means Vurctne Imagination.
+- Vurctne Skills is the future workflow and skill marketplace.
 
-## Engineering Guidance
+Use these names consistently.
 
-- Keep changes tightly scoped.
-- Do not add a runtime, framework, package manager, or build system without explicit approval.
-- Do not introduce secrets, API keys, tokens, or account credentials.
-- Treat local files as the source of truth.
-- Prefer markdown and simple structured files until automation is justified.
-- Preserve human readability in project, workflow, skill, and memory files.
-- Document important decisions in `docs/decisions/`.
+## Writing Rules
 
-## Repository Structure
+- Avoid the English long em dash character.
+- Use commas, colons, parentheses, short hyphens, or new lines instead.
+- Keep documentation practical and ambitious.
+- Explain what exists now versus what is future direction.
+- Do not pretend future systems are already implemented.
 
-- `docs/decisions/` stores architecture and product decisions.
-- `examples/video-production/` will hold reference project examples.
-- `workflows/` will hold workflow templates.
-- `skills/` will hold reusable skill templates.
-- `packages/` is reserved for future code packages after the MVP validates what should be automated.
+## Safety Rules
 
-## Git And GitHub
+- Do not commit secrets, tokens, browser profiles, session files, private creator assets, or account credentials.
+- Avoid APIs unless the user explicitly asks for API-based integration.
+- Prefer official subscription login workflows where practical and permitted.
+- Do not automate websites in ways that violate platform terms.
+- Preserve local-first behavior.
 
-- Keep commits intentional and small.
-- Do not commit generated secrets, local account state, browser profiles, or private creative assets.
-- If creating public GitHub artifacts, make licensing state explicit before claiming the project is fully open source.
+## Repository Rules
+
+- Do not delete source files or project documents unless the user explicitly asks.
+- Do not overbuild.
+- Prefer markdown and simple scripts first.
+- Do not add package managers, frameworks, build systems, MCP servers, or GUI code without explicit approval.
+- Preserve modular architecture.
+- Always update docs when making structural changes.
+- Keep project folders readable by humans and AI agents.
+
+## Architecture Rules
+
+- Local files are the first stable communication layer.
+- Workflows should be markdown-first until automation is justified.
+- Memory should be inspectable and editable.
+- Skills should be reusable workflow patterns, not hidden magic.
+- MCP comes later, after local workflows prove useful.
+- Plugin and marketplace layers come after the open-source foundation is coherent.
+
+## Agent Role Defaults
+
+- Claude Code: CTO, executor, project automation.
+- Codex: code review, implementation review, consistency checking.
+- Gemini: video analysis and long-context research.
+- ChatGPT: creative direction, prompt writing, visual judgment.
+- Hermes Agent: future memory and self-learning layer.
 
 ## Definition Of Done
 
 A change is done when:
 
-- the affected documents are internally consistent
+- affected documents are internally consistent
+- no forbidden long em dash characters were introduced
 - the repository still reflects a documentation-first foundation
 - no full-system implementation has been introduced accidentally
-- basic file and git status checks have been run
-
+- git status has been checked
