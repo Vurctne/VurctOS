@@ -6,6 +6,42 @@ The first architecture for VurctOS should be assistant-first, local-memory-backe
 
 The system should begin with the VurctOS Core Assistant as the product center. Project folders remain important, but they are the first local context and memory substrate, not the product center. The Core Assistant uses files, workflows, memory, skills, and agent roles to coordinate creative work. MCP, plugins, and GUI layers should arrive later, after the assistant-first local model proves itself.
 
+## System Overview
+
+Three parts work together: memory (how the user works), local context (the project state), and the worker layer (where work runs). Claude acts as the Orchestrator that reads the first two, drives the third, and writes back.
+
+```text
+                          You (director)
+                    intent / decisions / judgment
+                                 |
+                                 v
+              CLAUDE = Orchestrator (the brain)
+          read first  ->  act and delegate  ->  write back
+            |                     |                      |
+       read |               drive |                write |
+            v                     v                      v
+  +-------------------+ +--------------------+ +-----------------------+
+  | 1  MEMORY         | | 2  WORKER LAYER    | | 3  LOCAL CONTEXT      |
+  | across projects   | | does the work      | | this project, now     |
+  |                   | |                    | |                       |
+  | PROFILE prefs     | | Local tools (auto):| | project folder/       |
+  | style, decisions  | |  ffmpeg, Whisper,  | |  input/  frames/      |
+  | what worked,      | |  ComfyUI, scripts  | |  analysis/ prompts/   |
+  | what failed       | | Web tools (handoff)| |  final/  BOARD.md      |
+  | durable, editable | |  ChatGPT, Kling... | | single source of truth |
+  +---------^---------+ +---------+----------+ +-----------+-----------+
+            |                     | outputs                |
+            | capture lessons     +----------------------->| save to files
+            +------------------------------------------------+
+            loop: outputs return to context, lessons enter memory
+```
+
+- Memory is what carries across projects: stable preferences, style rules, decisions, and what worked or failed. Durable and editable. It means the user never has to re-explain how they work.
+- Local context is this project's current state held as files, the single source of truth that every tool and person reads. It means the user never has to re-paste the project background between tools.
+- The worker layer is where work actually runs. Local tools run automatically; web tools go through human handoff. This layer is not blocked by tool terms of service, because it runs on the user's own Claude subscription and local compute, with web tools kept human-in-the-loop.
+
+Before each action the Orchestrator reads memory and local context, then uses the worker layer to do the work, writing outputs back into context and lessons into memory. Each loop makes the system fit the user better.
+
 ## High-Level Flow
 
 The Core Assistant is realized by Claude acting as Orchestrator, which runs the canonical loop defined in `CORE.md`:
