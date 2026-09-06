@@ -25,6 +25,7 @@ Design rules (see AGENTS.md):
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -1303,13 +1304,18 @@ def _pick_card(cards):
     return None
 
 
-def _set_card_status(board_path, card, new_status):
-    """Flip the chosen card's status line, atomically.
+def _set_card_status(board_path, card, new_status, expect=None):
+    """Flip the chosen card's status line atomically. Return whether it did.
 
     Targets the exact block by the '_line' index recorded at parse time (not
     a fresh id search), so a duplicate id elsewhere in the file can never
     cause the wrong card, least of all a handoff-channel one, to be flipped.
-    Errors out if the board changed underneath us.
+    Errors out if the board changed underneath us. `expect` is the set of
+    current statuses this flip may replace: anything else means someone
+    changed the card mid-run, and their edit is left alone. The set always
+    includes the statuses a run must never be able to grant itself, so an
+    executor that writes `status: done` onto its own card is overruled
+    rather than preserved: only a human moves work past review.
     """
     lines = board_path.read_text(encoding="utf-8").splitlines()
     idx = card["_line"]
@@ -1322,6 +1328,9 @@ def _set_card_status(board_path, card, new_status):
         if line.startswith("- id:") or (line and not line.startswith(" ")):
             break
         if line.strip().startswith("status:"):
+            if expect is not None and \
+                    line.split(":", 1)[1].strip() not in expect:
+                return False
             indent = line[:len(line) - len(line.lstrip())]
             lines[j] = f"{indent}status: {new_status}"
             done = True
@@ -1331,6 +1340,7 @@ def _set_card_status(board_path, card, new_status):
     tmp = board_path.with_suffix(".md.tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, board_path)
+    return True
 
 
 def _dispatch_prompt(card, agent="claude"):
@@ -1419,24 +1429,90 @@ def _run_agent(agent, prompt, project, timeout):
     return runner(prompt, project, timeout)
 
 
-def _card_complete(project, card):
-    """Done only if the handoff AND every expected output actually exist.
+def _output_paths(project, card):
+    """Relative paths of the handoff plus every expected output.
 
-    Every checked path must resolve inside the project; an absolute or
-    ../-escaping path never counts as complete, so a pre-existing file
-    outside the project can not spoof success.
+    None when any of them resolves outside the project, so an absolute or
+    ../-escaping path is refused before the agent is ever launched.
     """
     handoff = card.get("handoff") or f"handoffs/{card['id']}.md"
-    root = project.resolve()
-    for p in [handoff] + list(card["expected_outputs"]):
-        full = (project / p).resolve()
-        try:
-            full.relative_to(root)
-        except ValueError:
-            return False
-        if not full.exists():
-            return False
-    return True
+    rels = [handoff] + list(card["expected_outputs"])
+    for rel in rels:
+        if _resolve_in_project(project, rel) is None:
+            return None
+    return rels
+
+
+def _resolve_in_project(project, rel):
+    """The resolved path for `rel`, or None when it escapes the project.
+
+    Re-resolved on every call on purpose: a run can replace a missing
+    output with a symlink pointing outside the project, so containment
+    checked only before the run would not hold after it.
+    """
+    full = (project / rel).resolve()
+    try:
+        full.relative_to(project.resolve())
+    except ValueError:
+        return None
+    return full
+
+
+UNREADABLE = "unreadable"
+
+
+def _output_hash(project, rel):
+    """sha256 of the in-project regular file at `rel`.
+
+    UNREADABLE when it exists but cannot be read, None when it is absent or
+    is not a regular file. The three are kept apart so an unreadable file
+    can fail closed instead of looking like a fresh write.
+
+    Content, not a timestamp: mtime is not a write detector (coarse
+    filesystems can put two writes in one tick, restored timestamps look
+    unwritten, and `touch` looks written), while a hash answers the only
+    question that matters, whether this content is new. Read in chunks so a
+    large artifact cannot exhaust memory and strand a claimed card.
+    """
+    full = _resolve_in_project(project, rel)
+    if full is None or not full.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with full.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return UNREADABLE
+    return digest.hexdigest()
+
+
+def _output_state(project, rels):
+    """Content hash of every output right now, keyed by relative path."""
+    return {rel: _output_hash(project, rel) for rel in rels}
+
+
+def _unwritten(project, rels, before):
+    """Outputs this run did not actually produce, as readable reasons.
+
+    Existence alone is spoofable: a card whose expected output already sat
+    in the project would otherwise pass with the agent doing nothing. An
+    output counts only if its content differs from before the run.
+    """
+    problems = []
+    for rel in rels:
+        if _resolve_in_project(project, rel) is None:
+            problems.append(f"{rel} (resolves outside the project)")
+            continue
+        now = _output_hash(project, rel)
+        was = before.get(rel)
+        if now is None:
+            problems.append(f"{rel} (missing, or not a regular file)")
+        elif UNREADABLE in (now, was):
+            problems.append(f"{rel} (unreadable, cannot verify)")
+        elif now == was:
+            problems.append(f"{rel} (unchanged by this run)")
+    return problems
 
 
 def cmd_dispatch(args):
@@ -1457,13 +1533,39 @@ def cmd_dispatch(args):
         print(prompt)
         return
 
+    def block(reason, expect):
+        # The lesson is filed either way; only the board flip is guarded, so
+        # a status a human changed mid-run is reported, never overwritten.
+        _file_memory(project, "fail",
+                     f"dispatch ({agent}) blocked {card['id']}: {reason}", "")
+        if _set_card_status(board, card, "blocked", expect=expect):
+            print(f"card {card['id']} -> blocked: {reason}")
+        else:
+            print(f"card {card['id']} failed, but its status changed during "
+                  f"the run; leaving the board alone. Reason: {reason}")
+
+    # Path safety first, so an escaping card is settled even when the
+    # chosen CLI turns out to be missing.
+    rels = _output_paths(project, card)
+    if rels is None:
+        block("an expected output or handoff path resolves outside the "
+              "project", expect=("ready",))
+        return
     if shutil.which(agent) is None:
         sys.exit(f"error: `{agent}` CLI not found on PATH. Install it and "
                  f"log in first.")
+
     print(f"dispatching card {card['id']} to {agent}: "
           f"{card.get('title', '(untitled)')}")
     print("  note: this runs the card's instructions with edits accepted; "
           "only dispatch boards whose cards you authored or reviewed.")
+    # Claim the card before running it, so a crash or a killed run leaves
+    # visible in-progress state instead of a card that still looks ready.
+    if not _set_card_status(board, card, "in-progress",
+                            expect=("ready",)):
+        sys.exit(f"error: card {card['id']} is no longer ready; re-run "
+                 f"dispatch")
+    before = _output_state(project, rels)
     try:
         rc, out, err = _run_agent(agent, prompt, project, args.timeout)
     except subprocess.TimeoutExpired:
@@ -1471,22 +1573,34 @@ def cmd_dispatch(args):
 
     limit_hit = re.search(r"hit your .{0,30}limit", out + err,
                           re.IGNORECASE) is not None
-    if _card_complete(project, card) and rc == 0:
-        _set_card_status(board, card, "review")
-        _file_memory(project, "tool",
-                     f"dispatch ({agent}) ran {card['id']} -> review", "")
-        print(f"card {card['id']} -> review (handoff + outputs verified)")
+    problems = _unwritten(project, rels, before)
+    if rc == 0 and not problems:
+        if _set_card_status(board, card, "review",
+                            expect=("in-progress", "done")):
+            _file_memory(project, "tool",
+                         f"dispatch ({agent}) ran {card['id']} -> review", "")
+            print(f"card {card['id']} -> review (handoff + outputs verified)")
+        else:
+            print(f"card {card['id']} succeeded but its status changed "
+                  f"during the run; leaving the board alone. Review the "
+                  f"outputs and set the status yourself.")
+        return
+    if limit_hit:
+        reason = "usage limit reached"
     else:
-        _set_card_status(board, card, "blocked")
-        reason = "usage limit reached" if limit_hit else \
-            (err or "run did not produce the expected handoff/outputs")
-        _file_memory(project, "fail",
-                     f"dispatch ({agent}) blocked {card['id']}: "
-                     f"{reason[:200]}", "")
-        print(f"card {card['id']} -> blocked: {reason[:200]}")
-        if limit_hit:
-            print("usage limit hit; stop dispatching until the reset time "
-                  "shown above.")
+        parts = []
+        if err.strip():
+            # Truncate the agent's own message, never the problem list: a
+            # long traceback must not push out what was missing. Collapse
+            # whitespace, since a day-log entry is one line.
+            parts.append(" ".join(err.split())[:200])
+        if problems:
+            parts.append("did not produce: " + ", ".join(problems))
+        reason = "; ".join(parts) or "the run failed without a message"
+    block(reason, expect=("in-progress", "review", "done"))
+    if limit_hit:
+        print("usage limit hit; stop dispatching until the reset time "
+              "shown above.")
 
 
 def _file_memory(project, kind, what, evidence):

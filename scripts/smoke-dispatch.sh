@@ -11,7 +11,7 @@
 #   sh scripts/smoke-dispatch.sh --agent codex --negative
 #
 # Run the positive case once after install (per agent), then re-run only
-# after changing dispatch, _child_env, _run_*, or _card_complete.
+# after changing dispatch, _child_env, _run_*, _output_paths, or the output verification helpers.
 set -eu
 
 mode="positive"
@@ -38,7 +38,7 @@ proj="$tmp/smoke"
 
 if [ "$mode" = "negative" ]; then
   # Deterministic failure: the expected output resolves OUTSIDE the
-  # project, so _card_complete must refuse it and the card must land in
+  # project, so dispatch must refuse it before running and the card must land in
   # blocked, no matter what the model does.
   expected="../escape.txt"
   notes="Write only the handoff file. Do not create any file outside the project directory."

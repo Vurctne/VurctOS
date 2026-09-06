@@ -216,7 +216,7 @@ Review is delegated to the agent that did not produce the work:
 - Codex reviews Claude as Executor output for correctness and consistency.
 - Claude reviews Codex output when Codex executed a card.
 
-Dispatched cards move to `review`, never straight to `done`. A rejected card files the lesson into memory and re-queues the work.
+A dispatched card is claimed as `in-progress` while it runs and then moves to `review`, never straight to `done`; it only reaches `review` if the run actually wrote its handoff and expected outputs. A rejected card files the lesson into memory and re-queues the work.
 
 ## 8. Learning Summary
 

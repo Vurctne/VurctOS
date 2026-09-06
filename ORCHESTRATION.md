@@ -11,7 +11,7 @@ Now (v1, markdown-first, no API keys required):
 - Claude (via Claude Code subscription login) acts as the Orchestrator.
 - The task board, agent profiles, handoffs, memory, and skills are all plain files.
 - Work is coordinated by Claude reading and writing those files, not by a background runtime.
-- `vurctos dispatch` claims and runs one `ready` + `channel: local` board card headlessly on the subscription (one card per invocation; the result goes to `review`, never `done`). `--agent {claude,codex}` selects the executor. `vurctos reject` files review feedback into memory and re-queues the card.
+- `vurctos dispatch` claims one `ready` + `channel: local` board card as `in-progress` and runs it headlessly on the subscription (one card per invocation; the result goes to `review`, never `done`, and only when the run actually wrote its handoff and expected outputs). `--agent {claude,codex}` selects the executor. `vurctos reject` files review feedback into memory and re-queues the card.
 
 Future (only after the local model proves useful):
 

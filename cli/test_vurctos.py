@@ -1125,6 +1125,239 @@ class VurctosDispatchTest(unittest.TestCase):
             vurctos.main(["dispatch", "--project", str(self.proj)])
         self.assertEqual(self._board(), before)  # nothing mutated
 
+    def test_card_is_claimed_in_progress_before_the_agent_runs(self):
+        # A crash or a killed run must leave visible state, not a card that
+        # still looks untouched and would be silently re-dispatched.
+        seen = {}
+
+        def fake(prompt, project, timeout):
+            seen["board"] = self._board()
+            raise subprocess.TimeoutExpired("claude", timeout)
+        vurctos._run_claude = fake
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        claimed = seen["board"].split("- id: card-102")[1]
+        self.assertIn("status: in-progress", claimed)
+        # card-101 (a handoff-channel card) is never touched.
+        self.assertIn("status: ready", seen["board"].split("- id: card-102")[0])
+        # A timeout still resolves the claim rather than leaving it hanging.
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_preexisting_output_does_not_count_as_produced(self):
+        # Existence alone is spoofable: an output already lying in the
+        # project would otherwise pass with the agent doing nothing.
+        (self.proj / "analysis").mkdir(exist_ok=True)
+        stale = self.proj / "analysis" / "org.md"
+        stale.write_text("left over from an earlier run", encoding="utf-8")
+
+        def handoff_only(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            return 0, "{}", ""
+        vurctos._run_claude = handoff_only
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+        self.assertIn("analysis/org.md (unchanged by this run)", out)
+        self.assertEqual(stale.read_text(encoding="utf-8"),
+                         "left over from an earlier run")
+        # A later run that genuinely writes both outputs does count.
+        def rewrites(prompt, project, timeout):
+            (project / "handoffs" / "card-102.md").write_text(
+                "a second, different handoff", encoding="utf-8")
+            (project / "analysis" / "org.md").write_text(
+                "produced now", encoding="utf-8")
+            return 0, "{}", ""
+        board = self._board().replace("status: blocked", "status: ready")
+        (self.proj / "BOARD.md").write_text(board, encoding="utf-8")
+        vurctos._run_claude = rewrites
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: review",
+                      self._board().split("- id: card-102")[1])
+
+    def test_byte_identical_output_is_treated_as_not_produced(self):
+        # Content hashing cannot tell "rewrote the same bytes" from "did
+        # nothing", so it blocks and lets a human decide. A false block
+        # costs one review; a false pass would bank unverified work.
+        def writes_same(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "analysis").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "same", encoding="utf-8")
+            (project / "analysis" / "org.md").write_text(
+                "same", encoding="utf-8")
+            return 0, "{}", ""
+        vurctos._run_claude = writes_same
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: review",
+                      self._board().split("- id: card-102")[1])
+        board = self._board().replace("status: review", "status: ready")
+        (self.proj / "BOARD.md").write_text(board, encoding="utf-8")
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("unchanged by this run", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_directory_named_as_output_is_not_accepted(self):
+        def makes_a_directory(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            (project / "analysis" / "org.md").mkdir(parents=True)
+            return 0, "{}", ""
+        vurctos._run_claude = makes_a_directory
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("analysis/org.md (missing, or not a regular file)", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_output_symlinked_outside_the_project_is_refused(self):
+        # Containment checked only before the run would not hold: the path
+        # did not exist then, and the run can make it a symlink pointing out.
+        secret = self.root / "outside.md"
+        secret.write_text("not the project's", encoding="utf-8")
+
+        def symlinks_out(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            (project / "analysis").mkdir(exist_ok=True)
+            (project / "analysis" / "org.md").symlink_to(secret)
+            return 0, "{}", ""
+        vurctos._run_claude = symlinks_out
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("analysis/org.md (resolves outside the project)", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_a_crash_leaves_the_card_claimed_in_progress(self):
+        def explodes(prompt, project, timeout):
+            raise RuntimeError("the runner died")
+        vurctos._run_claude = explodes
+        with self.assertRaises(RuntimeError):
+            vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: in-progress",
+                      self._board().split("- id: card-102")[1])
+        # A stuck card is not silently re-run: dispatch only picks `ready`.
+        vurctos._run_claude = lambda p, pr, t: (_ for _ in ()).throw(
+            AssertionError("re-ran a card stuck in-progress"))
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("no card with status: ready", out)
+
+    def test_status_changed_during_the_run_is_not_overwritten(self):
+        def succeeds_but_board_moved(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            (project / "analysis").mkdir(exist_ok=True)
+            (project / "analysis" / "org.md").write_text(
+                "ok", encoding="utf-8")
+            board = self._board().replace("status: in-progress",
+                                          "status: blocked")
+            (project / "BOARD.md").write_text(board, encoding="utf-8")
+            return 0, "{}", ""
+        vurctos._run_claude = succeeds_but_board_moved
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status changed during the run", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_failed_run_does_not_overwrite_a_changed_status(self):
+        # A non-terminal status a human parked the card at is preserved.
+        def fails_after_board_moved(prompt, project, timeout):
+            board = self._board().replace("status: in-progress",
+                                          "status: backlog")
+            (project / "BOARD.md").write_text(board, encoding="utf-8")
+            return 1, "", "the agent failed"
+        vurctos._run_claude = fails_after_board_moved
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status changed during the run", out)
+        self.assertIn("status: backlog",
+                      self._board().split("- id: card-102")[1])
+        self.assertNotIn("status: blocked", self._board())
+        # The lesson is still filed even though the board was left alone.
+        self.assertIn("blocked card-102", _today_log(self.proj))
+
+    def test_long_stderr_never_pushes_out_the_missing_outputs(self):
+        def noisy_failure(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            return 1, "", "boom\n" * 400
+        vurctos._run_claude = noisy_failure
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("did not produce: analysis/org.md", out)
+        reason = out.split("-> blocked: ")[1]
+        self.assertNotIn("\n", reason.rstrip("\n"))  # one line for the day log
+        self.assertIn("blocked card-102", _today_log(self.proj))
+
+    def test_unreadable_output_fails_closed(self):
+        (self.proj / "analysis").mkdir(exist_ok=True)
+        locked = self.proj / "analysis" / "org.md"
+        locked.write_text("secret", encoding="utf-8")
+        locked.chmod(0o000)
+
+        def handoff_only(prompt, project, timeout):
+            (project / "handoffs").mkdir(exist_ok=True)
+            (project / "handoffs" / "card-102.md").write_text(
+                "ok", encoding="utf-8")
+            return 0, "{}", ""
+        vurctos._run_claude = handoff_only
+        try:
+            out = _out(["dispatch", "--project", str(self.proj)])
+        finally:
+            locked.chmod(0o644)
+        self.assertIn("analysis/org.md (unreadable, cannot verify)", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_a_run_cannot_grant_itself_done(self):
+        # The prompt tells an executor not to touch BOARD.md, but a card
+        # runs with edits accepted, so the board must enforce it: no run
+        # moves its own work past review, whether it succeeded or failed.
+        def marks_itself_done(rc, err):
+            def run(prompt, project, timeout):
+                board = self._board().replace("status: in-progress",
+                                              "status: done")
+                (project / "BOARD.md").write_text(board, encoding="utf-8")
+                if rc == 0:
+                    (project / "handoffs").mkdir(exist_ok=True)
+                    (project / "analysis").mkdir(exist_ok=True)
+                    (project / "handoffs" / "card-102.md").write_text(
+                        "ok", encoding="utf-8")
+                    (project / "analysis" / "org.md").write_text(
+                        "ok", encoding="utf-8")
+                return rc, "{}", err
+            return run
+
+        vurctos._run_claude = marks_itself_done(0, "")
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        block = self._board().split("- id: card-102")[1]
+        self.assertIn("status: review", block)   # pulled back for review
+        self.assertNotIn("status: done", block)
+
+        board = self._board().replace("status: review", "status: ready")
+        (self.proj / "BOARD.md").write_text(board, encoding="utf-8")
+        vurctos._run_claude = marks_itself_done(1, "failed")
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        block = self._board().split("- id: card-102")[1]
+        self.assertIn("status: blocked", block)
+        self.assertNotIn("status: done", block)
+
+    def test_escaping_path_is_refused_before_the_agent_runs(self):
+        escape_board = BOARD_TWO_CARDS.replace(
+            "    - analysis/org.md", "    - ../evil.md")
+        (self.proj / "BOARD.md").write_text(escape_board, encoding="utf-8")
+
+        def must_not_run(*a, **k):
+            raise AssertionError("the agent ran for an escaping card")
+        vurctos._run_claude = must_not_run
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("outside the project", out)
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
     def test_escaping_expected_output_never_counts_complete(self):
         escape_board = BOARD_TWO_CARDS.replace(
             "    - analysis/org.md", "    - ../evil.md")
