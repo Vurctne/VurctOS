@@ -59,7 +59,3 @@ Memory should capture decisions, patterns, preferences, and workflow lessons, no
 - Required inputs:
 - Expected outputs:
 - Quality checks:
-
-## Session Updates
-
-Timestamped entries appended by `vurctos remember`. Newest entries are added at the end, each linking to its day log in `sessions/`. Keep this section last so appends stay in order. Curate the sections above from these entries over time.

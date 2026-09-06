@@ -26,11 +26,12 @@ python3 cli/vurctos.py remember --project my-project \
   --kind style --evidence "shot 3 accepted, shot 5 rejected"
 ```
 
-Files one memory entry into all three inspectable places at once:
+Files one memory entry into session recall:
 
-- a timestamped bullet under `## Session Updates` in `MEMORY.md` (durable memory)
-- an entry in the day log `sessions/<date>.md` (session recall)
+- an entry in the day log `sessions/<date>.md`
 - a row in `sessions/index.db`, the local SQLite full-text index
+
+Durable memory (`USER.md`, `MEMORY.md`) is not touched: only an approved `reflect-apply` writes there, so every durable line has been consolidated on purpose. `remember` ends with a one-line status of what is waiting to be reflected.
 
 `--kind` is one of `decision`, `style`, `tool`, `fail`, or `note` (default `note`). `--evidence` is optional. `--date YYYY-MM-DD` overrides today. The CLI only files what you give it; deciding what is worth remembering stays with Claude as Orchestrator.
 
@@ -67,7 +68,16 @@ python3 cli/vurctos.py reflect-apply --project my-project
 
 `reflect` collects the session day logs not yet reflected (since the last `reflections/.last-reflected` marker, or `--since DATE`) and stages a proposal at `reflections/<date>.md` with empty sections: additions to `USER.md`, additions to `MEMORY.md`, exact lines to prune, and skill candidates. Claude as Orchestrator distills the logs into that proposal (it does not copy them raw); a human reviews, edits, and sets `status: approved`.
 
-`reflect-apply` refuses unless the proposal is approved, then mechanically appends the additions under a dated `## Reflected Updates` block in `USER.md` / `MEMORY.md`, removes the exact prune lines, and advances the marker so those sessions are not reflected again. This is the loop that lets memory get sharper over time instead of just longer: distill, prune, and keep a human in the loop so a wrong distilled fact never silently poisons later sessions.
+`reflect-apply` refuses unless the proposal is approved, and validates the whole proposal before writing anything: every prune target must match exactly one line in `USER.md` / `MEMORY.md`, and an empty proposal must carry a Rationale. Then it appends the additions under a dated `## Reflected Updates` block, removes the prune lines, and advances the cursor (`reflections/.last-reflected`: the last reflected date plus how many of that day's entries were consumed, so entries filed later the same day are still picked up next time). The proposal records the cursor it was staged against (`cursor-before`) and the one it advances to (`cursor-after`), so an apply after the cursor moved is refused, and entries filed while the proposal was being written stay unreflected. Only one proposal can be pending at a time; an applied proposal is kept as the record, so a second one on the same date is staged as `<date>-2.md`. This is the loop that lets memory get sharper over time instead of just longer: distill, prune, and keep a human in the loop so a wrong distilled fact never silently poisons later sessions.
+
+### Memory status (the backlog dashboard)
+
+```bash
+python3 cli/vurctos.py memory-status --project my-project
+python3 cli/vurctos.py memory-status --global
+```
+
+Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Once the backlog reaches 30 entries (`--stage-at N`, 0 disables) and no draft is waiting, it stages an empty `reflections/<today>.md` so there is a concrete file to fill instead of a command to remember. `--hook` prints the same facts as a Claude Code `SessionStart` payload; both shipped nudge hooks call it.
 
 ### Global memory (cross-project)
 
@@ -81,7 +91,7 @@ python3 cli/vurctos.py reflect --global
 
 The global root is created and seeded on first use. It mirrors the project layout (`USER.md`, `MEMORY.md`, `sessions/` + index, `reflections/`) but holds what is true of the user across ALL projects: decision patterns, taste, recurring corrections. Add `@~/.vurctos/USER.md` to your `~/.claude/CLAUDE.md` and the distilled global memory loads in every Claude Code session, in every project. Promote a lesson from a project into global memory only when it is repeated, accepted, and useful beyond that project (see docs/memory-system.md).
 
-A `SessionStart` hook shipped in the project template nudges the assistant when session day-logs pile up unconsolidated, so the reflect loop gets driven instead of forgotten.
+Two `SessionStart` hooks drive the reflect loop instead of leaving it to be remembered: the project template ships one (`vurctos new` bakes in the CLI path), and `templates/global-hook/vurctos-global-nudge.sh` is the user-level one for `~/.vurctos` (install steps in `docs/memory-system.md`). Both call `memory-status --hook`.
 
 ### Dispatch (run one board card via headless Claude or Codex)
 
@@ -111,7 +121,7 @@ To verify dispatch end to end against a real logged-in CLI once (the unit tests 
 python3 cli/vurctos.py reject card-001 --project my-project --reason "pacing too slow in shot 3"
 ```
 
-When a `review` card fails your review, one command closes the learning loop: the reason is filed as a `fail` entry through all three memory layers, stamped into the card's `notes:` (so the re-run prompt carries the feedback explicitly), and the card flips back to `ready` for the next dispatch. The re-run starts with the lesson twice over: in its prompt and in `MEMORY.md`. Rejection reasons are the highest-value learning signal; never let one evaporate.
+When a `review` card fails your review, one command closes the learning loop: the reason is filed as a `fail` entry into the day log and the index (it reaches `MEMORY.md` through the next approved reflection), stamped into the card's `notes:` (so the re-run prompt carries the feedback explicitly), and the card flips back to `ready` for the next dispatch. Rejection reasons are the highest-value learning signal; never let one evaporate.
 
 ### Promote a proven pattern to a skill
 

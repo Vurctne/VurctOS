@@ -134,7 +134,7 @@ VurctOS uses a three-layer memory model, adapted as a design inspiration from th
 
 All four memory commands (`remember`, `recall`, `reflect`, `reflect-apply`) also accept `--global`, which targets a user-level root at `~/.vurctos` with the same layout, for memory that should persist across all projects rather than one. Global memory is bridged into both tools: into Claude Code via `@`-imports in `CLAUDE.md`, and into Codex via a prose `AGENTS.md` bridge (Codex has no `@`-import). See `docs/memory-system.md`.
 
-The Orchestrator reads durable memory and relevant skills before acting (loop steps 2 and 3) and appends to durable memory and session logs after review (loop steps 8 and 9). Memory stays human-readable and editable. VurctOS never becomes a hidden memory black box.
+The Orchestrator reads durable memory and relevant skills before acting (loop steps 2 and 3), appends to the session logs after review (loop steps 8 and 9), and folds them into durable memory only through the human-gated `reflect` / `reflect-apply`. Memory stays human-readable and editable. VurctOS never becomes a hidden memory black box.
 
 ## 6. Skills: The SKILL.md Open Standard
 

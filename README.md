@@ -98,7 +98,8 @@ Shipped (v1):
   - `vurctos new` scaffolds a project from the template
   - `vurctos remember` / `vurctos recall` file and full-text search session memory (SQLite FTS5 index, with a LIKE fallback that also covers CJK text); `recall --stats` reports what is indexed
   - `vurctos reindex` rebuilds the search index from the session day-logs
-  - `vurctos reflect` / `vurctos reflect-apply` run the human-gated consolidation loop: reflect stages an empty proposal from the session day-logs, a human fills and approves it, reflect-apply mechanically prunes and appends it into durable memory (it refuses to run until status is `approved`)
+  - `vurctos reflect` / `vurctos reflect-apply` run the human-gated consolidation loop: reflect stages an empty proposal from the session day-logs, a human fills and approves it, reflect-apply mechanically prunes and appends it into durable memory (it refuses to run until status is `approved`, and writes nothing if any part of the proposal fails validation). `reflect-apply` is the only writer of `USER.md` / `MEMORY.md`; `remember` captures into the day-log and index only
+  - `vurctos memory-status` shows the reflect backlog, the cursor, and any waiting draft, and stages an empty draft once the backlog is large; the shipped `SessionStart` nudge hooks call it
   - `vurctos dispatch` / `vurctos reject` are the single-card agent layer (see below)
   - `vurctos skill-new` scaffolds an empty SKILL.md skeleton for a proven, repeated pattern
 - three-layer file memory, all plain inspectable files: durable (`USER.md` + `MEMORY.md`), procedural (`skills/` in the SKILL.md format), and session recall (`sessions/<date>.md` + the SQLite index)
@@ -110,7 +111,7 @@ Agent layer (deliberately minimal, one card at a time):
 
 - `vurctos dispatch --project P [--agent {claude,codex}]` picks the first board card that is both `ready` and `channel: local`, runs it once through a headless agent on the existing subscription (API and cloud credentials, including Codex billing tokens, are stripped from the child environment), verifies the expected output files landed inside the project, and moves the card to `review` on success or `blocked` on failure. It never marks a card `done`; a human or Codex reviews it.
 - Codex runs as an executor either directly (`--agent codex`) or through a delegation subagent wrapper (native Claude subagents are Claude-only, so Codex is invoked as a wrapper subagent).
-- `vurctos reject <card-id> --reason "..."` files the reason as a memory lesson across all three layers, stamps it into the card, and re-queues the card as `ready` so the feedback rides along on the next dispatch.
+- `vurctos reject <card-id> --reason "..."` files the reason as a memory lesson (day log plus index; it reaches durable memory through the next approved reflection), stamps it into the card, and re-queues the card as `ready` so the feedback rides along on the next dispatch.
 - This is a single-run command, not a loop: repeated dispatch means repeated invocation (for example from cron), not a daemon.
 
 Not created yet:

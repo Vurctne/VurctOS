@@ -33,7 +33,7 @@ Open both files and treat their contents as known context before you plan or act
 
 User-level global memory lives outside this project at `~/.vurctos/USER.md` and `~/.vurctos/MEMORY.md`. In Codex, that global layer is loaded once per session from `~/.codex/AGENTS.md` (see `docs/memory-system.md`); it is not re-read here.
 
-Do not write to any of these durable-memory files directly. Filing and consolidating memory is human-gated and goes through the `vurctos remember` / `vurctos reflect` CLI, not through an agent editing the files.
+Do not write to any of these durable-memory files directly. Capture goes through `vurctos remember` (day log and index only); the durable files change only through the human-gated `vurctos reflect` / `reflect-apply`, never through an agent editing them.
 
 ## Working Rules
 

@@ -44,7 +44,8 @@ Run from this folder (`--project .`):
 - `vurctos remember --project . --what "..."`: file a memory entry.
 - `vurctos recall --project . "<query>"`: search past entries (`--stats` for index stats).
 - `vurctos reindex --project .`: rebuild the session search index.
-- `vurctos reflect --project .` then `vurctos reflect-apply --project .`: stage and apply a human-approved consolidation of session logs into durable memory.
+- `vurctos reflect --project .` then `vurctos reflect-apply --project .`: stage and apply a human-approved consolidation of session logs into durable memory (the only way `USER.md` / `MEMORY.md` get written).
+- `vurctos memory-status --project .`: show the reflect backlog and any waiting draft; stages an empty draft once the backlog is large.
 - `vurctos dispatch --project . --agent {claude,codex}`: run one ready card via the chosen agent; the card moves to review, never straight to done.
 - `vurctos reject <card-id> --project . --reason "..."`: reject reviewed work, file the lesson, and re-queue the card.
 - `vurctos skill-new <name> --project .`: scaffold a project skill for a human to review before first use.

@@ -25,8 +25,10 @@ Design rules (see AGENTS.md):
 
 import argparse
 import datetime
+import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -45,6 +47,12 @@ def cmd_new(args):
     if not TEMPLATE_DIR.exists():
         sys.exit(f"error: template not found at {TEMPLATE_DIR}")
     shutil.copytree(TEMPLATE_DIR, dest)
+    # The session-start nudge runs inside the project and has no other way
+    # to find this CLI, so bake the path in.
+    hook = dest / ".claude" / "hooks" / "reflect-nudge.sh"
+    hook.write_text(hook.read_text(encoding="utf-8").replace(
+        "__VURCTOS_CLI__", shlex.quote(str(Path(__file__).resolve()))),
+        encoding="utf-8")
     print(f"created project: {dest}")
     print("next:")
     print(f"  1. fill in {args.name}/USER.md and {args.name}/task.md")
@@ -56,20 +64,27 @@ def cmd_new(args):
 #
 # These commands do the mechanical filing only. The judgment about what is
 # worth remembering stays with Claude as Orchestrator, which supplies the
-# entry text. The CLI writes it into the three inspectable memory layers:
-# durable (MEMORY.md), session recall (sessions/<date>.md), and a local
-# SQLite index for full-text recall. This mirrors the Hermes Agent memory
-# design as local files, without depending on its runtime.
+# entry text. `remember` captures into session recall (sessions/<date>.md)
+# and a local SQLite index for full-text recall; the durable layer (USER.md,
+# MEMORY.md) is written only by the human-gated `reflect-apply`. This
+# mirrors the Hermes Agent memory design as local files, without depending
+# on its runtime.
 
-MEMORY_LOG_HEADING = "## Session Updates"
 INDEX_DB_RELPATH = "sessions/index.db"
 MEMORY_KINDS = ["decision", "style", "tool", "fail", "note"]
 
 REFLECT_DIRNAME = "reflections"
 REFLECT_MARKER_RELPATH = "reflections/.last-reflected"
 REFLECTED_HEADING = "## Reflected Updates"
+# Unreflected entries at which memory-status stages an empty draft, so the
+# session-start nudge can point at a concrete file instead of a command.
+REFLECT_STAGE_AT = 30
 _DAY_LOG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
 _STATUS_RE = re.compile(r"^status:\s*(\w+)\s*$", re.IGNORECASE)
+# Reflection proposals: <date>.md, or <date>-N.md when that date already
+# holds an applied proposal (the applied record is never overwritten).
+_REFLECTION_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-\d+)?\.md$")
+_CURSOR_LINE_RE = re.compile(r"^cursor-(before|after):\s*(.*?)\s*$")
 
 # Canonical reflection-proposal section titles. The staging template emits
 # exactly these, and the parser splits ONLY on these, so a distilled body that
@@ -125,14 +140,14 @@ def _resolve_root(args):
         user.write_text(
             "# User Memory (global)\n\n"
             "Durable, cross-project facts and decision patterns learned "
-            "about the user. Filed by `vurctos remember --global`, "
-            "consolidated by `vurctos reflect --global` (human-approved), "
-            "and loaded into every Claude Code session via the @import in "
-            "~/.claude/CLAUDE.md.\n", encoding="utf-8")
+            "about the user. Captured by `vurctos remember --global` into "
+            "session day logs, written here only by a human-approved "
+            "`vurctos reflect-apply --global`, and loaded into every Claude "
+            "Code session via the @import in ~/.claude/CLAUDE.md.\n",
+            encoding="utf-8")
     mem = root / "MEMORY.md"
     if not mem.exists():
-        mem.write_text(f"# Memory (global)\n\n{MEMORY_LOG_HEADING}\n",
-                       encoding="utf-8")
+        mem.write_text("# Memory (global)\n", encoding="utf-8")
     return root
 
 
@@ -277,29 +292,6 @@ def _print_index_stats(db_path):
             print(f"  {date} [{kind}] {what}")
 
 
-def _append_under_heading(path, heading, line):
-    """Append a line under a markdown heading, creating the heading if absent.
-
-    The heading is treated as the last section of the file, so entries
-    accumulate at the end in chronological order. A blank line is kept before
-    the first entry, so it starts a real Markdown list even when the heading is
-    followed by explanatory prose, while consecutive list items stay grouped
-    tightly. The heading is matched as a whole line, not a substring.
-    """
-    if path.exists():
-        text = path.read_text(encoding="utf-8").rstrip("\n")
-    else:
-        text = "# Project Memory"
-    lines = text.splitlines()
-    if not any(ln.strip() == heading for ln in lines):
-        text += f"\n\n{heading}"
-        lines = text.splitlines()
-    last = lines[-1].strip() if lines else ""
-    sep = "\n" if last.startswith("- ") else "\n\n"
-    text += f"{sep}{line}"
-    path.write_text(text + "\n", encoding="utf-8")
-
-
 def _append_session_entry(path, date, kind, what, evidence):
     """Append one entry to the day's session log, creating the file if absent."""
     if path.exists():
@@ -312,8 +304,26 @@ def _append_session_entry(path, date, kind, what, evidence):
     path.write_text(text + entry + "\n", encoding="utf-8")
 
 
+def _capture(project, date, kind, what, evidence):
+    """Append one entry to the day log and index it. Return (log, mode).
+
+    Session recall only: durable memory is written by reflect-apply alone.
+    """
+    sessions = project / "sessions"
+    log = sessions / f"{date}.md"
+    sessions.mkdir(exist_ok=True)
+    _append_session_entry(log, date, kind, what, evidence)
+    mode = _index_entry(project / INDEX_DB_RELPATH, date, kind, what,
+                        evidence, f"sessions/{date}.md")
+    return log, mode
+
+
 def cmd_remember(args):
-    """Record a memory entry into durable memory, the day log, and the index."""
+    """Capture a memory entry into the day log and the index.
+
+    Durable memory (USER.md, MEMORY.md) is written only by `reflect-apply`,
+    so every durable line has passed a human-approved consolidation.
+    """
     project = _resolve_root(args)
     date = _today(args)
     kind = args.kind
@@ -328,28 +338,21 @@ def cmd_remember(args):
         sys.exit("error: --what and --evidence must be single lines; "
                  "file long detail as its own entry or a file reference")
 
-    # 1. Durable memory: a timestamped bullet under Session Updates.
-    mem = project / "MEMORY.md"
-    bullet = f"- {date} [{kind}] {what}"
-    if evidence:
-        bullet += f" (evidence: {evidence})"
-    bullet += f" -> sessions/{date}.md"
-    _append_under_heading(mem, MEMORY_LOG_HEADING, bullet)
-
-    # 2. Session recall: the human-readable day log.
-    sessions = project / "sessions"
-    sessions.mkdir(exist_ok=True)
-    log = sessions / f"{date}.md"
-    _append_session_entry(log, date, kind, what, evidence)
-
-    # 3. Full-text index for recall.
-    mode = _index_entry(project / INDEX_DB_RELPATH, date, kind, what,
-                        evidence, f"sessions/{date}.md")
+    # A backdated entry behind the cursor, or inside the window a pending
+    # proposal will consume on apply, would never be reflected.
+    floor = _capture_floor(project)
+    if floor and date < floor:
+        sys.exit(f"error: --date {date} is behind {floor}, the reflect "
+                 f"cursor or the end of the pending proposal's window, so "
+                 f"the entry would never be reflected. File it without "
+                 f"--date and mention the original date in the text.")
+    log, mode = _capture(project, date, kind, what, evidence)
 
     print(f"remembered [{kind}] on {date}")
-    print(f"  durable: {mem}")
     print(f"  session: {log}")
     print(f"  index:   {project / INDEX_DB_RELPATH} ({mode})")
+    today = datetime.date.today().isoformat()
+    print(f"  {_status_line(project, max(date, today))}")
 
 
 def cmd_recall(args):
@@ -464,41 +467,170 @@ def _day_logs(project):
     return out
 
 
+def _entry_count(path):
+    """Number of `- [kind] ...` entries in a day-log."""
+    if not path.exists():
+        return 0
+    return sum(1 for ln in path.read_text(encoding="utf-8").splitlines()
+               if _LOG_ENTRY_RE.match(ln))
+
+
+def _parse_cursor(raw):
+    """Parse 'YYYY-MM-DD N' or 'none' into (date, consumed) / None.
+
+    A bare 'YYYY-MM-DD' (written by older CLIs) reads as (date, 0): that day
+    is re-read by the next reflect rather than assumed consumed, because an
+    older CLI may have filed more entries on it after the apply. Replaying a
+    day costs one review; assuming it consumed would lose those entries.
+    ValueError on anything else.
+    """
+    parts = raw.split()
+    if not parts or parts == ["none"]:
+        return None
+    datetime.date.fromisoformat(parts[0])
+    if len(parts) == 1:
+        return parts[0], 0
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0], int(parts[1])
+    raise ValueError(raw)
+
+
 def _read_marker(project):
-    """Return the last-reflected date, or None."""
+    """Return the reflect cursor as (date, entries consumed that day), or None.
+
+    Fails closed on a malformed cursor: guessing here would silently drop or
+    replay entries.
+    """
     mk = project / REFLECT_MARKER_RELPATH
-    if mk.exists():
-        return mk.read_text(encoding="utf-8").strip() or None
+    if not mk.exists():
+        return None
+    raw = mk.read_text(encoding="utf-8").strip()
+    try:
+        marker = _parse_cursor(raw)
+    except ValueError:
+        sys.exit(f"error: unreadable reflect cursor in {mk}: {raw!r}. "
+                 f"Expected 'YYYY-MM-DD' or 'YYYY-MM-DD N'; fix or delete "
+                 f"the file.")
+    if marker and marker[1] > _entry_count(project / "sessions"
+                                           / f"{marker[0]}.md"):
+        sys.exit(f"error: the reflect cursor in {mk} says {marker[1]} "
+                 f"entries of {marker[0]} were consumed, but that day's log "
+                 f"holds fewer; later entries would be mistaken for "
+                 f"consumed ones. Fix the cursor or the log first.")
+    return marker
+
+
+def _marker_text(marker):
+    """The cursor as written to the cursor file and the proposal."""
+    if marker is None:
+        return "none"
+    return f"{marker[0]} {marker[1]}"
+
+
+def _marker_label(marker):
+    if marker is None:
+        return "none"
+    return f"{marker[0]} ({marker[1]} entries)"
+
+
+def _write_marker(project, marker):
+    (project / REFLECT_MARKER_RELPATH).write_text(
+        _marker_text(marker) + "\n", encoding="utf-8")
+
+
+def _window_end(project, upto):
+    """The cursor a window ending at `upto` advances to: the newest day-log
+    on or before `upto` and its entry count right now, or (`upto`, 0)."""
+    logs = [(d, p) for (d, p) in _day_logs(project) if d <= upto]
+    if not logs:
+        return upto, 0
+    d, p = logs[-1]
+    return d, _entry_count(p)
+
+
+def _unreflected(project, upto, since=None):
+    """Day-logs still to reflect, as (date, path, consumed) triples.
+
+    With `since`, everything in since..upto. Otherwise everything after the
+    cursor day, plus the cursor day itself when it holds more entries than
+    the cursor consumed (consumed = how many of that day's entries are
+    already reflected; 0 for every other day).
+    """
+    logs = [(d, p) for (d, p) in _day_logs(project) if d <= upto]
+    if since:
+        return [(d, p, 0) for (d, p) in logs if d >= since]
+    marker = _read_marker(project)
+    if not marker:
+        return [(d, p, 0) for (d, p) in logs]
+    m_date, consumed = marker
+    out = []
+    for d, p in logs:
+        if d > m_date:
+            out.append((d, p, 0))
+        elif d == m_date and _entry_count(p) > consumed:
+            out.append((d, p, consumed))
+    return out
+
+
+def _scope_flag(args):
+    """The scope flag to echo back in next-step hints (shell-safe)."""
+    if getattr(args, "global_", False):
+        return "--global"
+    return f"--project {shlex.quote(args.project or '.')}"
+
+
+def _proposal_cursor(path, which):
+    """The parsed cursor-<which> line of a proposal, or None."""
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        m = _CURSOR_LINE_RE.match(ln.strip())
+        if m and m.group(1) == which:
+            try:
+                return _parse_cursor(m.group(2))
+            except ValueError:
+                return None
     return None
 
 
-def _reflect_window(project, since, upto):
-    """Day logs to reflect on: since..upto, else (last marker, upto]."""
-    logs = [(d, p) for (d, p) in _day_logs(project) if d <= upto]
-    if since:
-        return [(d, p) for (d, p) in logs if d >= since]
+def _capture_floor(project):
+    """Earliest date a new entry may carry and still be reflected: the
+    cursor day, or the window end of a pending proposal, whichever is
+    later. None when nothing constrains it."""
+    dates = []
     marker = _read_marker(project)
     if marker:
-        return [(d, p) for (d, p) in logs if d > marker]
-    return logs
+        dates.append(marker[0])
+    pending = _pending_draft(project)
+    if pending:
+        after = _proposal_cursor(pending[0], "after")
+        if after:
+            dates.append(after[0])
+    return max(dates) if dates else None
 
 
-def cmd_reflect(args):
-    """Stage a reflection proposal from the unreflected session day logs."""
-    project = _resolve_root(args)
-    upto = _today(args)
-    logs = _reflect_window(project, args.since, upto)
+def _stage_reflection(project, since, upto, force=False):
+    """Write the staging file for the window. Return (path, lower, logs).
+
+    One pending proposal at a time: two proposals over overlapping windows
+    could apply the same additions twice or move the cursor backwards. The
+    proposal records the cursor it was staged against and the cursor it
+    advances to, so apply can refuse a stale one and never consumes entries
+    the proposal did not see.
+    """
     refl_dir = project / REFLECT_DIRNAME
     refl_dir.mkdir(exist_ok=True)
-    staging = refl_dir / f"{upto}.md"
-    if staging.exists() and not args.force:
-        sys.exit(f"error: {staging} already exists. Use --force to overwrite.")
-
+    base = refl_dir / f"{upto}.md"
+    pending = _pending_draft(project)
+    if pending and not (force and _reflection_date(pending[0]) == upto):
+        sys.exit(f"error: a reflection is already pending at {pending[0]} "
+                 f"(status: {pending[1]}). Apply or delete it first; "
+                 f"--force only overwrites a pending draft for this same "
+                 f"date.")
+    logs = _unreflected(project, upto, since)
     marker = _read_marker(project)
-    if args.since:
-        lower = args.since
+    if since:
+        lower = since
     elif marker:
-        lower = f"after {marker}"
+        lower = f"after {_marker_label(marker)}"
     else:
         lower = "(all history)"
 
@@ -506,6 +638,9 @@ def cmd_reflect(args):
         f"# Reflection {upto}",
         "",
         "status: draft",
+        "",
+        f"cursor-before: {_marker_text(marker)}",
+        f"cursor-after: {_marker_text(_window_end(project, upto))}",
         "",
         f"window: {lower} .. {upto}  ({len(logs)} session day-logs)",
         "",
@@ -538,17 +673,41 @@ def cmd_reflect(args):
         f"## {SEC_RATIONALE}",
         "",
     ])
-    staging.write_text(template + "\n", encoding="utf-8")
+    if pending:  # --force over this date's own pending draft
+        pending[0].write_text(template + "\n", encoding="utf-8")
+        return pending[0], lower, logs
+    # Exclusive create: an applied <date>.md is kept as the record and the
+    # new proposal becomes <date>-2.md; two hooks racing cannot both win.
+    staging, n = base, 2
+    while True:
+        try:
+            with staging.open("x", encoding="utf-8") as fh:
+                fh.write(template + "\n")
+            return staging, lower, logs
+        except FileExistsError:
+            if _read_status(staging.read_text(encoding="utf-8")) != "applied":
+                sys.exit(f"error: a reflection was staged concurrently at "
+                         f"{staging}; use that one.")
+            staging = refl_dir / f"{upto}-{n}.md"
+            n += 1
+
+
+def cmd_reflect(args):
+    """Stage a reflection proposal from the unreflected session day logs."""
+    project = _resolve_root(args)
+    upto = _today(args)
+    staging, lower, logs = _stage_reflection(project, args.since, upto,
+                                             args.force)
     print(f"reflection staged: {staging}")
     print(f"window: {lower} .. {upto}  ({len(logs)} day-logs)")
-    for d, p in logs:
-        print(f"  {d}: {p}")
+    for d, p, consumed in logs:
+        tail = f"  (only entries after the first {consumed})" if consumed \
+            else ""
+        print(f"  {d}: {p}{tail}")
     if not logs:
         print("  (no session day-logs in window)")
-    scope = "--global" if getattr(args, "global_", False) \
-        else f"--project {args.project or '.'}"
     print("next: fill the proposal, set status: approved, then run "
-          f"`vurctos reflect-apply {scope} --date {upto}`")
+          f"`vurctos reflect-apply {_scope_flag(args)} --date {upto}`")
 
 
 def _split_sections(text, known):
@@ -653,28 +812,61 @@ def _mark_applied(text):
 def cmd_reflect_apply(args):
     """Apply an APPROVED reflection to durable memory, then advance the marker.
 
-    Order is deliberate: gate on status, validate the prune list, prune, then
-    append. Pruning before appending means a prune target can never delete a
-    line this same reflection just added, and a target is pruned only if it
-    matches exactly one line across durable memory, so a bare shared label
-    cannot silently remove curated content.
+    Order is deliberate: gate on status, validate the whole proposal, prune,
+    then append. Validation fails closed: nothing is written until every
+    prune target matches exactly one line across durable memory (so a bare
+    shared label cannot silently remove curated content, and a typo cannot
+    be skipped and forgotten), and an empty proposal must at least explain
+    itself under Rationale before it may advance the cursor. Pruning before
+    appending means a prune target can never delete a line this same
+    reflection just added.
     """
     project = _resolve_root(args)
     date = _today(args)
-    staging = project / REFLECT_DIRNAME / f"{date}.md"
-    if not staging.exists():
-        sys.exit(f"error: no reflection at {staging}. Run `vurctos reflect` "
-                 f"first.")
+    staging = _pending_for_date(project, date)
     text = staging.read_text(encoding="utf-8")
     status = _read_status(text)
-    if status == "applied":
-        sys.exit(f"error: reflection {date} was already applied. Run a new "
-                 f"`vurctos reflect` for newer sessions.")
     if status != "approved":
         shown = status or "missing or ambiguous"
         sys.exit(f"error: reflection status is '{shown}', not 'approved'. "
                  f"Review {staging}, set a single `status: approved` line, "
                  f"then re-run.")
+    heads = [ln[3:].strip() for ln in text.splitlines()
+             if ln.startswith("## ") and ln[3:].strip() in REFLECT_SECTIONS]
+    dup = [t for t in REFLECT_SECTIONS if heads.count(t) > 1]
+    if dup:
+        sys.exit(f"error: {staging} has more than one '## {dup[0]}' "
+                 f"section (only the last would count); merge them, then "
+                 f"re-run. Nothing applied.")
+    cursors = {"before": [], "after": []}
+    for ln in text.splitlines():
+        m = _CURSOR_LINE_RE.match(ln.strip())
+        if m:
+            try:
+                cursors[m.group(1)].append(_parse_cursor(m.group(2)))
+            except ValueError:
+                sys.exit(f"error: unreadable cursor-{m.group(1)} line in "
+                         f"{staging}; nothing applied.")
+    if len(cursors["before"]) != 1 or len(cursors["after"]) != 1:
+        sys.exit(f"error: {staging} must carry exactly one cursor-before and "
+                 f"one cursor-after line (a proposal staged by an older CLI "
+                 f"has none); nothing applied. Re-stage with `vurctos "
+                 f"reflect --force` and re-fill it.")
+    before, after = cursors["before"][0], cursors["after"][0]
+    marker = _read_marker(project)
+    if before != marker:
+        sys.exit(f"error: the reflect cursor moved since this proposal was "
+                 f"staged (was {_marker_label(before)}, now "
+                 f"{_marker_label(marker)}); nothing applied. Re-stage with "
+                 f"`vurctos reflect --force` and re-fill it.")
+    if (after is None or after[0] > date or (before and after < before)
+            or after[1] > _entry_count(project / "sessions"
+                                       / f"{after[0]}.md")):
+        sys.exit(f"error: cursor-after '{_marker_text(after)}' in {staging} "
+                 f"is not a valid end for this window: it must name a day "
+                 f"on or before {date}, not move behind the current cursor, "
+                 f"and not count more entries than that day's log holds; "
+                 f"nothing applied.")
 
     sections = _split_sections(text, REFLECT_SECTIONS)
     user_add = sections.get(SEC_USER, "").strip()
@@ -684,11 +876,18 @@ def cmd_reflect_apply(args):
     user_md, mem_md = project / "USER.md", project / "MEMORY.md"
     unique, ambiguous, not_found = _plan_prune([user_md, mem_md],
                                                prune_body.splitlines())
-    if ambiguous:
-        listed = "\n".join(f"    {t}" for t in ambiguous)
-        sys.exit(f"error: these prune targets match more than one line in "
-                 f"durable memory; make them exact and unique, then re-run:\n"
-                 f"{listed}")
+    if ambiguous or not_found:
+        listed = [f"    {t}  (matches more than one line)" for t in ambiguous]
+        listed += [f"    {t}  (not found)" for t in not_found]
+        sys.exit("error: nothing applied. Each prune target must match "
+                 "exactly one line in USER.md or MEMORY.md; fix these, "
+                 "then re-run:\n" + "\n".join(listed))
+    rationale = sections.get(SEC_RATIONALE, "").strip()
+    if not (user_add or mem_add or unique or rationale):
+        sys.exit("error: nothing applied. The proposal adds nothing, prunes "
+                 "nothing and gives no Rationale. Fill it in, or say under "
+                 "Rationale why this window leaves durable memory unchanged, "
+                 "then re-run.")
 
     pruned = _prune_lines(user_md, unique) + _prune_lines(mem_md, unique)
     applied = []
@@ -699,20 +898,249 @@ def cmd_reflect_apply(args):
         _append_reflected_block(mem_md, date, mem_add)
         applied.append("MEMORY.md")
 
-    (project / REFLECT_MARKER_RELPATH).write_text(date + "\n", encoding="utf-8")
+    _write_marker(project, after)
     staging.write_text(_mark_applied(text), encoding="utf-8")
 
     print(f"applied reflection {date}")
     print(f"  durable updates: {', '.join(applied) or 'none'}")
     print(f"  pruned lines: {pruned}")
-    if not_found:
-        print(f"  prune targets not found, skipped: {len(not_found)}")
     skills = sections.get(SEC_SKILLS, "").strip()
     if skills:
         print("  skill candidates (scaffold each with "
               "`vurctos skill-new <name>`):")
         print("    " + skills.replace("\n", "\n    "))
-    print(f"  marker advanced to {date}")
+    print(f"  cursor advanced to {_marker_label(after)}")
+
+
+# --- Memory status (the reflect loop's dashboard) -------------------------
+#
+# `remember` prints one status line, the SessionStart hooks call
+# `memory-status --hook`, and a human runs `memory-status` directly. All
+# three read the same numbers, so the backlog is never invisible.
+
+_C0_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")
+
+
+def _reflection_date(path):
+    return _REFLECTION_RE.match(path.name).group(1)
+
+
+def _pending_draft(project):
+    """Newest staged reflection not yet applied, as (path, status), or None."""
+    refl = project / REFLECT_DIRNAME
+    if not refl.is_dir():
+        return None
+    for p in sorted(refl.iterdir(), reverse=True):
+        if not _REFLECTION_RE.match(p.name):
+            continue
+        status = _read_status(p.read_text(encoding="utf-8"))
+        if status != "applied":
+            return p, status or "missing or ambiguous"
+    return None
+
+
+def _pending_for_date(project, date):
+    """The one not-yet-applied proposal staged for `date`, or exit."""
+    refl = project / REFLECT_DIRNAME
+    found = [p for p in sorted(refl.glob(f"{date}*.md"))
+             if _REFLECTION_RE.match(p.name)] if refl.is_dir() else []
+    if not found:
+        sys.exit(f"error: no reflection for {date} in {refl}. Run "
+                 f"`vurctos reflect` first.")
+    pending = [p for p in found
+               if _read_status(p.read_text(encoding="utf-8")) != "applied"]
+    if not pending:
+        sys.exit(f"error: reflection {date} was already applied. Run a new "
+                 f"`vurctos reflect` for newer sessions.")
+    if len(pending) > 1:
+        listed = ", ".join(str(p) for p in pending)
+        sys.exit(f"error: more than one pending reflection for {date} "
+                 f"({listed}); delete the stale one, then re-run.")
+    return pending[0]
+
+
+_LEGACY_CAPTURE_RE = re.compile(
+    r"^- (\d{4}-\d{2}-\d{2}) \[([a-z]+)\] (.*?)(?: \(evidence: (.*)\))? "
+    r"-> sessions/\d{4}-\d{2}-\d{2}\.md$")
+
+
+def _log_records(path):
+    """The (kind, what, evidence) of every entry in a day log."""
+    records, current = set(), None
+    if not path.exists():
+        return records
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        m = _LOG_ENTRY_RE.match(ln)
+        if m:
+            current = (m.group(1), m.group(2), "")
+            records.add(current)
+        elif current and ln.strip().startswith("- evidence: "):
+            records.discard(current)
+            current = current[:2] + (ln.strip()[len("- evidence: "):],)
+            records.add(current)
+    return records
+
+
+def _legacy_capture_lines(project):
+    """Raw capture lines that the older `remember` also wrote into MEMORY.md
+    (`- <date> [kind] what ... -> sessions/<date>.md`), wherever they sit.
+
+    Return (total, unmatched). A line is a verified duplicate only when its
+    day log holds the same kind, text and evidence, which is every capture
+    the old CLI completed; it wrote MEMORY.md before the log, so an
+    interrupted capture can exist only here and is listed as unmatched so
+    it is kept.
+    """
+    mem = project / "MEMORY.md"
+    if not mem.exists():
+        return 0, []
+    total, unmatched, logs = 0, [], {}
+    for ln in mem.read_text(encoding="utf-8").splitlines():
+        m = _LEGACY_CAPTURE_RE.match(ln.strip())
+        if not m:
+            continue
+        total += 1
+        date, kind, what, evidence = m.groups()
+        if date not in logs:
+            logs[date] = _log_records(project / "sessions" / f"{date}.md")
+        if (kind, what, evidence or "") not in logs[date]:
+            unmatched.append(ln.strip())
+    return total, unmatched
+
+
+def _legacy_note(legacy):
+    total, unmatched = legacy
+    note = (f"MEMORY.md still carries {total} raw capture lines written by "
+            f"an older remember, {total - len(unmatched)} verified as "
+            f"duplicates of their day log")
+    if unmatched:
+        note += (f" and {len(unmatched)} not found in any day log (keep or "
+                 f"move those)")
+    return note + "; see Upgrading in docs/memory-system.md"
+
+
+def _memory_status(project, upto):
+    logs = _unreflected(project, upto)
+    return {
+        "logs": logs,
+        "entries": sum(_entry_count(p) - c for _, p, c in logs),
+        "oldest": logs[0][0] if logs else None,
+        "marker": _read_marker(project),
+        "draft": _pending_draft(project),
+        "legacy": _legacy_capture_lines(project),
+    }
+
+
+def _status_line(project, upto):
+    """One line: what waits to be reflected, and whether a draft exists."""
+    st = _memory_status(project, upto)
+    if st["entries"]:
+        head = (f"unreflected: {st['entries']} entries over "
+                f"{len(st['logs'])} day-log(s), oldest {st['oldest']}")
+    else:
+        head = "unreflected: none"
+    if st["draft"]:
+        return f"{head}; draft waiting: {st['draft'][0]} " \
+               f"(status: {st['draft'][1]})"
+    return f"{head}; draft: none"
+
+
+def _durable_size(path):
+    if not path.exists():
+        return "missing"
+    text = path.read_text(encoding="utf-8")
+    lines = sum(1 for ln in text.splitlines() if ln.strip())
+    return f"{lines} lines, {len(text.encode('utf-8'))} bytes"
+
+
+def _hook_context(st, scope, stage_at):
+    """The SessionStart nudge text, or None when nothing is waiting."""
+    if not st["entries"] and not st["draft"]:
+        return None
+    where = "Global VurctOS memory" if scope == "--global" \
+        else "This VurctOS project"
+    cli = f"python3 {shlex.quote(str(Path(__file__).resolve()))}"
+    parts = []
+    if st["entries"]:
+        parts.append(f"{where} has {st['entries']} memory entries over "
+                     f"{len(st['logs'])} day-log(s) not yet consolidated "
+                     f"(oldest: {st['oldest']}).")
+        _, newest, consumed = st["logs"][-1]
+        digest = [ln for ln in newest.read_text(encoding="utf-8").splitlines()
+                  if _LOG_ENTRY_RE.match(ln)][consumed:][-3:]
+        digest = " ; ".join(_C0_RE.sub("", ln.replace("\t", " "))
+                            for ln in digest)
+        parts.append(f"Latest entries: {digest or '(no parsed entries)'}.")
+    else:
+        parts.append(f"{where} has no unconsolidated entries.")
+    if st["draft"]:
+        path, status = st["draft"]
+        parts.append(f"A reflection draft is waiting at {path} (status: "
+                     f"{status}): fill or review it, set status: approved, "
+                     f"then run {cli} reflect-apply {scope} "
+                     f"--date {_reflection_date(path)}.")
+    else:
+        auto = (f" (an empty draft is staged automatically at {stage_at} "
+                f"entries)") if stage_at else ""
+        parts.append(f"When convenient{auto}, run {cli} reflect {scope} to "
+                     f"stage a proposal, review it, then {cli} reflect-apply "
+                     f"{scope}.")
+    if st["legacy"][0]:
+        parts.append(_legacy_note(st["legacy"]) + ".")
+    return " ".join(parts)
+
+
+def cmd_memory_status(args):
+    """Report the reflect backlog; stage an empty draft once it is large."""
+    project = _resolve_root(args)
+    upto = _today(args)
+    scope = _scope_flag(args)
+    if args.stage_at < 0:
+        sys.exit("error: --stage-at must be 0 (disabled) or a positive "
+                 "entry count")
+    st = _memory_status(project, upto)
+    staged = None
+    if args.stage_at and st["entries"] >= args.stage_at and not st["draft"]:
+        staged, _, _ = _stage_reflection(project, None, upto)
+        st["draft"] = (staged, "draft")
+
+    if args.hook:
+        ctx = _hook_context(st, scope, args.stage_at)
+        if ctx:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": ctx}}, ensure_ascii=False))
+        return
+
+    print(f"memory status ({scope})")
+    if st["entries"]:
+        print(f"  unreflected: {st['entries']} entries over "
+              f"{len(st['logs'])} day-log(s), oldest {st['oldest']}")
+    else:
+        print("  unreflected: none")
+    marker = st["marker"]
+    print(f"  last reflected: {_marker_label(marker) if marker else 'never'}")
+    if st["draft"]:
+        print(f"  draft: {st['draft'][0]} (status: {st['draft'][1]})")
+    else:
+        print("  draft: none")
+    print(f"  durable: USER.md {_durable_size(project / 'USER.md')}; "
+          f"MEMORY.md {_durable_size(project / 'MEMORY.md')}")
+    if st["legacy"][0]:
+        print(f"  legacy: {_legacy_note(st['legacy'])}")
+        for ln in st["legacy"][1]:
+            print(f"    keep: {ln}")
+    if staged:
+        print(f"  staged an empty draft (backlog reached {args.stage_at} "
+              f"entries): {staged}")
+    if st["draft"]:
+        print(f"next: fill or review the draft, set status: approved, then "
+              f"run `vurctos reflect-apply {scope} "
+              f"--date {_reflection_date(st['draft'][0])}`")
+    elif st["entries"]:
+        print(f"next: run `vurctos reflect {scope}` to stage a proposal")
+    else:
+        print("next: nothing to consolidate")
 
 
 # --- Skill scaffolding (procedural-memory promotion) ---------------------
@@ -1050,24 +1478,17 @@ def cmd_dispatch(args):
 
 
 def _file_memory(project, kind, what, evidence):
-    """File a dispatch event through the same three layers as `remember`."""
-    date = datetime.date.today().isoformat()
-    bullet = f"- {date} [{kind}] {what} -> sessions/{date}.md"
-    _append_under_heading(project / "MEMORY.md", MEMORY_LOG_HEADING, bullet)
-    sessions = project / "sessions"
-    sessions.mkdir(exist_ok=True)
-    _append_session_entry(sessions / f"{date}.md", date, kind, what, evidence)
-    _index_entry(project / INDEX_DB_RELPATH, date, kind, what, evidence,
-                 f"sessions/{date}.md")
+    """File a dispatch event the same way `remember` does (day log + index)."""
+    _capture(project, datetime.date.today().isoformat(), kind, what, evidence)
 
 
 # --- Reject: the verdict-to-memory wire -----------------------------------
 #
 # Rejecting reviewed work is the highest-value learning signal in the
-# dispatch loop. One command files the reason into all three memory layers,
-# stamps it into the card's notes (so the re-run prompt carries the
-# feedback explicitly), and re-queues the card. The next dispatch run then
-# starts with the lesson twice over: in its prompt and in MEMORY.md.
+# dispatch loop. One command files the reason into the day log and the
+# index, stamps it into the card's notes (so the re-run prompt carries the
+# feedback explicitly), and re-queues the card. The lesson reaches durable
+# memory through the next approved reflection.
 
 
 def _apply_reject(board_path, card, date, reason):
@@ -1138,7 +1559,7 @@ def cmd_reject(args):
                  f"review rejected {card['id']}: {reason}", "")
     _apply_reject(board, card, date, reason)
     print(f"card {card['id']} rejected -> ready (re-queued)")
-    print(f"  lesson filed: MEMORY.md, sessions/{date}.md, index")
+    print(f"  lesson filed: sessions/{date}.md, index")
     print("  feedback stamped into the card notes; the next dispatch run "
           "carries it in the prompt")
 
@@ -1215,6 +1636,25 @@ def build_parser():
                        help="apply to the user-level memory at ~/.vurctos")
     p_rfa.add_argument("--date", help="reflection date (default: today)")
     p_rfa.set_defaults(func=cmd_reflect_apply)
+
+    p_ms = sub.add_parser("memory-status",
+                          help="show the reflect backlog; stage an empty "
+                               "draft once it is large")
+    p_ms.add_argument("--project", default=None,
+                      help="project folder (default: cwd)")
+    p_ms.add_argument("--global", dest="global_", action="store_true",
+                      help="report on the user-level memory at ~/.vurctos")
+    p_ms.add_argument("--date",
+                      help="count entries up to this date (default: today)")
+    p_ms.add_argument("--stage-at", type=int, default=REFLECT_STAGE_AT,
+                      help="stage an empty reflection draft once this many "
+                           "entries are unreflected (default: "
+                           f"{REFLECT_STAGE_AT}; 0 disables)")
+    p_ms.add_argument("--hook", action="store_true",
+                      help="print a Claude Code SessionStart hook payload "
+                           "(JSON) instead of the report; silent when "
+                           "nothing is waiting")
+    p_ms.set_defaults(func=cmd_memory_status)
 
     p_dis = sub.add_parser("dispatch",
                            help="run one ready local board card via headless "

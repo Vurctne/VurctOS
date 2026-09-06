@@ -99,7 +99,7 @@ Session recall is the third memory layer. Working notes are logged as dated day 
 
 Each entry is also indexed into `sessions/index.db`, a local SQLite full-text index, so recall is fast across many sessions. The index uses FTS5 where the local SQLite supports it, and falls back to a plain substring search otherwise, so search works on any standard Python install. The `index.db` file is generated machine-local instance data and is not committed.
 
-The CLI files these for you: `vurctos remember` appends an entry to the day log and `MEMORY.md`, then indexes it, and `vurctos recall "<query>"` searches the index. `recall --stats` counts how often a lesson repeats across distinct dates (the promotion signal) and, without a query, summarizes capture coverage per kind. Because the day-logs are the source of truth and the index is derived, `vurctos reindex` can rebuild the index from the markdown at any time (fresh machine, or drift after `reflect-apply` prunes). See `cli/README.md`.
+The CLI files these for you: `vurctos remember` appends an entry to the day log and indexes it (durable memory is untouched until an approved `reflect-apply`), and `vurctos recall "<query>"` searches the index. `recall --stats` counts how often a lesson repeats across distinct dates (the promotion signal) and, without a query, summarizes capture coverage per kind. Because the day-logs are the source of truth and the index is derived, `vurctos reindex` can rebuild the index from the markdown at any time (fresh machine, or drift after `reflect-apply` prunes). See `cli/README.md`.
 
 ## Obsidian Compatibility
 
@@ -122,11 +122,25 @@ Claude Code auto-loads durable memory through `@`-imports (`@USER.md` and `@MEMO
 
 Both are read-only bridges: Codex is told to read durable memory, never to write it. Filing and consolidation stay in the human-gated `vurctos remember` / `vurctos reflect` CLI. The `SessionStart` reflect-nudge is a Claude Code hook; Codex documents a comparable hook mechanism, but replicating the nudge there is a separate hook change, not part of this file wiring.
 
+### The session-start nudge
+
+What keeps the loop running is a Claude Code `SessionStart` hook that runs `vurctos memory-status --hook`: it reports how many entries are waiting, the freshest three, and any staged reflection not yet applied, and once the backlog reaches 30 entries it stages an empty `reflections/<today>.md` so the nudge points at a file to fill rather than a command to remember. Scaffolded projects get the hook from the template (`vurctos new` bakes in the CLI path). For the global layer, install the shipped copy once from your checkout, then wire it into `~/.claude/settings.json`:
+
+```bash
+mkdir -p ~/.claude/hooks && sed "s|__VURCTOS_CLI__|'$PWD/cli/vurctos.py'|" templates/global-hook/vurctos-global-nudge.sh > ~/.claude/hooks/vurctos-global-nudge.sh
+```
+
+(If your checkout path contains a single quote, `|` or `&`, copy the file and edit its `cli=` line by hand instead.) Then add to `hooks.SessionStart` in `~/.claude/settings.json`: `{"matcher": "", "hooks": [{"type": "command", "command": "sh \"$HOME/.claude/hooks/vurctos-global-nudge.sh\"", "timeout": 10}]}`. The hook is read-only apart from staging that empty draft; it never approves or applies anything.
+
 ## Reflection And Consolidation
 
 Memory that only grows gets slower and noisier, not smarter. The step that makes memory improve over time is reflection: periodically distilling the raw session day logs into durable memory and pruning what is stale, rather than appending forever. This is the empirically load-bearing mechanism in the agent-memory literature, and an independently built production agent (Nous Research's Hermes Agent) converges on the same USER.md + MEMORY.md + skills file layering and a distillation loop.
 
 In VurctOS this runs as `vurctos reflect` (see `cli/README.md`): the CLI gathers the unreflected day logs and stages a proposal; Claude as Orchestrator distills them into proposed `USER.md` and `MEMORY.md` updates, prunes, and skill candidates; a human approves before anything is written to durable memory. Keep both the concrete dated logs and the distilled abstractions. The human approval gate is deliberate: a single wrong distilled fact, written unchecked into `USER.md`, would quietly affect every later session.
+
+Two mechanics enforce that gate. `remember` writes only the day log and the index, so nothing reaches `USER.md` or `MEMORY.md` except through an approved reflection. `reflect-apply` fails closed: if any prune target is missing or ambiguous, if the proposal is empty with no rationale, or if the cursor has moved since the proposal was staged, nothing is written and the cursor stays put. The cursor (`reflections/.last-reflected`) records the last reflected day and how many of that day's entries were consumed; a proposal records the cursor it was staged against and the cursor it advances to (`cursor-before` / `cursor-after`), so entries filed after staging, including later the same day, are still picked up by the next reflect. Only one proposal can be pending at a time, and an applied proposal is never overwritten (a second one on the same date becomes `<date>-2.md`). `vurctos memory-status` shows the backlog, the cursor, any waiting draft, and the size of the durable files.
+
+Upgrading from an older CLI: `remember` used to copy every entry into `MEMORY.md` as well, as `- <date> [kind] ... -> sessions/<date>.md` lines (first under a `## Session Updates` heading, later wherever the file ended). Each completed capture wrote the same entry to its day log, so those lines are raw duplicates of what reflect reads. `memory-status` counts them, verifies each against its day log, and lists any it cannot find there (the old CLI wrote `MEMORY.md` first, so an interrupted capture can exist only there): move an unmatched line into a proper section or its day log, then delete the verified duplicates by hand along with the empty heading. The old bare-date cursor is read as "that day not yet consumed": the next reflect re-reads the cursor day, so entries the older CLI filed after that apply are not lost, and anything already distilled from that day is simply skipped in the proposal.
 
 Two write-time disciplines keep the durable layer from bloating (adopted from the Hermes Agent memory design, which uses hard size budgets plus consolidate-on-write rather than any automatic decay): keep transient or soon-stale content out of durable memory entirely (rankings and market data, environment-dependent failures, negative tool claims, transient errors that already resolved, one-off task narratives; the day-log keeps them as dated history), and supersede instead of append (a proposal that updates an existing durable fact prunes the old line in the same apply, so revisions never stack). The staged proposal template restates both.
 

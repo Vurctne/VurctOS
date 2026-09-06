@@ -67,7 +67,7 @@ The MVP should produce:
 The user or agent may manually:
 
 1. Create the project from the template.
-2. Record durable preferences in `USER.md` and project decisions in `MEMORY.md` (directly or via `remember`).
+2. Record preferences and project decisions with `remember` (they land in the day log; `USER.md` and `MEMORY.md` are written by an approved `reflect-apply`, and remain the user's own files to edit, never an agent's).
 3. Write reusable procedures as skills, scaffolding them with `skill-new`.
 4. Run `reflect`, review the staged consolidation, then `reflect-apply` to fold session logs into durable memory.
 5. Queue a task as a board card and run it with `dispatch --agent {claude,codex}`.
@@ -78,7 +78,7 @@ The user or agent may manually:
 The CLI already handles the repeatable parts:
 
 1. scaffold a new project folder (`new`)
-2. file a memory entry into `MEMORY.md`, the day log, and the SQLite index (`remember`)
+2. file a memory entry into the day log and the SQLite index (`remember`)
 3. full-text search past entries, with counts via `--stats` (`recall`)
 4. rebuild the session index (`reindex`)
 5. run one ready, local-channel board card on the user's subscription (`dispatch`)
@@ -100,11 +100,12 @@ The MVP succeeds when:
 
 1. Copy `templates/project-template/` into a new project folder (or run `new`).
 2. Rename the project and fill in `USER.md`, `MEMORY.md`, and `task.md`.
-3. Record a durable preference: `remember --global --what "..."`, and a project decision: `remember --project <p> --what "..."`.
-4. Confirm the shared bridge: `CLAUDE.md` `@`-imports the memory for Claude Code, and `AGENTS.md` carries the same memory in prose for Codex.
-5. Open both tools and confirm they surface the same preferences without re-asking.
-6. Search past decisions with `recall --project <p> "<query>"`, and check counts with `recall --stats`.
-7. Scaffold a reusable procedure with `skill-new <name>`.
-8. Queue a board card, then run `dispatch --project <p> --agent codex` (or `--agent claude`); the card moves to review.
-9. If the result is wrong, `reject <card-id> --project <p> --reason "..."`; the lesson is filed into memory and the card is re-queued.
-10. Run `reflect --project <p>`, review the staged consolidation, then `reflect-apply` to fold what was learned into durable memory.
+3. Record a preference with `remember --global --what "..."` and a project decision with `remember --project <p> --what "..."`; both land in the day logs.
+4. Run `reflect --global` and `reflect --project <p>`, fill and approve the staged consolidation, then `reflect-apply`: this is what writes `USER.md` and `MEMORY.md`.
+5. Confirm the shared bridge: `CLAUDE.md` `@`-imports the memory for Claude Code, and `AGENTS.md` carries the same memory in prose for Codex.
+6. Open both tools and confirm they surface the same preferences without re-asking.
+7. Search past decisions with `recall --project <p> "<query>"`, and check counts with `recall --stats`.
+8. Scaffold a reusable procedure with `skill-new <name>`.
+9. Queue a board card, then run `dispatch --project <p> --agent codex` (or `--agent claude`); the card moves to review.
+10. If the result is wrong, `reject <card-id> --project <p> --reason "..."`; the lesson is filed into memory and the card is re-queued.
+11. As sessions accumulate, `memory-status` shows what is waiting; repeat `reflect` and `reflect-apply` to fold it into durable memory.

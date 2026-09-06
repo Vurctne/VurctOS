@@ -15,7 +15,7 @@ Session recall is the third memory layer. There are two complementary forms here
   - evidence: PR review, the wrapper was dropped as overbuild
 ```
 
-Entry kinds are `decision`, `style`, `tool`, `fail`, and `note`. Each entry is also appended to `MEMORY.md` under `## Session Updates`.
+Entry kinds are `decision`, `style`, `tool`, `fail`, and `note`. Entries reach `USER.md` or `MEMORY.md` only through an approved `vurctos reflect` / `reflect-apply`; the day logs are the raw record.
 
 ## Narrative Session Logs
 

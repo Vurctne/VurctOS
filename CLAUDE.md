@@ -20,7 +20,8 @@ Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the co
 
 - **Run the CLI** (Python 3.8+ standard library only):
   - `python3 cli/vurctos.py new <name> [--dir DIR]` - scaffold a project from `templates/project-template/`.
-  - `python3 cli/vurctos.py remember --project <p> --what "..." [--kind decision|style|tool|fail|note] [--evidence "..."]` - file a memory entry into `MEMORY.md`, the day log `sessions/<date>.md`, and the SQLite index.
+  - `python3 cli/vurctos.py remember --project <p> --what "..." [--kind decision|style|tool|fail|note] [--evidence "..."]` - file a memory entry into the day log `sessions/<date>.md` and the SQLite index (durable `USER.md` / `MEMORY.md` are written only by `reflect-apply`).
+  - `python3 cli/vurctos.py memory-status --project <p> [--global]` - show the reflect backlog, the cursor, and any waiting draft; stages an empty draft once the backlog is large (the SessionStart nudge hooks call it with `--hook`).
   - `python3 cli/vurctos.py recall --project <p> "<query>"` - full-text search past entries (SQLite FTS5, LIKE fallback). `recall --stats` reports index counts.
   - `remember` / `recall` / `reflect` / `reflect-apply` all accept `--global` to target the user-level memory at `~/.vurctos/` (cross-project; loaded everywhere via the `@import` in `~/.claude/CLAUDE.md`).
   - `python3 cli/vurctos.py reflect --project <p>` then `reflect-apply` - stage and apply a human-approved consolidation of session logs into durable memory.
