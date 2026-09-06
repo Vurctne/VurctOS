@@ -56,7 +56,7 @@ python3 cli/vurctos.py recall --project my-project --stats
 python3 cli/vurctos.py reindex --project my-project
 ```
 
-The markdown day-logs are the source of truth; `sessions/index.db` is derived, machine-local, and gitignored. On a second machine or a fresh copy of a project the index does not exist, and `reflect-apply` prunes markdown without touching the index. `reindex` deletes the index and rebuilds it from the day-logs (also with `--global` for `~/.vurctos`).
+The markdown day-logs are the source of truth; `sessions/index.db` is derived, machine-local, and gitignored. Use `reindex` when the index is absent on a fresh machine or clone, after index corruption, or after hand-editing a day-log. `reindex` deletes the index and rebuilds it from the day-logs (also with `--global` for `~/.vurctos`).
 
 ### Reflect (distill sessions into durable memory)
 

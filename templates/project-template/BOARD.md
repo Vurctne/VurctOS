@@ -2,7 +2,7 @@
 
 The task board is the single source of truth for coordination in this project. The Orchestrator (Claude) creates cards, assigns them to agent profiles, and moves them through statuses. Agents do not message each other directly. All coordination flows through this board and the files in `handoffs/`.
 
-See `ORCHESTRATION.md` in the repository root for the full model.
+For the full model, see [ORCHESTRATION.md](https://github.com/Vurctne/VurctOS/blob/main/ORCHESTRATION.md) in the public VurctOS repository (this file is not included in the project folder).
 
 ## Card Format
 

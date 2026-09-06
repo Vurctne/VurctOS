@@ -15,4 +15,4 @@ Working rules:
 - After significant or repeated work, proactively propose remember entries and skill candidates; when a pattern has repeated and proven useful, scaffold it with: vurctos skill-new <name> --project . (a human reviews the filled skill before first use).
 - When the user rejects reviewed work, capture it the same turn: vurctos reject <card-id> --project . --reason "their words" (files the lesson, feeds it to the re-run, re-queues the card).
 
-See AGENTS.md and ORCHESTRATION.md for the full operating model.
+See AGENTS.md in this project folder and [ORCHESTRATION.md](https://github.com/Vurctne/VurctOS/blob/main/ORCHESTRATION.md) in the public VurctOS repository (this file is not included in the project folder) for the full operating model.

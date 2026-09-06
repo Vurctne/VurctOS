@@ -31,7 +31,7 @@ This project carries durable memory in two plain files at the project root:
 
 Open both files and treat their contents as known context before you plan or act. This instruction is written out in prose on purpose: Codex does not expand `@file` import syntax, so the files are named here for you to open directly. A Claude Code session gets the same two files via the `@USER.md` / `@MEMORY.md` imports in `CLAUDE.md`.
 
-User-level global memory lives outside this project at `~/.vurctos/USER.md` and `~/.vurctos/MEMORY.md`. In Codex, that global layer is loaded once per session from `~/.codex/AGENTS.md` (see `docs/memory-system.md`); it is not re-read here.
+User-level global memory lives outside this project at `~/.vurctos/USER.md` and `~/.vurctos/MEMORY.md`. In Codex, that global layer is loaded once per session from `~/.codex/AGENTS.md` and is not re-read here (see [docs/memory-system.md](https://github.com/Vurctne/VurctOS/blob/main/docs/memory-system.md) in the public VurctOS repository; that guide is not included in this project folder).
 
 Do not write to any of these durable-memory files directly. Capture goes through `vurctos remember` (day log and index only); the durable files change only through the human-gated `vurctos reflect` / `reflect-apply`, never through an agent editing them.
 

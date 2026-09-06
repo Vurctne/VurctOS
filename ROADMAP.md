@@ -62,7 +62,7 @@ Success criteria:
 
 ## Phase 3: Agent Orchestration
 
-Goal: strengthen the orchestration model in `ORCHESTRATION.md`, with Claude as Orchestrator coordinating Codex, Gemini, ChatGPT, and Hermes.
+Goal: strengthen the orchestration model in `ORCHESTRATION.md`, with Claude as Orchestrator coordinating Codex.
 
 Status: a first slice ships in v1. `vurctos dispatch` runs one `ready` + `channel: local` board card headlessly on the subscription (to `review`, never `done`) and `vurctos reject` wires review verdicts back into memory. The continuous dispatcher loop and the rest of this phase remain future.
 

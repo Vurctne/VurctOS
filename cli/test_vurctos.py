@@ -173,6 +173,21 @@ class VurctosMemoryTest(unittest.TestCase):
             vurctos.main(["remember", "--project", str(self.root),
                           "--what", "x"])
 
+    def test_memory_rejects_invalid_dates_without_writing_files(self):
+        proj = self._new()
+        before = sorted(proj.rglob("*"))
+        for command, option, extra in (
+                ("remember", "--date", ["--what", "x"]),
+                ("reflect", "--since", [])):
+            for value in ("2026-13-45", "yesterday", "20260630",
+                          "2026-W27-2", "2026-6-30", ""):
+                with self.subTest(command=command, value=value):
+                    with self.assertRaisesRegex(
+                            SystemExit, f"error: {option} .*YYYY-MM-DD"):
+                        vurctos.main([command, "--project", str(proj),
+                                      option, value] + extra)
+                    self.assertEqual(sorted(proj.rglob("*")), before)
+
     # --- reflection / consolidation ---
 
     def _remember_on(self, proj, what, date, kind="note"):
@@ -738,22 +753,25 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("- Communication preferences:", reflected)  # the added line survived
 
     def test_reflect_apply_refuses_ambiguous_prune(self):
-        # B2: "- What it is:" exists in BOTH USER.md and MEMORY.md.
+        # B2: seed a duplicate of a USER.md field in the MEMORY.md fixture.
         proj = self._new()
+        duplicate = "- Communication preferences:"
+        self.assertIn(duplicate, (proj / "USER.md").read_text(encoding="utf-8"))
+        mem = proj / "MEMORY.md"
+        mem.write_text(mem.read_text(encoding="utf-8") + f"\n{duplicate}\n",
+                       encoding="utf-8")
+        before = _durable(proj)
         staging = self._staged(proj)
         t = staging.read_text(encoding="utf-8").replace(
             "status: draft", "status: approved").replace(
             f"## {vurctos.SEC_PRUNE}\n",
-            f"## {vurctos.SEC_PRUNE}\n- What it is:\n")
+            f"## {vurctos.SEC_PRUNE}\n{duplicate}\n")
         staging.write_text(t, encoding="utf-8")
-        with self.assertRaises(SystemExit):
+        with self.assertRaisesRegex(SystemExit, "matches more than one line"):
             vurctos.main(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         # Nothing mutated: both lines intact, staging not marked applied.
-        self.assertIn("- What it is:",
-                      (proj / "USER.md").read_text(encoding="utf-8"))
-        self.assertIn("- What it is:",
-                      (proj / "MEMORY.md").read_text(encoding="utf-8"))
+        self.assertEqual(_durable(proj), before)
         self.assertIn("status: approved", staging.read_text(encoding="utf-8"))
 
     def test_reflect_template_carries_write_time_disciplines(self):

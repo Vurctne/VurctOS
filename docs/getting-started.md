@@ -27,10 +27,9 @@ Scaffolded projects include a `.claude/` folder with a SessionStart hook that ru
 Then fill in:
 
 - `README.md`: what the project is
-- `USER.md`: who you are and how you like to work
-- `PROFILE.md`: project facts and conventions
+- `USER.md`: your user profile, how you like to work, and how you decide
 - `task.md`: current task, inputs, outputs, and success criteria
-- `MEMORY.md`: reusable learning from this project (decisions, what worked, what failed)
+- `MEMORY.md`: project facts, conventions, and reusable learning (decisions, what worked, what failed)
 - `AGENTS.md`: local rules for the AI agents working in the project
 
 ## Recommended First Workflow

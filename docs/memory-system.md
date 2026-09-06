@@ -99,7 +99,7 @@ Session recall is the third memory layer. Working notes are logged as dated day 
 
 Each entry is also indexed into `sessions/index.db`, a local SQLite full-text index, so recall is fast across many sessions. The index uses FTS5 where the local SQLite supports it, and falls back to a plain substring search otherwise, so search works on any standard Python install. The `index.db` file is generated machine-local instance data and is not committed.
 
-The CLI files these for you: `vurctos remember` appends an entry to the day log and indexes it (durable memory is untouched until an approved `reflect-apply`), and `vurctos recall "<query>"` searches the index. `recall --stats` counts how often a lesson repeats across distinct dates (the promotion signal) and, without a query, summarizes capture coverage per kind. Because the day-logs are the source of truth and the index is derived, `vurctos reindex` can rebuild the index from the markdown at any time (fresh machine, or drift after `reflect-apply` prunes). See `cli/README.md`.
+The CLI files these for you: `vurctos remember` appends an entry to the day log and indexes it (durable memory is untouched until an approved `reflect-apply`), and `vurctos recall "<query>"` searches the index. `recall --stats` counts how often a lesson repeats across distinct dates (the promotion signal) and, without a query, summarizes capture coverage per kind. Because the day-logs are the source of truth and the index is derived and gitignored, `vurctos reindex` rebuilds it from the day-logs when it is absent on a fresh machine or clone, after index corruption, or after hand-editing a day-log. See `cli/README.md`.
 
 ## Obsidian Compatibility
 

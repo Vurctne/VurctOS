@@ -12,7 +12,7 @@ Use this folder to give your AI coding assistants (Claude Code and OpenAI Codex)
 - `sessions/`: dated session logs (session recall memory)
 - `reflections/`: staged consolidation proposals from `reflect`, before you apply them
 - `skills/`: project-specific experimental skills
-- `USER.md`: user and project context, how you like to work (durable memory)
+- `USER.md`: your user profile, how you like to work, and how you decide (durable memory)
 - `MEMORY.md`: project facts, decisions, and what worked or failed (durable memory)
 - `task.md`: current task and acceptance criteria
 - `AGENTS.md`: project-level agent rules

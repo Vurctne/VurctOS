@@ -23,9 +23,7 @@ Use this file to define the current unit of work.
 
 ## Workflow
 
-Recommended workflow:
-
-- `workflows/vibe-coding.md`
+Use the recommended [vibe coding workflow](https://github.com/Vurctne/VurctOS/blob/main/workflows/vibe-coding.md) in the public VurctOS repository (the workflow file is not included in this project folder).
 
 ## Agent Roles
 

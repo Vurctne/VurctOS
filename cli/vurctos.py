@@ -151,11 +151,23 @@ def _resolve_root(args):
     return root
 
 
+def _iso_date(value, option):
+    """Validate a real date with the canonical YYYY-MM-DD spelling."""
+    try:
+        parsed = datetime.date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError
+    except ValueError:
+        sys.exit(f"error: {option} must be a real date in YYYY-MM-DD "
+                 f"format (got {value!r})")
+    return value
+
+
 def _today(args):
     """Return the entry date: an explicit --date, else today (ISO)."""
     explicit = getattr(args, "date", None)
-    if explicit:
-        return explicit
+    if explicit is not None:
+        return _iso_date(explicit, "--date")
     return datetime.date.today().isoformat()
 
 
@@ -403,10 +415,9 @@ def cmd_reindex(args):
     """Rebuild the session index from the markdown day-logs.
 
     The day-logs are the source of truth; sessions/index.db is a derived,
-    machine-local artifact (gitignored). On a fresh clone or a second
-    machine the index simply does not exist, and reflect-apply prunes
-    markdown without touching the index, so a rebuild is the recovery path
-    for both.
+    machine-local artifact (gitignored). Rebuild the index when it is absent
+    on a fresh machine or clone, after index corruption, or after hand-editing
+    a day-log.
     """
     project = _resolve_root(args)
     db = project / INDEX_DB_RELPATH
@@ -696,7 +707,8 @@ def cmd_reflect(args):
     """Stage a reflection proposal from the unreflected session day logs."""
     project = _resolve_root(args)
     upto = _today(args)
-    staging, lower, logs = _stage_reflection(project, args.since, upto,
+    since = _iso_date(args.since, "--since") if args.since is not None else None
+    staging, lower, logs = _stage_reflection(project, since, upto,
                                              args.force)
     print(f"reflection staged: {staging}")
     print(f"window: {lower} .. {upto}  ({len(logs)} day-logs)")
