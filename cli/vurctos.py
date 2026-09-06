@@ -522,6 +522,11 @@ def cmd_reflect(args):
         "prune the superseded line in the SAME apply instead of stacking a "
         "second entry beside it.",
         "",
+        "Also mine for blind spots: when several failures in the window "
+        "point at one question nobody asked, propose that question as a "
+        "durable rule or skill candidate rather than filing each failure "
+        "separately.",
+        "",
         f"## {SEC_USER}",
         "",
         f"## {SEC_MEM}",
@@ -906,6 +911,10 @@ def _dispatch_prompt(card, agent="claude"):
         f"{handoff} in the format shown in handoffs/README.md (frontmatter: "
         f"card, from: {agent}-exec, to: claude, status: done, inputs, "
         f"outputs; body: Summary, Result, Notes For Review).\n"
+        f"If you hit an unknown the card does not answer (missing input, "
+        f"ambiguous requirement, an assumption you would otherwise guess), "
+        f"do not guess silently: state it under Notes For Review in the "
+        f"handoff.\n"
         f"Do only this card. Do not mark anything done in BOARD.md."
     )
 

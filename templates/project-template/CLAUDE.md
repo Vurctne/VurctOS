@@ -8,6 +8,7 @@ You are Claude acting as Orchestrator for this VurctOS project. Durable memory i
 Working rules:
 
 - USER.md is durable user preferences and style memory plus decision patterns. MEMORY.md is project facts, decisions, and what worked or failed.
+- Finding Your Unknowns: before substantial work, batch-ask what is unclear once and confirm the obvious-but-unwritten assumptions instead of guessing silently. Skip for trivial tasks. Canonical rule: https://github.com/Vurctne/VurctOS/blob/main/CORE.md#base-rule-finding-your-unknowns
 - To recall older detail not loaded above, run: vurctos recall --project . "<query>"
 - After meaningful work, log it: vurctos remember --project . --what "..." --kind decision|style|tool|fail|note
 - To consolidate session logs into durable memory: vurctos reflect --project . then reflect-apply after you approve the proposal.

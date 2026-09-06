@@ -275,6 +275,14 @@ class VurctosMemoryTest(unittest.TestCase):
                       (proj / "MEMORY.md").read_text(encoding="utf-8"))
         self.assertIn("status: approved", staging.read_text(encoding="utf-8"))
 
+    def test_reflect_template_carries_write_time_disciplines(self):
+        # The staged proposal must restate the keep-out list and the
+        # blind-spot mining instruction, so the distiller sees them every time.
+        proj = self._new()
+        text = self._staged(proj).read_text(encoding="utf-8")
+        self.assertIn("Keep out of durable memory", text)
+        self.assertIn("mine for blind spots", text)
+
     def test_reflect_apply_rejects_spoofed_status(self):
         # B3: a stray "status: approved" must not pass while the real one is draft.
         proj = self._new()
@@ -551,6 +559,14 @@ class VurctosDispatchTest(unittest.TestCase):
         self.assertIn("status: review", board.split("- id: card-102")[1])
         mem = (self.proj / "MEMORY.md").read_text(encoding="utf-8")
         self.assertIn("dispatch (codex) ran card-102 -> review", mem)
+
+    def test_dispatch_prompt_tells_executor_to_surface_unknowns(self):
+        # Finding Your Unknowns base rule: an Executor that hits an unknown
+        # the card does not answer must record it, not guess silently.
+        card = vurctos._parse_cards(BOARD_TWO_CARDS)[1]
+        prompt = vurctos._dispatch_prompt(card)
+        self.assertIn("do not guess silently", prompt)
+        self.assertIn("Notes For Review", prompt)
 
     # --- template doc-example and duplicate-id hardening ---
 

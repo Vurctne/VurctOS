@@ -7,13 +7,14 @@ Each worker returns a structured handoff file, not free-form chat, so the Orches
 ```text
 ---
 card: card-001
-from: gemini
+from: claude-exec
 to: claude
 status: done
 inputs:
-  - input/source.mp4
+  - src/config.py
 outputs:
-  - analysis/hook-analysis.md
+  - src/config.py
+  - tests/test_config.py
 ---
 
 ## Summary
@@ -23,7 +24,7 @@ One paragraph on what was produced.
 The concrete output, or a pointer to the output files.
 
 ## Notes For Review
-Anything the Orchestrator should check, plus known limitations.
+Anything the Orchestrator should check, known limitations, and any unknowns the card did not answer (record them here instead of guessing silently).
 ```
 
 The Orchestrator reads the handoff during result review, checks it against intent, project constraints, and style memory, then accepts the card or reopens it with feedback.

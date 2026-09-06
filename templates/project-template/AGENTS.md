@@ -18,6 +18,10 @@ Before making changes, read:
 - `task.md`
 - `MEMORY.md`
 
+## Base Rule: Finding Your Unknowns
+
+Before substantial work, surface unknowns instead of guessing silently. The Orchestrator batch-asks the key questions once and confirms the obvious-but-unwritten assumptions; an Executor running a card records any unknown the card does not answer under Notes For Review in the handoff. Skip for trivial tasks. Canonical rule: https://github.com/Vurctne/VurctOS/blob/main/CORE.md#base-rule-finding-your-unknowns
+
 ## Durable Memory (read before acting)
 
 This project carries durable memory in two plain files at the project root:

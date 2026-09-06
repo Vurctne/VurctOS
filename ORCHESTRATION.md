@@ -113,7 +113,7 @@ One paragraph on what was produced.
 The concrete output, or a pointer to the output files.
 
 ## Notes For Review
-Anything the Orchestrator should check, plus known limitations.
+Anything the Orchestrator should check, known limitations, and any unknowns the card did not answer (an Executor records these here instead of guessing silently; see the base rule in `CORE.md`).
 ```
 
 The Orchestrator reads the handoff during result review (loop step 7), checks it against intent, project constraints, and style memory, then either accepts it (card to `done`) or reopens the card with feedback. Reopening is mechanized by `vurctos reject <card-id> --reason "..."`: the reason is filed into memory, stamped into the card notes so the re-run carries it, and the card returns to `ready`.

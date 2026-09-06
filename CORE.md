@@ -47,6 +47,21 @@ User request
 
 This loop is the core operating model. Every workflow, project folder, memory file, agent handoff, and future MCP tool should support this loop.
 
+## Base Rule: Finding Your Unknowns
+
+Before any substantial step of the loop (planning, delegation, execution), the Orchestrator runs a cheap unknowns pass. The map is not the territory: the gap between the request/plan and the real world is the unknowns, and for substantial work surfacing them before acting is far cheaper than discovering them after execution.
+
+Four quadrants, three moves:
+
+- **Known knowns**: what the request states. Just do it.
+- **Known unknowns**: what you know is unclear. Batch the key questions and ask them once, up front.
+- **Unknown knowns**: assumptions so obvious nobody wrote them down. Name them explicitly and confirm the load-bearing ones.
+- **Unknown unknowns**: what nobody thought to ask. Run a blindspot scan: (1) which unstated assumptions could bite, (2) which implicit conventions need confirming, (3) what blind spots exist in the method or checks you are about to use.
+
+Never guess silently through an unknown. Surface it: the Orchestrator asks the user; an Executor records it in the handoff (see `ORCHESTRATION.md`). Skip the pass for trivial, well-trodden tasks.
+
+(Adapted from Thariq Shihipar's "A Field Guide to Fable: Finding Your Unknowns".)
+
 ## 1. Intent Detection
 
 The Core Assistant first identifies what kind of request the user is making.
