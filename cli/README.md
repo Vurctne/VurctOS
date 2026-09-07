@@ -77,7 +77,16 @@ python3 cli/vurctos.py memory-status --project my-project
 python3 cli/vurctos.py memory-status --global
 ```
 
-Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Once the backlog reaches 30 entries (`--stage-at N`, 0 disables) and no draft is waiting, it stages an empty `reflections/<today>.md` so there is a concrete file to fill instead of a command to remember. `--hook` prints the same facts as a Claude Code `SessionStart` payload; both shipped nudge hooks call it.
+Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Once the backlog reaches 30 entries (`--stage-at N`, 0 disables) and no draft is waiting, it stages an empty `reflections/<today>.md` so there is a concrete file to fill instead of a command to remember. `--hook` prints the same facts as a Claude Code `SessionStart` payload; both shipped nudge hooks call it. When a durable file is over its size budget (60 non-empty lines or 6 KiB), the report and the hook say so and point at `aging`.
+
+### Aging (retire old durable lines)
+
+```bash
+python3 cli/vurctos.py aging --project my-project --older-than 90
+python3 cli/vurctos.py aging --global
+```
+
+Read-only (it never creates or seeds anything, not even the global root). Durable memory that only grows gets slower and noisier, so each durable file has a size budget of 60 non-empty lines or 6 KiB; a file within budget is reported and left alone. For a file over budget, `aging` lists every line under a `### <date>` block that `reflect-apply` wrote more than `--older-than` days ago (default 90), verbatim and complete (continuation lines included, so a pasted prune never orphans a tail), as retirement candidates. When the file is over budget but no block is that old yet, it tells you the age of the oldest block and the `--older-than` value that would reach it, or that the weight is in hand-written sections above `## Reflected Updates`. Age is by reflection date, not by how often a line was used (a local adaptation, not the Hermes original). Nothing is deleted here: paste the lines to retire into the Prune section of the next `reflect` proposal and restate whatever still matters in its Add sections, so retirement goes through the same human-approved apply as everything else.
 
 ### Global memory (cross-project)
 

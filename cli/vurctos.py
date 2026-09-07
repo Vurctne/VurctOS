@@ -80,6 +80,11 @@ REFLECTED_HEADING = "## Reflected Updates"
 # Unreflected entries at which memory-status stages an empty draft, so the
 # session-start nudge can point at a concrete file instead of a command.
 REFLECT_STAGE_AT = 30
+# Size budget per durable file (non-empty lines / bytes). Over budget is the
+# retirement trigger: `aging` lists the oldest reflected blocks as prune
+# candidates for the next reflect. By date, not by use count: a local
+# adaptation, not the Hermes original.
+AGING_LINES, AGING_BYTES = 60, 6 * 1024
 _DAY_LOG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
 _STATUS_RE = re.compile(r"^status:\s*(\w+)\s*$", re.IGNORECASE)
 # Reflection proposals: <date>.md, or <date>-N.md when that date already
@@ -117,8 +122,11 @@ def _global_root():
     return Path(os.environ.get("VURCTOS_HOME") or "~/.vurctos").expanduser()
 
 
-def _resolve_root(args):
+def _resolve_root(args, seed=True):
     """Project root, or the user-level global root when --global is given.
+
+    seed=False returns the global root without creating or seeding it, for
+    read-only commands.
 
     The global root mirrors the Hermes Agent layout (a per-user memories
     home) and is created and seeded on first use, so `remember --global`
@@ -133,6 +141,8 @@ def _resolve_root(args):
     root = _global_root()
     if root.exists() and not root.is_dir():
         sys.exit(f"error: VURCTOS_HOME points at a non-directory: {root}")
+    if not seed:
+        return root
     (root / "sessions").mkdir(parents=True, exist_ok=True)
     (root / REFLECT_DIRNAME).mkdir(exist_ok=True)
     os.chmod(root, 0o700)  # private by construction, even on shared machines
@@ -1041,6 +1051,7 @@ def _memory_status(project, upto):
         "marker": _read_marker(project),
         "draft": _pending_draft(project),
         "legacy": _legacy_capture_lines(project),
+        "project": project,
     }
 
 
@@ -1058,17 +1069,127 @@ def _status_line(project, upto):
     return f"{head}; draft: none"
 
 
+def _durable_stats(path):
+    """(non-empty lines, bytes) of a durable file; (0, 0) when missing."""
+    if not path.exists():
+        return 0, 0
+    text = path.read_text(encoding="utf-8")
+    return sum(1 for ln in text.splitlines() if ln.strip()), \
+        len(text.encode("utf-8"))
+
+
 def _durable_size(path):
     if not path.exists():
         return "missing"
-    text = path.read_text(encoding="utf-8")
-    lines = sum(1 for ln in text.splitlines() if ln.strip())
-    return f"{lines} lines, {len(text.encode('utf-8'))} bytes"
+    lines, size = _durable_stats(path)
+    return f"{lines} lines, {size} bytes"
 
+
+def _over_budget(project):
+    """Names of durable files over the size budget."""
+    return [name for name in ("USER.md", "MEMORY.md")
+            if (lambda ln, by: ln > AGING_LINES or by > AGING_BYTES)(
+                *_durable_stats(project / name))]
+
+
+def _reflected_blocks(path):
+    """The dated blocks reflect-apply wrote: [(date, [lines])].
+
+    A block is a `### YYYY-MM-DD` heading after the Reflected Updates
+    heading, up to the next heading of any level. Every non-empty line in
+    it is captured verbatim, continuation lines included, so a candidate
+    pasted into Prune removes the whole item and never orphans a tail.
+    """
+    blocks, current, inside = [], None, False
+    if not path.exists():
+        return blocks
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if ln.strip() == REFLECTED_HEADING:
+            inside = True
+            continue
+        if not inside:
+            continue
+        if ln.startswith("#"):
+            current = None
+            if ln.startswith("### "):
+                try:
+                    datetime.date.fromisoformat(ln[4:].strip())
+                except ValueError:
+                    continue
+                current = (ln[4:].strip(), [])
+                blocks.append(current)
+        elif current is not None and ln.strip():
+            current[1].append(ln)
+    return blocks
+
+def cmd_aging(args):
+    """Read-only: list old reflected lines as prune candidates.
+
+    Only files over the size budget are enumerated; the budget is the
+    trigger, not a suggestion. Nothing here writes: retirement goes through
+    the next human-approved reflect-apply.
+    """
+    if args.older_than < 0:
+        sys.exit("error: --older-than must be 0 or more days")
+    project = _resolve_root(args, seed=False)
+    if not (project / "USER.md").exists() and \
+            not (project / "MEMORY.md").exists():
+        print(f"no durable memory at {project} yet; nothing to age")
+        return
+    upto = datetime.date.fromisoformat(_today(args))
+    cutoff = upto - datetime.timedelta(days=args.older_than)
+    scope = _scope_flag(args)
+    print(f"aging report ({scope}), reference date {upto}: blocks reflected "
+          f"before {cutoff} are candidates")
+    total = 0
+    for name in ("USER.md", "MEMORY.md"):
+        path = project / name
+        lines, size = _durable_stats(path)
+        over = name in _over_budget(project)
+        print(f"\n{name}: {lines} lines, {size} bytes "
+              f"({'OVER' if over else 'within'} the budget of {AGING_LINES} "
+              f"lines / {AGING_BYTES} bytes)")
+        if not over:
+            print("  within budget: nothing to retire")
+            continue
+        parsed = [(datetime.date.fromisoformat(d), ls)
+                  for d, ls in _reflected_blocks(path) if ls]
+        blocks = [(d, ls) for d, ls in parsed if d <= upto]
+        old = [(d, ls) for d, ls in blocks if d < cutoff]
+        if not old:
+            if not parsed:
+                print("  no reflected blocks: the size comes from "
+                      "hand-written sections, trim those by hand")
+            elif not blocks:
+                print(f"  all {len(parsed)} reflected blocks are dated "
+                      f"after the reference date {upto}; nothing is older "
+                      f"than it")
+            else:
+                oldest = max((upto - d).days for d, _ in blocks)
+                if oldest == 0:
+                    print("  no reflected block older than today; retry "
+                          "another day, or pick lines to retire by hand")
+                else:
+                    print(f"  no reflected block older than "
+                          f"{args.older_than} days; the oldest is {oldest} "
+                          f"days old, so retry with --older-than "
+                          f"{oldest - 1}, or trim the hand-written sections "
+                          f"above Reflected Updates")
+            continue
+        for d, ls in old:
+            print(f"  ### {d} ({(upto - d).days} days old, {len(ls)} lines)")
+            for ln in ls:
+                print(f"    {ln}")
+            total += len(ls)
+    print(f"\n{total} candidate lines. Nothing was changed: paste the ones to "
+          f"retire into the Prune section of the next `vurctos reflect "
+          f"{scope}` proposal, and restate what still matters in its Add "
+          f"sections (supersede, do not just delete).")
 
 def _hook_context(st, scope, stage_at):
     """The SessionStart nudge text, or None when nothing is waiting."""
-    if not st["entries"] and not st["draft"]:
+    if not st["entries"] and not st["draft"] \
+            and not _over_budget(st["project"]):
         return None
     where = "Global VurctOS memory" if scope == "--global" \
         else "This VurctOS project"
@@ -1100,6 +1221,11 @@ def _hook_context(st, scope, stage_at):
                      f"{scope}.")
     if st["legacy"][0]:
         parts.append(_legacy_note(st["legacy"]) + ".")
+    over = _over_budget(st["project"])
+    if over:
+        parts.append(f"{', '.join(over)} is over the {AGING_LINES}-line / "
+                     f"{AGING_BYTES // 1024}-KiB budget: run {cli} aging "
+                     f"{scope} for retirement candidates.")
     return " ".join(parts)
 
 
@@ -1139,6 +1265,11 @@ def cmd_memory_status(args):
         print("  draft: none")
     print(f"  durable: USER.md {_durable_size(project / 'USER.md')}; "
           f"MEMORY.md {_durable_size(project / 'MEMORY.md')}")
+    over = _over_budget(project)
+    if over:
+        print(f"  budget: {', '.join(over)} over {AGING_LINES} lines / "
+              f"{AGING_BYTES // 1024} KiB; run `vurctos aging {scope}` to "
+              f"list retirement candidates for the next reflect")
     if st["legacy"][0]:
         print(f"  legacy: {_legacy_note(st['legacy'])}")
         for ln in st["legacy"][1]:
@@ -1862,6 +1993,19 @@ def build_parser():
                            "(JSON) instead of the report; silent when "
                            "nothing is waiting")
     p_ms.set_defaults(func=cmd_memory_status)
+
+    p_ag = sub.add_parser("aging",
+                          help="list old reflected lines as prune candidates "
+                               "(read-only)")
+    p_ag.add_argument("--project", default=None,
+                      help="project folder (default: cwd)")
+    p_ag.add_argument("--global", dest="global_", action="store_true",
+                      help="report on the user-level memory at ~/.vurctos")
+    p_ag.add_argument("--older-than", type=int, default=90, metavar="DAYS",
+                      help="list blocks reflected more than DAYS ago "
+                           "(default: 90)")
+    p_ag.add_argument("--date", help="reference date (default: today)")
+    p_ag.set_defaults(func=cmd_aging)
 
     p_dis = sub.add_parser("dispatch",
                            help="run one ready local board card via headless "

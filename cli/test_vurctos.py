@@ -736,6 +736,113 @@ class VurctosMemoryTest(unittest.TestCase):
         ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"reflect --project '{proj}'", ctx)
 
+    def _reflected(self, proj, date, user_add):
+        """Run one reflect/apply on `date` adding `user_add` to USER.md."""
+        self._remember_on(proj, f"seed {date}", date)
+        vurctos.main(["reflect", "--project", str(proj), "--date", date])
+        staging = proj / "reflections" / f"{date}.md"
+        self._approve(staging, SEC_USER=user_add)
+        vurctos.main(["reflect-apply", "--project", str(proj), "--date", date])
+
+    def _pad_over_budget(self, proj, name="USER.md"):
+        """Push a durable file over the budget without touching its blocks."""
+        path = proj / name
+        text = path.read_text(encoding="utf-8")
+        pad = "".join(f"- hand-written line {i}\n" for i in range(70))
+        path.write_text(text.replace("\n## ", "\n" + pad + "\n## ", 1)
+                        if "\n## " in text else text + pad, encoding="utf-8")
+
+    def _snapshot(self, root):
+        return sorted((str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                      for p in root.rglob("*") if p.is_file())
+
+    def test_aging_lists_only_old_reflected_lines_read_only(self):
+        proj = self._new()
+        # Real blocks, written the way reflect-apply writes them, with a
+        # continuation line that a prune must not orphan.
+        self._reflected(proj, "2026-01-01",
+                        "- ancient rule one\n  continued detail\n"
+                        "- ancient rule two")
+        self._reflected(proj, "2026-06-25", "- recent rule")
+        self._pad_over_budget(proj)
+        before = self._snapshot(proj)
+        out = _out(["aging", "--project", str(proj), "--date", "2026-06-30",
+                    "--older-than", "90"])
+        self.assertIn("### 2026-01-01 (180 days old, 3 lines)", out)
+        self.assertIn("    - ancient rule one", out)
+        self.assertIn("      continued detail", out)
+        self.assertIn("    - ancient rule two", out)
+        self.assertNotIn("recent rule", out)
+        self.assertIn("3 candidate lines", out)
+        self.assertIn("Nothing was changed", out)
+        # MEMORY.md is within budget: never enumerated.
+        self.assertIn("within budget: nothing to retire", out)
+        self.assertEqual(self._snapshot(proj), before)  # read-only
+        # Boundary: age equal to DAYS is not "older than"; DAYS-1 is.
+        out = _out(["aging", "--project", str(proj), "--date", "2026-06-30",
+                    "--older-than", "180"])
+        self.assertIn("no reflected block older than 180 days; the oldest "
+                      "is 180 days old, so retry with --older-than 179", out)
+        self.assertIn("0 candidate lines", out)
+        out = _out(["aging", "--project", str(proj), "--date", "2026-06-30",
+                    "--older-than", "179"])
+        self.assertIn("### 2026-01-01 (180 days old", out)
+        # A reference date before every block: nothing is older, no crash.
+        out = _out(["aging", "--project", str(proj), "--date", "2025-12-31"])
+        self.assertIn("no reflected blocks on or before the reference date",
+                      out)
+        with self.assertRaises(SystemExit):
+            vurctos.main(["aging", "--project", str(proj),
+                          "--older-than", "-1"])
+
+    def test_aging_survives_hand_edits_around_the_blocks(self):
+        proj = self._new()
+        self._reflected(proj, "2026-01-01", "- ancient rule")
+        user = proj / "USER.md"
+        user.write_text(user.read_text(encoding="utf-8")
+                        + "\n### not-a-date\n\n- stray\n\n## Hand section\n\n"
+                        "- hand line\n\n### 2026-02-01\n\n- later block\n",
+                        encoding="utf-8")
+        self._pad_over_budget(proj)
+        out = _out(["aging", "--project", str(proj), "--date", "2026-12-31",
+                    "--older-than", "90"])
+        self.assertIn("- ancient rule", out)
+        self.assertIn("- later block", out)   # a block after a later H2
+        self.assertNotIn("stray", out)        # not under a dated heading
+        self.assertNotIn("hand line", out)
+
+    def test_memory_status_flags_the_size_budget(self):
+        proj = self._new()
+        self.assertNotIn("budget:", _out(["memory-status", "--project",
+                                          str(proj)]))
+        self._pad_over_budget(proj)
+        out = _out(["memory-status", "--project", str(proj)])
+        self.assertIn("budget: USER.md over 60 lines / 6 KiB", out)
+        self.assertIn("vurctos aging", out)
+        # Over budget alone, with nothing unreflected and no draft, still
+        # produces a hook payload.
+        hook = _out(["memory-status", "--project", str(proj), "--hook"])
+        ctx = json.loads(hook)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("USER.md is over the 60-line / 6-KiB budget", ctx)
+        self.assertIn(f"aging --project {proj}", ctx)
+
+    def test_aging_names_hand_written_weight_when_no_blocks_exist(self):
+        proj = self._new()
+        self._pad_over_budget(proj)
+        out = _out(["aging", "--project", str(proj)])
+        self.assertIn("no reflected blocks: the size comes from hand-written "
+                      "sections", out)
+
+    def test_aging_global_never_seeds_the_root(self):
+        ghome = self.root / "ghome-aging"
+        os.environ["VURCTOS_HOME"] = str(ghome)
+        try:
+            out = _out(["aging", "--global"])
+        finally:
+            del os.environ["VURCTOS_HOME"]
+        self.assertIn("no durable memory at", out)
+        self.assertFalse(ghome.exists())
+
     def test_reflect_apply_prunes_before_append(self):
         # B1: a prune target equal to an added line must NOT delete the add.
         proj = self._new()

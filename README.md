@@ -100,6 +100,7 @@ Shipped (v1):
   - `vurctos reindex` rebuilds the search index from the session day-logs
   - `vurctos reflect` / `vurctos reflect-apply` run the human-gated consolidation loop: reflect stages an empty proposal from the session day-logs, a human fills and approves it, reflect-apply mechanically prunes and appends it into durable memory (it refuses to run until status is `approved`, and writes nothing if any part of the proposal fails validation). `reflect-apply` is the only writer of `USER.md` / `MEMORY.md`; `remember` captures into the day-log and index only
   - `vurctos memory-status` shows the reflect backlog, the cursor, and any waiting draft, and stages an empty draft once the backlog is large; the shipped `SessionStart` nudge hooks call it
+  - `vurctos aging` lists old reflected lines as retirement candidates once a durable file is over its size budget (read-only; retirement goes through the next approved reflect)
   - `vurctos dispatch` / `vurctos reject` are the single-card agent layer (see below)
   - `vurctos skill-new` scaffolds an empty SKILL.md skeleton for a proven, repeated pattern
 - three-layer file memory, all plain inspectable files: durable (`USER.md` + `MEMORY.md`), procedural (`skills/` in the SKILL.md format), and session recall (`sessions/<date>.md` + the SQLite index)
