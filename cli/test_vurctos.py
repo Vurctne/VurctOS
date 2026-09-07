@@ -787,10 +787,18 @@ class VurctosMemoryTest(unittest.TestCase):
         out = _out(["aging", "--project", str(proj), "--date", "2026-06-30",
                     "--older-than", "179"])
         self.assertIn("### 2026-01-01 (180 days old", out)
-        # A reference date before every block: nothing is older, no crash.
+        # A reference date before every block: the weight is in reflected
+        # blocks that are simply newer, not in hand-written sections.
         out = _out(["aging", "--project", str(proj), "--date", "2025-12-31"])
-        self.assertIn("no reflected blocks on or before the reference date",
-                      out)
+        self.assertIn("all 2 reflected blocks are dated after the reference "
+                      "date 2025-12-31", out)
+        self.assertNotIn("hand-written", out)
+        # The oldest eligible block is from today: --older-than 0 would
+        # only repeat the same empty result, so say so.
+        out = _out(["aging", "--project", str(proj), "--date", "2026-01-01",
+                    "--older-than", "0"])
+        self.assertIn("no reflected block older than today", out)
+        self.assertNotIn("--older-than 0", out)
         with self.assertRaises(SystemExit):
             vurctos.main(["aging", "--project", str(proj),
                           "--older-than", "-1"])
