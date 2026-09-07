@@ -1554,6 +1554,16 @@ def cmd_dispatch(args):
     if shutil.which(agent) is None:
         sys.exit(f"error: `{agent}` CLI not found on PATH. Install it and "
                  f"log in first.")
+    state, detail = _login_state(agent, project)
+    if state is False:
+        # Environment, not card: like a missing CLI, this leaves the board
+        # alone and spends nothing. A Claude desktop-app session's login is
+        # not inherited by a headless child (the child env drops the app's
+        # routing on purpose), so the CLI needs its own login once.
+        sys.exit(f"error: `{agent}` has no subscription login for headless "
+                 f"runs ({detail or 'status unavailable'}). Run "
+                 f"`{LOGIN_CMD[agent]}` once in a terminal, then re-run "
+                 f"dispatch.")
 
     print(f"dispatching card {card['id']} to {agent}: "
           f"{card.get('title', '(untitled)')}")
@@ -1589,11 +1599,12 @@ def cmd_dispatch(args):
         reason = "usage limit reached"
     else:
         parts = []
-        if err.strip():
+        agent_said = _agent_message(out, err)
+        if agent_said:
             # Truncate the agent's own message, never the problem list: a
             # long traceback must not push out what was missing. Collapse
             # whitespace, since a day-log entry is one line.
-            parts.append(" ".join(err.split())[:200])
+            parts.append(" ".join(agent_said.split())[:200])
         if problems:
             parts.append("did not produce: " + ", ".join(problems))
         reason = "; ".join(parts) or "the run failed without a message"
@@ -1601,6 +1612,76 @@ def cmd_dispatch(args):
     if limit_hit:
         print("usage limit hit; stop dispatching until the reset time "
               "shown above.")
+
+
+LOGIN_CMD = {"claude": "claude auth login", "codex": "codex login"}
+
+
+def _login_state(agent, project):
+    """Best-effort, free preflight. Return (state, detail).
+
+    state is True when the agent CLI positively reports a subscription
+    login, False when it reports being logged out or logged in by some
+    other route (an API key is not the subscription, and a headless run
+    must never bill anything else), and None when nothing can be
+    established: an older CLI without the status command, a timeout, or
+    wording this code does not know. None lets the run proceed, since the
+    run plus its output verification remains the real gate.
+
+    Runs inside the project with the same stripped environment as the run,
+    so it answers for the run, not for the caller's shell or cwd.
+    """
+    cmd = {"claude": ["claude", "auth", "status", "--json"],
+           "codex": ["codex", "login", "status"]}[agent]
+    try:
+        proc = subprocess.run(cmd, cwd=str(project), env=_child_env(),
+                              stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    lines = [ln.strip() for ln in (proc.stdout + proc.stderr).splitlines()
+             if ln.strip()]
+    # Quote the line that states the login, not a warning printed above it.
+    auth_lines = [ln for ln in lines if "logged in" in ln.lower()]
+    detail = (auth_lines or lines or [""])[0][:120]
+    if agent == "claude":
+        try:
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            return None, detail
+        flag = payload.get("loggedIn") if isinstance(payload, dict) else None
+        if not isinstance(flag, bool):
+            return None, detail
+        return flag, f"loggedIn: {str(flag).lower()}"
+    text = " ".join(lines).lower()
+    if "not logged in" in text:
+        return False, detail
+    if proc.returncode == 0 and "logged in using chatgpt" in text:
+        return True, detail
+    if proc.returncode == 0 and "logged in using" in text:
+        return False, detail  # a login, but not the subscription
+    return None, detail
+
+
+def _agent_message(out, err):
+    """What the agent itself said went wrong, or an empty string.
+
+    `claude -p --output-format json` reports failures such as "Not logged
+    in" inside the stdout JSON with is_error set, with nothing on stderr;
+    without reading it, a login failure is misreported as the run merely
+    not producing its outputs. Stderr wins when present.
+    """
+    if err.strip():
+        return err.strip()
+    if len(out) > 1 << 20:  # a diagnostic, not worth decoding megabytes
+        return ""
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        return ""
+    if isinstance(payload, dict) and payload.get("is_error"):
+        return str(payload.get("result") or "the agent reported an error")
+    return ""
 
 
 def _file_memory(project, kind, what, evidence):

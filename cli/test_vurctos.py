@@ -869,11 +869,14 @@ class VurctosDispatchTest(unittest.TestCase):
         (self.proj / "BOARD.md").write_text(BOARD_TWO_CARDS, encoding="utf-8")
         self._real_run = vurctos._run_claude
         self._real_which = vurctos.shutil.which
+        self._real_login = vurctos._login_state
         vurctos.shutil.which = lambda name: "/usr/bin/true"
+        vurctos._login_state = lambda agent, project: (True, "")
 
     def tearDown(self):
         vurctos._run_claude = self._real_run
         vurctos.shutil.which = self._real_which
+        vurctos._login_state = self._real_login
         self.tmp.cleanup()
 
     def _board(self):
@@ -1344,6 +1347,98 @@ class VurctosDispatchTest(unittest.TestCase):
         block = self._board().split("- id: card-102")[1]
         self.assertIn("status: blocked", block)
         self.assertNotIn("status: done", block)
+
+    def test_agent_error_inside_the_json_result_is_surfaced(self):
+        # A real smoke run failed with "Not logged in", reported only inside
+        # the stdout JSON; the block reason must say so, not just list the
+        # outputs that were never produced.
+        def not_logged_in(prompt, project, timeout):
+            return 1, json.dumps({"type": "result", "is_error": True,
+                                  "result": "Not logged in. Please run /login"}), ""
+        vurctos._run_claude = not_logged_in
+        out = _out(["dispatch", "--project", str(self.proj)])
+        self.assertIn("Not logged in", out)
+        self.assertIn("did not produce: handoffs/card-102.md", out)
+        self.assertIn("Not logged in", _today_log(self.proj))
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_not_logged_in_is_refused_before_the_run_and_leaves_the_board(self):
+        vurctos._login_state = lambda agent, project: (False, "loggedIn: false")
+
+        def must_not_run(*a, **k):
+            raise AssertionError("the agent ran without a login")
+        vurctos._run_claude = must_not_run
+        before = self._board()
+        with self.assertRaises(SystemExit) as cm:
+            vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("claude auth login", str(cm.exception))
+        self.assertIn("loggedIn: false", str(cm.exception))
+        self.assertEqual(self._board(), before)  # not claimed, not blocked
+        today = datetime.date.today().isoformat()
+        self.assertFalse((self.proj / "sessions" / f"{today}.md").exists())
+
+    def test_unknown_login_state_lets_the_run_be_the_gate(self):
+        vurctos._login_state = lambda agent, project: (None, "")
+        vurctos._run_claude = lambda p, pr, t: (0, "{}", "")  # produces nothing
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: blocked",
+                      self._board().split("- id: card-102")[1])
+
+    def test_login_state_parses_both_clis(self):
+        import subprocess as sp
+        seen = []
+
+        def fake_for(rc, out, err=""):
+            def run(cmd, **kw):
+                seen.append((cmd, kw))
+                return sp.CompletedProcess(cmd, rc, out, err)
+            return run
+        cases = [
+            # agent, rc, stdout, stderr, expected state
+            ("claude", 0, '{"loggedIn": true, "authMethod": "claude.ai"}', "", True),
+            ("claude", 0, '{"loggedIn": false, "authMethod": "none"}', "", False),
+            ("claude", 0, '{"loggedIn": "false"}', "", None),  # not a bool
+            ("claude", 0, '{"authMethod": "none"}', "", None),  # key missing
+            ("claude", 0, '[true]', "", None),                 # not a dict
+            ("claude", 1, 'error: unknown option --json', "", None),
+            ("codex", 0, "Logged in using ChatGPT\n", "", True),
+            ("codex", 0, "Logged in using API key\n", "", False),
+            ("codex", 1, "", "Not logged in\n", False),
+            ("codex", 1, "", "error: config parse failure\n", None),
+            ("codex", 0, "Signed in (new wording)\n", "", None),
+            ("codex", 1, "", "warning: config deprecated\nNot logged in\n",
+             False),
+        ]
+        real_run = vurctos.subprocess.run
+        os.environ["ANTHROPIC_BASE_URL"] = "https://should-be-stripped"
+        try:
+            for agent, rc, out, err, want in cases:
+                vurctos.subprocess.run = fake_for(rc, out, err)
+                state, detail = self._real_login(agent, self.proj)
+                self.assertIs(state, want, (agent, out, err))
+                if "logged in" in (out + err).lower():
+                    self.assertIn("logged in", detail.lower(), (agent, out, err))
+                    self.assertNotIn("warning", detail.lower())
+                cmd, kw = seen[-1]
+                self.assertEqual(cmd, {"claude": ["claude", "auth", "status",
+                                                  "--json"],
+                                       "codex": ["codex", "login", "status"]}
+                                 [agent])
+                self.assertEqual(kw["cwd"], str(self.proj))
+                self.assertIs(kw["stdin"], sp.DEVNULL)
+                self.assertNotIn("ANTHROPIC_BASE_URL", kw["env"])
+                self.assertEqual(kw["timeout"], 30)
+            for exc in (OSError("no such binary"),
+                        sp.TimeoutExpired("x", 30)):
+                def raiser(cmd, **kw):
+                    raise exc
+                vurctos.subprocess.run = raiser
+                self.assertEqual(self._real_login("codex", self.proj),
+                                 (None, ""))
+        finally:
+            vurctos.subprocess.run = real_run
+            del os.environ["ANTHROPIC_BASE_URL"]
 
     def test_escaping_path_is_refused_before_the_agent_runs(self):
         escape_board = BOARD_TWO_CARDS.replace(
