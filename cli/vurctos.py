@@ -80,11 +80,17 @@ REFLECTED_HEADING = "## Reflected Updates"
 # Unreflected entries at which memory-status stages an empty draft, so the
 # session-start nudge can point at a concrete file instead of a command.
 REFLECT_STAGE_AT = 30
-# Size budget per durable file (non-empty lines / bytes). Over budget is the
+# Size budget per durable file (non-empty lines, bytes). Over budget is the
 # retirement trigger: `aging` lists the oldest reflected blocks as prune
 # candidates for the next reflect. By date, not by use count: a local
-# adaptation, not the Hermes original.
-AGING_LINES, AGING_BYTES = 60, 6 * 1024
+# adaptation, not the Hermes original. MEMORY.md carries dense tool and
+# method facts, so its byte budget is larger.
+AGING_BUDGET = {"USER.md": (60, 6 * 1024), "MEMORY.md": (60, 24 * 1024)}
+
+
+def _budget_label(name):
+    lines, size = AGING_BUDGET[name]
+    return f"{lines} lines / {size // 1024} KiB"
 _DAY_LOG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
 _STATUS_RE = re.compile(r"^status:\s*(\w+)\s*$", re.IGNORECASE)
 # Reflection proposals: <date>.md, or <date>-N.md when that date already
@@ -1086,10 +1092,13 @@ def _durable_size(path):
 
 
 def _over_budget(project):
-    """Names of durable files over the size budget."""
-    return [name for name in ("USER.md", "MEMORY.md")
-            if (lambda ln, by: ln > AGING_LINES or by > AGING_BYTES)(
-                *_durable_stats(project / name))]
+    """Names of durable files over their size budget."""
+    over = []
+    for name, (max_lines, max_bytes) in AGING_BUDGET.items():
+        lines, size = _durable_stats(project / name)
+        if lines > max_lines or size > max_bytes:
+            over.append(name)
+    return over
 
 
 def _reflected_blocks(path):
@@ -1132,8 +1141,7 @@ def cmd_aging(args):
     if args.older_than < 0:
         sys.exit("error: --older-than must be 0 or more days")
     project = _resolve_root(args, seed=False)
-    if not (project / "USER.md").exists() and \
-            not (project / "MEMORY.md").exists():
+    if not any((project / n).exists() for n in AGING_BUDGET):
         print(f"no durable memory at {project} yet; nothing to age")
         return
     upto = datetime.date.fromisoformat(_today(args))
@@ -1142,13 +1150,17 @@ def cmd_aging(args):
     print(f"aging report ({scope}), reference date {upto}: blocks reflected "
           f"before {cutoff} are candidates")
     total = 0
-    for name in ("USER.md", "MEMORY.md"):
+    for name, (max_lines, max_bytes) in AGING_BUDGET.items():
         path = project / name
         lines, size = _durable_stats(path)
-        over = name in _over_budget(project)
-        print(f"\n{name}: {lines} lines, {size} bytes "
-              f"({'OVER' if over else 'within'} the budget of {AGING_LINES} "
-              f"lines / {AGING_BYTES} bytes)")
+        over = lines > max_lines or size > max_bytes
+        if lines > max_lines:
+            verdict = f"OVER its budget: lines {lines} > {max_lines}"
+        elif size > max_bytes:
+            verdict = f"OVER its budget: bytes {size} > {max_bytes}"
+        else:
+            verdict = f"within its budget of {max_lines} lines / {max_bytes} bytes"
+        print(f"\n{name}: {lines} lines, {size} bytes ({verdict})")
         if not over:
             print("  within budget: nothing to retire")
             continue
@@ -1223,9 +1235,9 @@ def _hook_context(st, scope, stage_at):
         parts.append(_legacy_note(st["legacy"]) + ".")
     over = _over_budget(st["project"])
     if over:
-        parts.append(f"{', '.join(over)} is over the {AGING_LINES}-line / "
-                     f"{AGING_BYTES // 1024}-KiB budget: run {cli} aging "
-                     f"{scope} for retirement candidates.")
+        listed = ", ".join(f"{n} (budget {_budget_label(n)})" for n in over)
+        parts.append(f"Over budget: {listed}; run {cli} aging {scope} for "
+                     f"retirement candidates.")
     return " ".join(parts)
 
 
@@ -1267,9 +1279,9 @@ def cmd_memory_status(args):
           f"MEMORY.md {_durable_size(project / 'MEMORY.md')}")
     over = _over_budget(project)
     if over:
-        print(f"  budget: {', '.join(over)} over {AGING_LINES} lines / "
-              f"{AGING_BYTES // 1024} KiB; run `vurctos aging {scope}` to "
-              f"list retirement candidates for the next reflect")
+        listed = ", ".join(f"{n} over {_budget_label(n)}" for n in over)
+        print(f"  budget: {listed}; run `vurctos aging {scope}` to list "
+              f"retirement candidates for the next reflect")
     if st["legacy"][0]:
         print(f"  legacy: {_legacy_note(st['legacy'])}")
         for ln in st["legacy"][1]:

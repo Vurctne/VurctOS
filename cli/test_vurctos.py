@@ -803,6 +803,31 @@ class VurctosMemoryTest(unittest.TestCase):
             vurctos.main(["aging", "--project", str(proj),
                           "--older-than", "-1"])
 
+    def test_aging_applies_memory_md_larger_byte_budget(self):
+        proj = self._new()
+        self._remember_on(proj, "seed", "2026-01-01")
+        vurctos.main(["reflect", "--project", str(proj), "--date", "2026-01-01"])
+        staging = proj / "reflections" / "2026-01-01.md"
+        self._approve(staging, SEC_MEM="- ancient tool fact")
+        vurctos.main(["reflect-apply", "--project", str(proj),
+                      "--date", "2026-01-01"])
+        mem = proj / "MEMORY.md"
+        base = mem.read_text(encoding="utf-8")
+        # 7 KiB of dense lines: over USER.md's budget, within MEMORY.md's.
+        mem.write_text(base.replace("\n## ", "\n- " + "x" * 7000 + "\n\n## ", 1),
+                       encoding="utf-8")
+        out = _out(["aging", "--project", str(proj), "--date", "2026-12-31"])
+        self.assertIn("MEMORY.md: ", out)
+        self.assertIn("within its budget of 60 lines / 24576 bytes", out)
+        self.assertNotIn("ancient tool fact", out)
+        # Past 24 KiB the same old block becomes a candidate.
+        mem.write_text(base.replace("\n## ", "\n- " + "y" * 25000 + "\n\n## ", 1),
+                       encoding="utf-8")
+        out = _out(["aging", "--project", str(proj), "--date", "2026-12-31"])
+        self.assertIn("OVER its budget: bytes", out)
+        self.assertIn("> 24576", out)
+        self.assertIn("    - ancient tool fact", out)
+
     def test_aging_survives_hand_edits_around_the_blocks(self):
         proj = self._new()
         self._reflected(proj, "2026-01-01", "- ancient rule")
@@ -827,11 +852,22 @@ class VurctosMemoryTest(unittest.TestCase):
         out = _out(["memory-status", "--project", str(proj)])
         self.assertIn("budget: USER.md over 60 lines / 6 KiB", out)
         self.assertIn("vurctos aging", out)
+        # MEMORY.md has its own, larger byte budget: 7 KiB of dense lines
+        # is within it, 25 KiB is not.
+        mem = proj / "MEMORY.md"
+        mem.write_text(mem.read_text(encoding="utf-8")
+                       + "- " + "x" * 7000 + "\n", encoding="utf-8")
+        self.assertNotIn("MEMORY.md over", _out(["memory-status",
+                                                 "--project", str(proj)]))
+        mem.write_text(mem.read_text(encoding="utf-8")
+                       + "- " + "y" * 18000 + "\n", encoding="utf-8")
+        self.assertIn("MEMORY.md over 60 lines / 24 KiB",
+                      _out(["memory-status", "--project", str(proj)]))
         # Over budget alone, with nothing unreflected and no draft, still
         # produces a hook payload.
         hook = _out(["memory-status", "--project", str(proj), "--hook"])
         ctx = json.loads(hook)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("USER.md is over the 60-line / 6-KiB budget", ctx)
+        self.assertIn("Over budget: USER.md (budget 60 lines / 6 KiB)", ctx)
         self.assertIn(f"aging --project {proj}", ctx)
 
     def test_aging_names_hand_written_weight_when_no_blocks_exist(self):
