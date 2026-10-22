@@ -36,6 +36,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows: captures are appended without a file lock
+    fcntl = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = REPO_ROOT / "templates" / "project-template"
 
@@ -72,20 +77,26 @@ def cmd_new(args):
 # on its runtime.
 
 INDEX_DB_RELPATH = "sessions/index.db"
-MEMORY_KINDS = ["decision", "style", "tool", "fail", "note"]
+MEMORY_KINDS = ["decision", "style", "tool", "fail", "note", "correction",
+                "fact"]
 
 REFLECT_DIRNAME = "reflections"
 REFLECT_MARKER_RELPATH = "reflections/.last-reflected"
 REFLECTED_HEADING = "## Reflected Updates"
-# Unreflected entries at which memory-status stages an empty draft, so the
-# session-start nudge can point at a concrete file instead of a command.
-REFLECT_STAGE_AT = 30
-# Size budget per durable file (non-empty lines, bytes). Over budget is the
-# retirement trigger: `aging` lists the oldest reflected blocks as prune
-# candidates for the next reflect. By date, not by use count: a local
-# adaptation, not the Hermes original. MEMORY.md carries dense tool and
-# method facts, so its byte budget is larger.
+# The session-start nudge speaks only once the backlog is worth a short
+# consolidation: this many unreflected entries, or an oldest entry this
+# many days old. Small, frequent batches keep durable memory from bloating.
+REFLECT_NUDGE_AT = 60
+REFLECT_NUDGE_DAYS = 7
+# Size budget per durable file (non-empty lines, bytes). reflect-apply
+# refuses a result over budget; `aging` lists the oldest reflected blocks
+# as prune candidates. By date, not by use count: a local adaptation, not
+# the Hermes original. MEMORY.md carries dense tool and method facts, so
+# its byte budget is larger.
 AGING_BUDGET = {"USER.md": (60, 6 * 1024), "MEMORY.md": (60, 24 * 1024)}
+# One fact per durable line: a line added by reflect-apply may not exceed
+# this many UTF-8 bytes, so a correction replaces one fact, not a paragraph.
+DURABLE_LINE_MAX = 512
 
 
 def _budget_label(name):
@@ -108,6 +119,10 @@ SEC_PRUNE = "Prune (exact lines to remove from USER.md or MEMORY.md)"
 SEC_SKILLS = "Skill candidates"
 SEC_RATIONALE = "Rationale"
 REFLECT_SECTIONS = (SEC_USER, SEC_MEM, SEC_PRUNE, SEC_SKILLS, SEC_RATIONALE)
+# Staged ahead of those sections, and the parser splits only on them, so it
+# never reads this one: facts the CLI computed for the distiller, not
+# content to apply.
+SEC_DIGEST = "Digest (computed by the CLI, never applied)"
 
 
 def _project_root(project):
@@ -321,30 +336,80 @@ def _print_index_stats(db_path):
             print(f"  {date} [{kind}] {what}")
 
 
-def _append_session_entry(path, date, kind, what, evidence):
-    """Append one entry to the day's session log, creating the file if absent."""
-    if path.exists():
-        text = path.read_text(encoding="utf-8").rstrip("\n")
-    else:
-        text = f"# Session: {date}\n\n## Entries"
-    entry = f"\n\n- [{kind}] {what}"
+def _append_session_entry(path, date, kind, what, evidence, subs=()):
+    """Append one entry to the day's session log. Return its number that day.
+
+    The file is opened for append and held under an exclusive lock while the
+    entry is counted and written, so two sessions filing at the same moment
+    both land (a read-and-rewrite would silently drop one of them). `subs`
+    are extra (key, value) sub-lines in the same shape as evidence.
+    """
+    lines = [f"- [{kind}] {what}"]
     if evidence:
-        entry += f"\n  - evidence: {evidence}"
-    path.write_text(text + entry + "\n", encoding="utf-8")
+        lines.append(f"  - evidence: {evidence}")
+    lines += [f"  - {key}: {value}" for key, value in subs]
+    with open(path, "ab+") as fh:
+        if fcntl:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fh.seek(0)
+        old = fh.read().decode("utf-8")
+        if not old:
+            prefix = f"# Session: {date}\n\n## Entries\n\n"
+        else:
+            prefix = "\n" if old.endswith("\n") else "\n\n"
+        fh.write((prefix + "\n".join(lines) + "\n").encode("utf-8"))
+    return sum(1 for ln in old.splitlines() if _LOG_ENTRY_RE.match(ln)) + 1
 
 
-def _capture(project, date, kind, what, evidence):
-    """Append one entry to the day log and index it. Return (log, mode).
+def _capture(project, date, kind, what, evidence, subs=()):
+    """Append one entry to the day log and index it. Return (log, mode, id).
 
     Session recall only: durable memory is written by reflect-apply alone.
+    The day log is the source of truth, so an index failure after the entry
+    is filed is reported, not raised: the entry is kept and `reindex`
+    repairs the index.
     """
     sessions = project / "sessions"
     log = sessions / f"{date}.md"
     sessions.mkdir(exist_ok=True)
-    _append_session_entry(log, date, kind, what, evidence)
-    mode = _index_entry(project / INDEX_DB_RELPATH, date, kind, what,
-                        evidence, f"sessions/{date}.md")
-    return log, mode
+    number = _append_session_entry(log, date, kind, what, evidence, subs)
+    try:
+        mode = _index_entry(project / INDEX_DB_RELPATH, date, kind, what,
+                            evidence, f"sessions/{date}.md")
+    except sqlite3.Error as exc:
+        mode = f"index not updated ({exc}); run `vurctos reindex`"
+    return log, mode, f"{date}#{number}"
+
+
+# Entry ids are the day plus the entry's position in that day's log. Day
+# logs are append-only, so the position never changes.
+_ENTRY_ID_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})#([1-9]\d*)$")
+_SCOPE_RE = re.compile(r"^(global|project:\S+)$")
+# Phone, ID-card and Medicare-shaped numbers: one run of 9 to 18 digits
+# (an ID card may end in X), or groups of 3+ digits joined by single spaces
+# adding up to 9 to 18 digits.
+# Personal form data belongs in the private profile, never in day logs.
+# ASCII-only boundaries, so a number written right after Chinese text still
+# counts, while ids such as 2026-10-22#16 or decimals do not.
+_PII_RE = re.compile(r"(?<![0-9A-Za-z.#-])(\d{3,}(?: \d{3,})+|\d{9,}[Xx]?)"
+                     r"(?![0-9A-Za-z.-])")
+
+
+def _pii_hits(text):
+    return [m.group(1) for m in _PII_RE.finditer(text)
+            if 9 <= len(re.sub(r"\D", "", m.group(1))) <= 18]
+
+
+def _entry_kind(kind, what):
+    """Resolve the kind: an explicit --kind wins; otherwise a leading
+    `[kind]` tag in the text becomes the kind instead of sitting behind a
+    default `[note]`. Return (kind, what)."""
+    if kind:
+        return kind, what
+    m = re.match(r"^\[([a-z]+)\]\s+(.+)$", what)
+    if m and m.group(1) in MEMORY_KINDS:
+        return m.group(1), m.group(2)
+    return "note", what
 
 
 def cmd_remember(args):
@@ -355,17 +420,39 @@ def cmd_remember(args):
     """
     project = _resolve_root(args)
     date = _today(args)
-    kind = args.kind
-    what = args.what.strip()
+    kind, what = _entry_kind(args.kind, args.what.strip())
     evidence = (args.evidence or "").strip()
+    landed = (args.landed or "").strip()
     if not what:
         sys.exit("error: --what must not be empty")
-    # The day-log format is line-based (one `- [kind] what` line, one
-    # optional evidence line), so multiline fields cannot round-trip
-    # through `reindex`. Same invariant as the reject reason.
-    if any(c in what or c in evidence for c in "\n\r"):
-        sys.exit("error: --what and --evidence must be single lines; "
-                 "file long detail as its own entry or a file reference")
+    # The day-log format is line-based (one `- [kind] what` line, then
+    # optional `  - key: value` sub-lines), so multiline fields cannot
+    # round-trip through `reindex`. Same invariant as the reject reason.
+    if any(c in f for f in (what, evidence, landed) for c in "\n\r"):
+        sys.exit("error: --what, --evidence and --landed must be single "
+                 "lines; file long detail as its own entry or a file "
+                 "reference")
+    subs = []
+    for target in args.supersedes or []:
+        m = _ENTRY_ID_RE.match(target)
+        if not m or int(m.group(2)) > _entry_count(
+                project / "sessions" / f"{m.group(1)}.md"):
+            sys.exit(f"error: --supersedes {target!r} is not an existing "
+                     f"entry id (YYYY-MM-DD#N, as printed by remember)")
+        subs.append(("supersedes", target))
+    if args.scope:
+        if not _SCOPE_RE.match(args.scope):
+            sys.exit("error: --scope must be 'global' or 'project:<name>'")
+        subs.append(("scope", args.scope))
+    if landed:
+        subs.append(("landed", landed))
+    hits = _pii_hits(" ".join((what, evidence, landed)))
+    if hits and not args.allow_pii:
+        masked = ", ".join(h[:2] + "*" * (len(h) - 4) + h[-2:] for h in hits)
+        sys.exit(f"error: this entry contains what looks like a phone, ID "
+                 f"or card number ({masked}). Personal form data belongs in "
+                 f"the private profile, not in day logs; drop the number, "
+                 f"or pass --allow-pii if it is not personal.")
 
     # A backdated entry behind the cursor, or inside the window a pending
     # proposal will consume on apply, would never be reflected.
@@ -375,9 +462,9 @@ def cmd_remember(args):
                  f"cursor or the end of the pending proposal's window, so "
                  f"the entry would never be reflected. File it without "
                  f"--date and mention the original date in the text.")
-    log, mode = _capture(project, date, kind, what, evidence)
+    log, mode, entry_id = _capture(project, date, kind, what, evidence, subs)
 
-    print(f"remembered [{kind}] on {date}")
+    print(f"remembered [{kind}] on {date} as {entry_id}")
     print(f"  session: {log}")
     print(f"  index:   {project / INDEX_DB_RELPATH} ({mode})")
     today = datetime.date.today().isoformat()
@@ -391,7 +478,7 @@ def cmd_recall(args):
     global or becomes a skill only when it repeats) needs a number, not a
     hunch, and the index already holds the data.
     """
-    project = _resolve_root(args)
+    project = _resolve_root(args, seed=False)
     db = project / INDEX_DB_RELPATH
     if not db.exists():
         sys.exit(f"error: no session index at {db}. Run `vurctos remember` "
@@ -437,6 +524,9 @@ def cmd_reindex(args):
     a day-log.
     """
     project = _resolve_root(args)
+    # Fails closed when a hand edit removed entries the cursor already
+    # counted: entry ids are positions, so a shrunk log would shift them.
+    _read_marker(project)
     db = project / INDEX_DB_RELPATH
     logs = _day_logs(project)
     if db.exists():
@@ -501,6 +591,27 @@ def _entry_count(path):
         return 0
     return sum(1 for ln in path.read_text(encoding="utf-8").splitlines()
                if _LOG_ENTRY_RE.match(ln))
+
+
+_SUB_LINE_RE = re.compile(r"^\s+- ([a-z]+): (.*)$")
+
+
+def _log_entries(date, path):
+    """The entries of one day log, in order, as dicts: id, kind, what and
+    subs ({key: [values]} from the `  - key: value` lines under it)."""
+    entries = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        m = _LOG_ENTRY_RE.match(ln)
+        if m:
+            entries.append({"id": f"{date}#{len(entries) + 1}",
+                            "kind": m.group(1), "what": m.group(2),
+                            "subs": {}})
+            continue
+        s = _SUB_LINE_RE.match(ln)
+        if s and entries:
+            entries[-1]["subs"].setdefault(s.group(1), []).append(
+                s.group(2).strip())
+    return entries
 
 
 def _parse_cursor(raw):
@@ -635,6 +746,77 @@ def _capture_floor(project):
     return max(dates) if dates else None
 
 
+def _untouched(path):
+    """True for a draft nobody has written into: status draft and all five
+    sections present and empty."""
+    text = path.read_text(encoding="utf-8")
+    sections = _split_sections(text, REFLECT_SECTIONS)
+    return (_read_status(text) == "draft"
+            and len(sections) == len(REFLECT_SECTIONS)
+            and not any(sections.values()))
+
+
+def _archive_empty_draft(path):
+    """Move an untouched draft to reflections/archive/, never overwriting."""
+    archive = path.parent / "archive"
+    archive.mkdir(exist_ok=True)
+    dest, n = archive / f"{path.stem}.empty-draft.md", 2
+    while dest.exists():
+        dest = archive / f"{path.stem}.empty-draft-{n}.md"
+        n += 1
+    path.rename(dest)
+    print(f"archived an untouched draft: {dest}")
+
+
+def _entry_sort_key(entry_id):
+    date, number = entry_id.split("#")
+    return date, int(number)
+
+
+def _reflection_digest(project, logs):
+    """The digest lines staged into a proposal: counts, supersede links,
+    entries already written into a carrier, project-scoped entries, and
+    the durable sizes against their budgets. Mechanical facts only; every
+    judgment stays with the distiller and the human."""
+    window = [e for date, path, consumed in logs
+              for e in _log_entries(date, path)[consumed:]]
+    ids = {e["id"] for e in window}
+    out = [f"- {len(window)} entries over {len(logs)} day-log(s)."]
+    succ = {}
+    for e in window:
+        for target in e["subs"].get("supersedes", []):
+            succ.setdefault(target, []).append(e["id"])
+    if succ:
+        out.append("- Superseded (the later entry replaces it; two "
+                   "successors means a conflict to resolve):")
+        for target in sorted(succ, key=_entry_sort_key):
+            note = "" if target in ids else " (before this window)"
+            out.append(f"  - {target}{note} -> {', '.join(succ[target])}")
+    landed = [(e["id"], c) for e in window for c in e["subs"].get("landed", [])]
+    if landed:
+        out.append("- Already written into a carrier (confirm it is there "
+                   "and reaches every assistant that needs it; then usually "
+                   "leave it out):")
+        out += [f"  - {i}: {c}" for i, c in landed]
+    scoped = {}
+    for e in window:
+        for scope in e["subs"].get("scope", []):
+            if scope != "global":
+                scoped.setdefault(scope, []).append(e["id"])
+    if scoped:
+        out.append("- Project-scoped (keep out of global durable memory "
+                   "unless it generalizes):")
+        out += [f"  - {s}: {', '.join(i)}" for s, i in sorted(scoped.items())]
+    for name in AGING_BUDGET:
+        lines, size = _durable_stats(project / name)
+        out.append(f"- {name} now: {lines} lines, {size} bytes (budget "
+                   f"{_budget_label(name)}).")
+    out.append(f"- Each added line must be at most {DURABLE_LINE_MAX} bytes "
+               f"and the result must stay within budget, so make room with "
+               f"Prune first.")
+    return out
+
+
 def _stage_reflection(project, since, upto, force=False):
     """Write the staging file for the window. Return (path, lower, logs).
 
@@ -648,6 +830,11 @@ def _stage_reflection(project, since, upto, force=False):
     refl_dir.mkdir(exist_ok=True)
     base = refl_dir / f"{upto}.md"
     pending = _pending_draft(project)
+    if pending and _untouched(pending[0]):
+        # Nobody wrote a word into it: archive it rather than let a stale
+        # empty draft freeze the window for weeks.
+        _archive_empty_draft(pending[0])
+        pending = None
     if pending and not (force and _reflection_date(pending[0]) == upto):
         sys.exit(f"error: a reflection is already pending at {pending[0]} "
                  f"(status: {pending[1]}). Apply or delete it first; "
@@ -673,10 +860,12 @@ def _stage_reflection(project, since, upto, force=False):
         f"window: {lower} .. {upto}  ({len(logs)} session day-logs)",
         "",
         "The Orchestrator fills the sections below by distilling the session "
-        "logs (not copying them raw). Then a human reviews, edits, sets status "
-        "to approved, and runs `vurctos reflect-apply`. Empty sections are "
-        "skipped on apply. Do not start a body line with `## ` and list only "
-        "exact, unique stale lines under Prune.",
+        "logs (not copying them raw). Then it runs `vurctos reflect-apply "
+        "--check`, shows the human the result and its approval hash, and "
+        "only after the human approves sets status to approved and applies "
+        "with `--approved-hash <hash>`. Empty sections are skipped on apply. "
+        "Do not start a body line with `## ` and list only exact, unique "
+        "stale lines under Prune.",
         "",
         "Keep out of durable memory (day-log only): transient facts such as "
         "rankings or market data, environment-dependent failures, negative "
@@ -685,10 +874,20 @@ def _stage_reflection(project, since, upto, force=False):
         "prune the superseded line in the SAME apply instead of stacking a "
         "second entry beside it.",
         "",
+        "Layering: USER.md loads into every session, so it holds only what "
+        "nearly every session needs. A fact needed for one kind of task goes "
+        "to MEMORY.md, one fact per line under a `[tag]` that can be "
+        "grepped. A lesson already written into a skill, a hard rule or a "
+        "project record stays out of both.",
+        "",
         "Also mine for blind spots: when several failures in the window "
         "point at one question nobody asked, propose that question as a "
         "durable rule or skill candidate rather than filing each failure "
         "separately.",
+        "",
+        f"## {SEC_DIGEST}",
+        "",
+        *_reflection_digest(project, logs),
         "",
         f"## {SEC_USER}",
         "",
@@ -735,8 +934,9 @@ def cmd_reflect(args):
         print(f"  {d}: {p}{tail}")
     if not logs:
         print("  (no session day-logs in window)")
-    print("next: fill the proposal, set status: approved, then run "
-          f"`vurctos reflect-apply {_scope_flag(args)} --date {upto}`")
+    print(f"next: fill the proposal, run `vurctos reflect-apply "
+          f"{_scope_flag(args)} --date {upto} --check`, and once the human "
+          f"approves, set status: approved and apply with the hash it prints")
 
 
 def _split_sections(text, known):
@@ -789,34 +989,71 @@ def _plan_prune(files, prune_lines):
     return unique, ambiguous, not_found
 
 
-def _append_reflected_block(path, date, block):
+def _with_reflected_block(text, date, block):
     """Append a distilled block under a dated Reflected Updates subheading."""
-    if path.exists():
-        text = path.read_text(encoding="utf-8").rstrip("\n")
-    else:
-        text = "# Memory"
+    text = text.rstrip("\n") or "# Memory"
     if not any(ln.strip() == REFLECTED_HEADING for ln in text.splitlines()):
         text += f"\n\n{REFLECTED_HEADING}"
-    text += f"\n\n### {date}\n\n{block.strip()}"
-    path.write_text(text + "\n", encoding="utf-8")
+    return text + f"\n\n### {date}\n\n{block.strip()}\n"
 
 
-def _prune_lines(path, prune_lines):
-    """Remove lines from path that exactly match (trimmed) any prune line."""
-    if not path.exists():
-        return 0
-    targets = {ln.strip() for ln in prune_lines if ln.strip()}
-    if not targets:
-        return 0
+def _without_lines(text, targets):
+    """Remove lines that exactly match (trimmed) a target. Return
+    (text, removed); the text is untouched when nothing matched."""
     kept, removed = [], 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if line.strip() in targets:
             removed += 1
         else:
             kept.append(line)
-    if removed:
-        path.write_text("\n".join(kept).rstrip("\n") + "\n", encoding="utf-8")
-    return removed
+    if not removed:
+        return text, 0
+    return "\n".join(kept).rstrip("\n") + "\n", removed
+
+
+_DATED_HEADING_RE = re.compile(r"^### \d{4}-\d{2}-\d{2}\s*$")
+
+
+def _drop_empty_dated_headings(text):
+    """Under Reflected Updates, drop `### YYYY-MM-DD` headings left with no
+    content once their lines were pruned, and squeeze the blank runs they
+    leave. A heading shared by USER.md and MEMORY.md can never be pruned
+    by exact match, so this is the only way it goes."""
+    lines = text.splitlines()
+    out, inside = [], False
+    for i, ln in enumerate(lines):
+        if ln.strip() == REFLECTED_HEADING:
+            inside = True
+        elif inside and _DATED_HEADING_RE.match(ln):
+            nxt = next((n for n in lines[i + 1:] if n.strip()), None)
+            if nxt is None or nxt.startswith("#"):
+                continue
+        if inside and not ln.strip() and out and not out[-1].strip():
+            continue
+        out.append(ln)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _approval_hash(text, project):
+    """What a human approves: the proposal (minus its status line, which
+    flips on approval) and the durable files it applies to. Any later edit
+    to either changes the hash, so an apply can only carry the reviewed
+    result."""
+    body = "\n".join(ln for ln in text.splitlines()
+                     if not _STATUS_RE.match(ln.strip()))
+    h = hashlib.sha256(body.encode("utf-8"))
+    for name in AGING_BUDGET:
+        path = project / name
+        h.update(b"\0" + (path.read_bytes() if path.exists() else b""))
+    return h.hexdigest()[:16]
+
+
+def _atomic_write(path, text):
+    """Replace a file in one step, so a crash leaves the old or the new
+    content, never half of it."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _read_status(text):
@@ -841,21 +1078,28 @@ def _mark_applied(text):
 def cmd_reflect_apply(args):
     """Apply an APPROVED reflection to durable memory, then advance the marker.
 
-    Order is deliberate: gate on status, validate the whole proposal, prune,
-    then append. Validation fails closed: nothing is written until every
-    prune target matches exactly one line across durable memory (so a bare
-    shared label cannot silently remove curated content, and a typo cannot
-    be skipped and forgotten), and an empty proposal must at least explain
-    itself under Rationale before it may advance the cursor. Pruning before
-    appending means a prune target can never delete a line this same
-    reflection just added.
+    Order is deliberate: validate the whole proposal, compute both final
+    files in memory, check them, and only then write. Validation fails
+    closed: nothing is written until every prune target matches exactly one
+    line across durable memory (so a bare shared label cannot silently
+    remove curated content, and a typo cannot be skipped and forgotten), and
+    an empty proposal must at least explain itself under Rationale before it
+    may advance the cursor. Pruning before appending means a prune target
+    can never delete a line this same reflection just added. A result over
+    the size budget, or an added line over DURABLE_LINE_MAX bytes, is
+    refused. `--check` prints the result and its approval hash and writes
+    nothing; the real apply needs that same hash, so it can only carry the
+    result the human reviewed. Both files are backed up, then each is
+    replaced atomically; the cursor moves last. A leftover backup for the
+    same proposal means an earlier apply was interrupted between the two
+    files, so it is refused until the files are restored.
     """
     project = _resolve_root(args)
     date = _today(args)
     staging = _pending_for_date(project, date)
     text = staging.read_text(encoding="utf-8")
     status = _read_status(text)
-    if status != "approved":
+    if status != "approved" and not args.check:
         shown = status or "missing or ambiguous"
         sys.exit(f"error: reflection status is '{shown}', not 'approved'. "
                  f"Review {staging}, set a single `status: approved` line, "
@@ -908,9 +1152,12 @@ def cmd_reflect_apply(args):
     if ambiguous or not_found:
         listed = [f"    {t}  (matches more than one line)" for t in ambiguous]
         listed += [f"    {t}  (not found)" for t in not_found]
+        hint = ("\nIf an earlier apply was interrupted, restore USER.md "
+                "and MEMORY.md from reflections/backup/ first."
+                if not_found else "")
         sys.exit("error: nothing applied. Each prune target must match "
                  "exactly one line in USER.md or MEMORY.md; fix these, "
-                 "then re-run:\n" + "\n".join(listed))
+                 "then re-run:\n" + "\n".join(listed) + hint)
     rationale = sections.get(SEC_RATIONALE, "").strip()
     if not (user_add or mem_add or unique or rationale):
         sys.exit("error: nothing applied. The proposal adds nothing, prunes "
@@ -918,14 +1165,79 @@ def cmd_reflect_apply(args):
                  "Rationale why this window leaves durable memory unchanged, "
                  "then re-run.")
 
-    pruned = _prune_lines(user_md, unique) + _prune_lines(mem_md, unique)
-    applied = []
-    if user_add:
-        _append_reflected_block(user_md, date, user_add)
-        applied.append("USER.md")
-    if mem_add:
-        _append_reflected_block(mem_md, date, mem_add)
-        applied.append("MEMORY.md")
+    backup = project / REFLECT_DIRNAME / "backup" / staging.stem
+    if backup.exists():
+        sys.exit(f"error: nothing applied. An earlier apply of {staging} was "
+                 f"interrupted: its backup {backup} exists, so durable "
+                 f"memory may be half updated. Copy USER.md and MEMORY.md "
+                 f"back from it, delete that folder, then re-run --check.")
+    finals, pruned = {}, 0
+    for name, add in (("MEMORY.md", mem_add), ("USER.md", user_add)):
+        path = project / name
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        new, removed = _without_lines(old, set(unique))
+        if add:
+            new = _with_reflected_block(new, date, add)
+        if new != old:
+            finals[name] = _drop_empty_dated_headings(new)
+        pruned += removed
+    long_lines = [ln.strip() for ln in (user_add + "\n" + mem_add).splitlines()
+                  if len(ln.encode("utf-8")) > DURABLE_LINE_MAX]
+    if long_lines:
+        listed = "\n".join(f"    {len(ln.encode('utf-8'))} bytes: {ln[:60]}"
+                           for ln in long_lines)
+        sys.exit(f"error: nothing applied. One fact per line, at most "
+                 f"{DURABLE_LINE_MAX} bytes each; split or shorten these:\n"
+                 + listed)
+    over = []
+    for name, new in finals.items():
+        lines = sum(1 for ln in new.splitlines() if ln.strip())
+        size = len(new.encode("utf-8"))
+        max_lines, max_bytes = AGING_BUDGET[name]
+        if lines > max_lines or size > max_bytes:
+            over.append(f"    {name} would be {lines} lines, {size} bytes "
+                        f"(budget {max_lines} lines / {max_bytes} bytes)")
+    if over:
+        sys.exit("error: nothing applied. The result is over the size "
+                 "budget; prune more, or move task-specific detail out of "
+                 "USER.md, then re-run:\n" + "\n".join(over))
+    digest = _approval_hash(text, project)
+    scope = _scope_flag(args)
+
+    if args.check:
+        print(f"check of reflection {date} (nothing written)")
+        for name in AGING_BUDGET:
+            if name in finals:
+                new = finals[name]
+                lines = sum(1 for ln in new.splitlines() if ln.strip())
+                print(f"  {name}: {lines} lines, {len(new.encode('utf-8'))} "
+                      f"bytes after apply (budget {_budget_label(name)})")
+            else:
+                print(f"  {name}: unchanged")
+        print(f"  pruned lines: {pruned}")
+        print(f"  cursor would advance to {_marker_label(after)}")
+        print(f"  approval hash: {digest}")
+        print(f"next: show this result to the human; once they approve, set "
+              f"status: approved and run `vurctos reflect-apply {scope} "
+              f"--date {date} --approved-hash {digest}`")
+        return
+    if args.approved_hash != digest:
+        why = ("no --approved-hash given" if not args.approved_hash else
+               "the proposal or durable memory changed since that hash "
+               "was shown")
+        sys.exit(f"error: nothing applied ({why}). Run `vurctos "
+                 f"reflect-apply {scope} --date {date} --check`, show the "
+                 f"result to the human, and apply with the hash it prints "
+                 f"once they approve.")
+
+    backup.mkdir(parents=True)
+    for name in AGING_BUDGET:
+        if (project / name).exists():
+            shutil.copy2(project / name, backup / name)
+    for name, new in finals.items():
+        _atomic_write(project / name, new)
+    applied = [n for n, add in (("USER.md", user_add), ("MEMORY.md", mem_add))
+               if add]
 
     _write_marker(project, after)
     staging.write_text(_mark_applied(text), encoding="utf-8")
@@ -933,6 +1245,7 @@ def cmd_reflect_apply(args):
     print(f"applied reflection {date}")
     print(f"  durable updates: {', '.join(applied) or 'none'}")
     print(f"  pruned lines: {pruned}")
+    print(f"  backup of the previous files: {backup}")
     skills = sections.get(SEC_SKILLS, "").strip()
     if skills:
         print("  skill candidates (scaffold each with "
@@ -946,8 +1259,6 @@ def cmd_reflect_apply(args):
 # `remember` prints one status line, the SessionStart hooks call
 # `memory-status --hook`, and a human runs `memory-status` directly. All
 # three read the same numbers, so the backlog is never invisible.
-
-_C0_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")
 
 
 def _reflection_date(path):
@@ -1198,10 +1509,22 @@ def cmd_aging(args):
           f"{scope}` proposal, and restate what still matters in its Add "
           f"sections (supersede, do not just delete).")
 
-def _hook_context(st, scope, stage_at):
-    """The SessionStart nudge text, or None when nothing is waiting."""
-    if not st["entries"] and not st["draft"] \
-            and not _over_budget(st["project"]):
+def _hook_context(st, scope, upto):
+    """The SessionStart nudge text, or None when nothing needs attention.
+
+    Numbers only: entry text has not passed a human-approved reflection, so
+    it never rides into a session's context. The backlog speaks once it is
+    worth a short consolidation (REFLECT_NUDGE_AT entries, or an oldest
+    entry REFLECT_NUDGE_DAYS old); a waiting draft or a file over budget
+    always speaks.
+    """
+    over = _over_budget(st["project"])
+    age = ((datetime.date.fromisoformat(upto)
+            - datetime.date.fromisoformat(st["oldest"])).days
+           if st["oldest"] else 0)
+    due = bool(st["entries"]) and (st["entries"] >= REFLECT_NUDGE_AT
+                                   or age >= REFLECT_NUDGE_DAYS)
+    if not (due or st["draft"] or over):
         return None
     where = "Global VurctOS memory" if scope == "--global" \
         else "This VurctOS project"
@@ -1210,30 +1533,24 @@ def _hook_context(st, scope, stage_at):
     if st["entries"]:
         parts.append(f"{where} has {st['entries']} memory entries over "
                      f"{len(st['logs'])} day-log(s) not yet consolidated "
-                     f"(oldest: {st['oldest']}).")
-        _, newest, consumed = st["logs"][-1]
-        digest = [ln for ln in newest.read_text(encoding="utf-8").splitlines()
-                  if _LOG_ENTRY_RE.match(ln)][consumed:][-3:]
-        digest = " ; ".join(_C0_RE.sub("", ln.replace("\t", " "))
-                            for ln in digest)
-        parts.append(f"Latest entries: {digest or '(no parsed entries)'}.")
+                     f"(oldest: {st['oldest']}, {age} days).")
     else:
         parts.append(f"{where} has no unconsolidated entries.")
     if st["draft"]:
         path, status = st["draft"]
         parts.append(f"A reflection draft is waiting at {path} (status: "
-                     f"{status}): fill or review it, set status: approved, "
-                     f"then run {cli} reflect-apply {scope} "
-                     f"--date {_reflection_date(path)}.")
-    else:
-        auto = (f" (an empty draft is staged automatically at {stage_at} "
-                f"entries)") if stage_at else ""
-        parts.append(f"When convenient{auto}, run {cli} reflect {scope} to "
-                     f"stage a proposal, review it, then {cli} reflect-apply "
-                     f"{scope}.")
+                     f"{status}): fill or review it, run {cli} reflect-apply "
+                     f"{scope} --date {_reflection_date(path)} --check, and "
+                     f"apply with the hash it prints once the user "
+                     f"approves.")
+    elif due:
+        parts.append(f"At a natural pause, offer the user a short "
+                     f"consolidation: run {cli} reflect {scope}, fill the "
+                     f"proposal, run {cli} reflect-apply {scope} --check, "
+                     f"and apply with the hash it prints once the user "
+                     f"approves.")
     if st["legacy"][0]:
         parts.append(_legacy_note(st["legacy"]) + ".")
-    over = _over_budget(st["project"])
     if over:
         listed = ", ".join(f"{n} (budget {_budget_label(n)})" for n in over)
         parts.append(f"Over budget: {listed}; run {cli} aging {scope} for "
@@ -1242,21 +1559,14 @@ def _hook_context(st, scope, stage_at):
 
 
 def cmd_memory_status(args):
-    """Report the reflect backlog; stage an empty draft once it is large."""
-    project = _resolve_root(args)
+    """Report the reflect backlog. Read-only: stages nothing, seeds nothing."""
+    project = _resolve_root(args, seed=False)
     upto = _today(args)
     scope = _scope_flag(args)
-    if args.stage_at < 0:
-        sys.exit("error: --stage-at must be 0 (disabled) or a positive "
-                 "entry count")
     st = _memory_status(project, upto)
-    staged = None
-    if args.stage_at and st["entries"] >= args.stage_at and not st["draft"]:
-        staged, _, _ = _stage_reflection(project, None, upto)
-        st["draft"] = (staged, "draft")
 
     if args.hook:
-        ctx = _hook_context(st, scope, args.stage_at)
+        ctx = _hook_context(st, scope, upto)
         if ctx:
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "SessionStart",
@@ -1286,13 +1596,10 @@ def cmd_memory_status(args):
         print(f"  legacy: {_legacy_note(st['legacy'])}")
         for ln in st["legacy"][1]:
             print(f"    keep: {ln}")
-    if staged:
-        print(f"  staged an empty draft (backlog reached {args.stage_at} "
-              f"entries): {staged}")
     if st["draft"]:
-        print(f"next: fill or review the draft, set status: approved, then "
-              f"run `vurctos reflect-apply {scope} "
-              f"--date {_reflection_date(st['draft'][0])}`")
+        print(f"next: fill or review the draft, run `vurctos reflect-apply "
+              f"{scope} --date {_reflection_date(st['draft'][0])} --check`, "
+              f"and apply with the hash it prints once approved")
     elif st["entries"]:
         print(f"next: run `vurctos reflect {scope}` to stage a proposal")
     else:
@@ -1932,10 +2239,23 @@ def build_parser():
                        help="use the user-level memory at ~/.vurctos "
                             "(cross-project) instead of a project")
     p_rem.add_argument("--what", required=True, help="the thing to remember")
-    p_rem.add_argument("--kind", default="note", choices=MEMORY_KINDS,
-                       help="entry kind (default: note)")
+    p_rem.add_argument("--kind", default=None, choices=MEMORY_KINDS,
+                       help="entry kind (default: a leading [kind] tag in "
+                            "the text, else note)")
     p_rem.add_argument("--evidence", default="",
                        help="optional supporting detail or file reference")
+    p_rem.add_argument("--supersedes", action="append", metavar="ENTRY_ID",
+                       help="id (YYYY-MM-DD#N) of an earlier entry this one "
+                            "replaces; repeatable")
+    p_rem.add_argument("--scope",
+                       help="'global' or 'project:<name>': where the lesson "
+                            "applies, as opposed to where it is filed")
+    p_rem.add_argument("--landed",
+                       help="where the lesson is already written (a skill, "
+                            "a rule file, a project record)")
+    p_rem.add_argument("--allow-pii", action="store_true",
+                       help="file a long number that looks personal but is "
+                            "not")
     p_rem.add_argument("--date", help="entry date YYYY-MM-DD (default: today)")
     p_rem.set_defaults(func=cmd_remember)
 
@@ -1985,21 +2305,22 @@ def build_parser():
     p_rfa.add_argument("--global", dest="global_", action="store_true",
                        help="apply to the user-level memory at ~/.vurctos")
     p_rfa.add_argument("--date", help="reflection date (default: today)")
+    p_rfa.add_argument("--check", action="store_true",
+                       help="validate and print the result and its approval "
+                            "hash; write nothing")
+    p_rfa.add_argument("--approved-hash",
+                       help="the approval hash --check printed for the "
+                            "result the human approved")
     p_rfa.set_defaults(func=cmd_reflect_apply)
 
     p_ms = sub.add_parser("memory-status",
-                          help="show the reflect backlog; stage an empty "
-                               "draft once it is large")
+                          help="show the reflect backlog (read-only)")
     p_ms.add_argument("--project", default=None,
                       help="project folder (default: cwd)")
     p_ms.add_argument("--global", dest="global_", action="store_true",
                       help="report on the user-level memory at ~/.vurctos")
     p_ms.add_argument("--date",
                       help="count entries up to this date (default: today)")
-    p_ms.add_argument("--stage-at", type=int, default=REFLECT_STAGE_AT,
-                      help="stage an empty reflection draft once this many "
-                           "entries are unreflected (default: "
-                           f"{REFLECT_STAGE_AT}; 0 disables)")
     p_ms.add_argument("--hook", action="store_true",
                       help="print a Claude Code SessionStart hook payload "
                            "(JSON) instead of the report; silent when "

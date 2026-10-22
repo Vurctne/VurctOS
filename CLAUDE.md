@@ -20,12 +20,12 @@ Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the co
 
 - **Run the CLI** (Python 3.8+ standard library only):
   - `python3 cli/vurctos.py new <name> [--dir DIR]` - scaffold a project from `templates/project-template/`.
-  - `python3 cli/vurctos.py remember --project <p> --what "..." [--kind decision|style|tool|fail|note] [--evidence "..."]` - file a memory entry into the day log `sessions/<date>.md` and the SQLite index (durable `USER.md` / `MEMORY.md` are written only by `reflect-apply`).
-  - `python3 cli/vurctos.py memory-status --project <p> [--global]` - show the reflect backlog, the cursor, and any waiting draft; stages an empty draft once the backlog is large (the SessionStart nudge hooks call it with `--hook`).
+  - `python3 cli/vurctos.py remember --project <p> --what "..." [--kind decision|style|tool|fail|note|correction|fact] [--evidence "..."] [--supersedes ID] [--scope global|project:NAME] [--landed "..."]` - file a memory entry into the day log `sessions/<date>.md` and the SQLite index under a file lock, and print its id (`YYYY-MM-DD#N`); refuses phone or ID numbers unless `--allow-pii` (durable `USER.md` / `MEMORY.md` are written only by `reflect-apply`).
+  - `python3 cli/vurctos.py memory-status --project <p> [--global]` - read-only: show the reflect backlog, the cursor, and any waiting draft (the SessionStart nudge hooks call it with `--hook`, which reports numbers only and speaks once 60 entries wait or the oldest is 7 days old).
   - `python3 cli/vurctos.py aging --project <p> [--global] [--older-than DAYS]` - read-only list of old reflected lines as prune candidates once a durable file is over its size budget (USER.md 60 non-empty lines or 6 KiB; MEMORY.md 60 non-empty lines or 24 KiB).
   - `python3 cli/vurctos.py recall --project <p> "<query>"` - full-text search past entries (SQLite FTS5, LIKE fallback). `recall --stats` reports index counts.
   - `remember` / `recall` / `reflect` / `reflect-apply` all accept `--global` to target the user-level memory at `~/.vurctos/` (cross-project; loaded everywhere via the `@import` in `~/.claude/CLAUDE.md`).
-  - `python3 cli/vurctos.py reflect --project <p>` then `reflect-apply` - stage and apply a human-approved consolidation of session logs into durable memory.
+  - `python3 cli/vurctos.py reflect --project <p>`, then `reflect-apply --check`, then `reflect-apply --approved-hash <hash>` - stage, check and apply a human-approved consolidation of session logs into durable memory (budget-gated, 512 bytes per added line, backups and atomic writes).
   - `python3 cli/vurctos.py reindex --project <p>` - rebuild the SQLite full-text index from the day logs.
   - `python3 cli/vurctos.py dispatch --project <p> [--agent claude|codex] [--dry-run]` - run one `ready` + `channel: local` board card via the chosen agent (headless `claude -p` or the Codex CLI) on the user's subscription; card moves to `review`, never `done`.
   - `python3 cli/vurctos.py reject <card-id> --project <p> --reason "..."` - reject reviewed work: files the lesson into memory, stamps it into the card notes, re-queues the card.

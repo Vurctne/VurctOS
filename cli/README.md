@@ -31,9 +31,9 @@ Files one memory entry into session recall:
 - an entry in the day log `sessions/<date>.md`
 - a row in `sessions/index.db`, the local SQLite full-text index
 
-Durable memory (`USER.md`, `MEMORY.md`) is not touched: only an approved `reflect-apply` writes there, so every durable line has been consolidated on purpose. `remember` ends with a one-line status of what is waiting to be reflected.
+Durable memory (`USER.md`, `MEMORY.md`) is not touched: only an approved `reflect-apply` writes there, so every durable line has been consolidated on purpose. `remember` prints the entry's id (its day plus its position in that day's log, such as `2026-06-30#2`; day logs are append-only, so ids never move) and ends with a one-line status of what is waiting to be reflected. It appends under a file lock, so two sessions filing at once both land. If the index cannot be updated, the entry is still filed and the output says to run `reindex`.
 
-`--kind` is one of `decision`, `style`, `tool`, `fail`, or `note` (default `note`). `--evidence` is optional. `--date YYYY-MM-DD` overrides today. The CLI only files what you give it; deciding what is worth remembering stays with Claude as Orchestrator.
+`--kind` is one of `decision`, `style`, `tool`, `fail`, `note`, `correction`, or `fact`; without it, a leading `[kind]` tag in the text becomes the kind, and anything else is a `note`. `--evidence` is optional. `--supersedes <id>` (repeatable) marks an earlier entry this one replaces, `--scope global|project:<name>` says where the lesson applies, and `--landed "<where>"` says it is already written into a skill, a rule file or a project record; each is stored as a line under the entry and shows up in the next reflect's digest. Text that looks like a phone, ID-card or card number is refused (personal form data belongs in a private profile, not in day logs); `--allow-pii` files a number that only looks personal. `--date YYYY-MM-DD` overrides today. The CLI only files what you give it; deciding what is worth remembering stays with Claude as Orchestrator.
 
 ### Recall past memory
 
@@ -41,7 +41,7 @@ Durable memory (`USER.md`, `MEMORY.md`) is not touched: only an approved `reflec
 python3 cli/vurctos.py recall --project my-project "premium lighting"
 ```
 
-Full-text searches past entries and prints the matches with their dates and day-log paths. It uses SQLite FTS5 when available and falls back to a substring search otherwise, so it works on any standard Python install. FTS5 query operators work in FTS mode; an invalid FTS query is retried as a plain AND of its words.
+Full-text searches past entries and prints the matches with their dates and day-log paths. Read-only: it never creates or seeds anything. It uses SQLite FTS5 when available and falls back to a substring search otherwise, so it works on any standard Python install. FTS5 query operators work in FTS mode; an invalid FTS query is retried as a plain AND of its words.
 
 ```bash
 python3 cli/vurctos.py recall --project my-project --stats "reference image"
@@ -56,19 +56,21 @@ python3 cli/vurctos.py recall --project my-project --stats
 python3 cli/vurctos.py reindex --project my-project
 ```
 
-The markdown day-logs are the source of truth; `sessions/index.db` is derived, machine-local, and gitignored. Use `reindex` when the index is absent on a fresh machine or clone, after index corruption, or after hand-editing a day-log. `reindex` deletes the index and rebuilds it from the day-logs (also with `--global` for `~/.vurctos`).
+The markdown day-logs are the source of truth; `sessions/index.db` is derived, machine-local, and gitignored. Use `reindex` when the index is absent on a fresh machine or clone, after index corruption, or after hand-editing a day-log. `reindex` deletes the index and rebuilds it from the day-logs (also with `--global` for `~/.vurctos`). It refuses when a hand edit removed entries the reflect cursor already counted, since entry ids are positions and would shift.
 
 ### Reflect (distill sessions into durable memory)
 
 ```bash
 python3 cli/vurctos.py reflect --project my-project
-# the Orchestrator fills reflections/<date>.md, a human sets status: approved
-python3 cli/vurctos.py reflect-apply --project my-project
+# the Orchestrator fills reflections/<date>.md
+python3 cli/vurctos.py reflect-apply --project my-project --check
+# a human approves the printed result; set status: approved, then
+python3 cli/vurctos.py reflect-apply --project my-project --approved-hash <hash>
 ```
 
-`reflect` collects the session day logs not yet reflected (since the last `reflections/.last-reflected` marker, or `--since DATE`) and stages a proposal at `reflections/<date>.md` with empty sections: additions to `USER.md`, additions to `MEMORY.md`, exact lines to prune, and skill candidates. Claude as Orchestrator distills the logs into that proposal (it does not copy them raw); a human reviews, edits, and sets `status: approved`.
+`reflect` collects the session day logs not yet reflected (since the last `reflections/.last-reflected` marker, or `--since DATE`) and stages a proposal at `reflections/<date>.md`. It opens with a digest the CLI computed (entry counts, which entries supersede which, entries already written into a carrier, project-scoped entries, the durable sizes against their budgets), which is never applied, followed by empty sections: additions to `USER.md`, additions to `MEMORY.md`, exact lines to prune, skill candidates, and a rationale. Claude as Orchestrator distills the logs into that proposal (it does not copy them raw). Only one proposal can be pending at a time, but a pending draft nobody has written into does not block: `reflect` moves it to `reflections/archive/` and stages a fresh one.
 
-`reflect-apply` refuses unless the proposal is approved, and validates the whole proposal before writing anything: every prune target must match exactly one line in `USER.md` / `MEMORY.md`, and an empty proposal must carry a Rationale. Then it appends the additions under a dated `## Reflected Updates` block, removes the prune lines, and advances the cursor (`reflections/.last-reflected`: the last reflected date plus how many of that day's entries were consumed, so entries filed later the same day are still picked up next time). The proposal records the cursor it was staged against (`cursor-before`) and the one it advances to (`cursor-after`), so an apply after the cursor moved is refused, and entries filed while the proposal was being written stay unreflected. Only one proposal can be pending at a time; an applied proposal is kept as the record, so a second one on the same date is staged as `<date>-2.md`. This is the loop that lets memory get sharper over time instead of just longer: distill, prune, and keep a human in the loop so a wrong distilled fact never silently poisons later sessions.
+`reflect-apply --check` validates the whole proposal and computes the exact result without writing anything: every prune target must match exactly one line in `USER.md` / `MEMORY.md`, an empty proposal must carry a Rationale, each added line must be at most 512 bytes (one fact per line), and the resulting files must stay within their size budgets. It prints both files' sizes after the apply, the lines pruned, where the cursor would move, and an approval hash over the proposal (minus its status line) and the current durable files. A human reviews that; then `reflect-apply --approved-hash <hash>` repeats every check, refuses unless the status is `approved` and the hash still matches (any later edit to the proposal or to durable memory means checking again), copies both files to `reflections/backup/<proposal>/`, replaces each atomically (pruning first, then appending the additions under a dated `## Reflected Updates` block and dropping dated headings left empty), and advances the cursor last (`reflections/.last-reflected`: the last reflected date plus how many of that day's entries were consumed, so entries filed later the same day are still picked up next time). A crash can leave one file new and the other old, never half a file; the leftover backup folder marks that case, and the next apply refuses until the files are copied back from it and the folder is removed. The proposal records the cursor it was staged against (`cursor-before`) and the one it advances to (`cursor-after`), so an apply after the cursor moved is refused, and entries filed while the proposal was being written stay unreflected. An applied proposal is kept as the record, so a second one on the same date is staged as `<date>-2.md`. This is the loop that lets memory get sharper over time instead of just longer: distill, prune, and keep a human in the loop so a wrong distilled fact never silently poisons later sessions.
 
 ### Memory status (the backlog dashboard)
 
@@ -77,7 +79,7 @@ python3 cli/vurctos.py memory-status --project my-project
 python3 cli/vurctos.py memory-status --global
 ```
 
-Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Once the backlog reaches 30 entries (`--stage-at N`, 0 disables) and no draft is waiting, it stages an empty `reflections/<today>.md` so there is a concrete file to fill instead of a command to remember. `--hook` prints the same facts as a Claude Code `SessionStart` payload; both shipped nudge hooks call it. When a durable file is over its size budget (USER.md: 60 non-empty lines or 6 KiB; MEMORY.md: 60 non-empty lines or 24 KiB, since it holds dense tool and method facts), the report and the hook say so and point at `aging`.
+Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Read-only: it never stages a draft and never creates or seeds anything. `--hook` prints the same facts as a Claude Code `SessionStart` payload, numbers only (unreviewed entry text never enters a session); both shipped nudge hooks call it. The backlog part speaks once there are 60 waiting entries or the oldest is 7 days old, and asks the assistant to offer a short consolidation at a natural pause; a waiting draft, or a durable file over its size budget (USER.md: 60 non-empty lines or 6 KiB; MEMORY.md: 60 non-empty lines or 24 KiB, since it holds dense tool and method facts), always shows, and an over-budget file points at `aging`.
 
 ### Aging (retire old durable lines)
 
@@ -86,7 +88,7 @@ python3 cli/vurctos.py aging --project my-project --older-than 90
 python3 cli/vurctos.py aging --global
 ```
 
-Read-only (it never creates or seeds anything, not even the global root). Durable memory that only grows gets slower and noisier, so each durable file has a size budget (USER.md 60 non-empty lines or 6 KiB, MEMORY.md 60 non-empty lines or 24 KiB); a file within budget is reported and left alone. For a file over budget, `aging` lists every line under a `### <date>` block that `reflect-apply` wrote more than `--older-than` days ago (default 90), verbatim and complete (continuation lines included, so a pasted prune never orphans a tail), as retirement candidates. When the file is over budget but no block is that old yet, it tells you the age of the oldest block and the `--older-than` value that would reach it, or that the weight is in hand-written sections above `## Reflected Updates`. Age is by reflection date, not by how often a line was used (a local adaptation, not the Hermes original). Nothing is deleted here: paste the lines to retire into the Prune section of the next `reflect` proposal and restate whatever still matters in its Add sections, so retirement goes through the same human-approved apply as everything else.
+Read-only (it never creates or seeds anything, not even the global root). Durable memory that only grows gets slower and noisier, so each durable file has a size budget (USER.md 60 non-empty lines or 6 KiB, MEMORY.md 60 non-empty lines or 24 KiB) that `reflect-apply` enforces; a file within budget is reported and left alone. For a file over budget, `aging` lists every line under a `### <date>` block that `reflect-apply` wrote more than `--older-than` days ago (default 90), verbatim and complete (continuation lines included, so a pasted prune never orphans a tail), as retirement candidates. When the file is over budget but no block is that old yet, it tells you the age of the oldest block and the `--older-than` value that would reach it, or that the weight is in hand-written sections above `## Reflected Updates`. Age is by reflection date, not by how often a line was used (a local adaptation, not the Hermes original). Nothing is deleted here: paste the lines to retire into the Prune section of the next `reflect` proposal and restate whatever still matters in its Add sections, so retirement goes through the same human-approved apply as everything else.
 
 ### Global memory (cross-project)
 

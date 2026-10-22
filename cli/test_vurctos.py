@@ -14,11 +14,14 @@ import datetime
 import io
 import json
 import os
+import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -31,6 +34,15 @@ def _out(argv):
     with contextlib.redirect_stdout(buf):
         vurctos.main(argv)
     return buf.getvalue()
+
+
+def _apply(argv):
+    """reflect-apply the way the CLI requires: --check first, then apply
+    with the approval hash the check printed. A refusal in either step
+    raises SystemExit as before."""
+    out = _out(argv + ["--check"])
+    digest = re.search(r"approval hash: ([0-9a-f]{16})", out).group(1)
+    vurctos.main(argv + ["--approved-hash", digest])
 
 
 def _durable(project):
@@ -226,7 +238,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "status: draft", "status: approved").replace(
             f"## {vurctos.SEC_USER}\n", f"## {vurctos.SEC_USER}\n- fact\n"),
             encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         marker = proj / "reflections" / ".last-reflected"
         self.assertEqual(marker.read_text(encoding="utf-8").strip(),
@@ -244,7 +256,7 @@ class VurctosMemoryTest(unittest.TestCase):
             f"## {vurctos.SEC_RATIONALE}\n",
             f"## {vurctos.SEC_RATIONALE}\n- nothing durable\n"),
             encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-07-01"])
         self.assertEqual(marker.read_text(encoding="utf-8").strip(),
                          "2026-06-30 2")
@@ -256,7 +268,7 @@ class VurctosMemoryTest(unittest.TestCase):
         vurctos.main(["reflect", "--project", str(proj), "--date", "2026-06-30"])
         # Still draft -> apply must refuse.
         with self.assertRaises(SystemExit):
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
 
     def test_reflect_apply_writes_prunes_and_advances_marker(self):
@@ -279,7 +291,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "## Prune (exact lines to remove from USER.md or MEMORY.md)\n"
             "- stale fact to remove\n")
         staging.write_text(filled, encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         user_text = (proj / "USER.md").read_text(encoding="utf-8")
         mem_text = (proj / "MEMORY.md").read_text(encoding="utf-8")
@@ -311,7 +323,7 @@ class VurctosMemoryTest(unittest.TestCase):
             encoding="utf-8")
         before = _durable(proj)
         with self.assertRaises(SystemExit) as cm:
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertIn("not found", str(cm.exception))
         self.assertEqual(_durable(proj), before)
@@ -325,7 +337,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "status: draft", "status: approved")
         staging.write_text(approved, encoding="utf-8")
         with self.assertRaises(SystemExit) as cm:
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertIn("Rationale", str(cm.exception))
         self.assertFalse((proj / "reflections" / ".last-reflected").exists())
@@ -335,12 +347,12 @@ class VurctosMemoryTest(unittest.TestCase):
             f"## {vurctos.SEC_RATIONALE}\n",
             f"## {vurctos.SEC_RATIONALE}\n- only transient notes this week\n"),
             encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(_durable(proj), before)
         self.assertTrue((proj / "reflections" / ".last-reflected").exists())
 
-    def test_memory_status_reports_and_stages_at_threshold(self):
+    def test_memory_status_reports_and_never_stages(self):
         proj = self._new()
         for i in range(3):
             self._remember_on(proj, f"entry {i}", "2026-06-29")
@@ -352,44 +364,59 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("last reflected: never", out)
         self.assertIn("draft: none", out)
         self.assertIn("durable: USER.md", out)
-        staging = proj / "reflections" / "2026-06-30.md"
-        self.assertFalse(staging.exists())  # below the default threshold
+        self.assertIn(f"next: run `vurctos reflect --project {proj}`", out)
+        # However large the backlog, status and the hook only report: a
+        # draft is staged by an explicit `reflect`, never as a side effect.
+        for i in range(vurctos.REFLECT_NUDGE_AT):
+            self._remember_on(proj, f"more {i}", "2026-06-30")
         before = _durable(proj)
-        out = _out(argv + ["--stage-at", "4"])
-        self.assertIn("staged an empty draft", out)
-        self.assertTrue(staging.exists())
-        text = staging.read_text(encoding="utf-8")
-        self.assertIn("status: draft", text)
-        self.assertIn("(2 session day-logs)", text)
-        self.assertEqual(_durable(proj), before)  # staging never applies
-        # A second run reports the waiting draft and does not stage again.
-        out = _out(argv + ["--stage-at", "4"])
-        self.assertNotIn("staged an empty draft", out)
-        self.assertIn(f"draft: {staging.resolve()} (status: draft)", out)
-        self.assertIn(f"reflect-apply --project {proj} --date 2026-06-30", out)
+        _out(argv)
+        _out(argv + ["--hook"])
+        refl = proj / "reflections"
+        self.assertEqual([q for q in refl.glob("*.md") if
+                          vurctos._REFLECTION_RE.match(q.name)]
+                         if refl.is_dir() else [], [])
+        self.assertEqual(_durable(proj), before)
 
-    def test_memory_status_hook_payload(self):
+    def test_memory_status_hook_payload_has_numbers_not_entry_text(self):
         proj = self._new()
-        self._remember_on(proj, 'said "quoted" and back\\slash 中文教训',
+        self._remember_on(proj, 'said "quoted" 中文教训 secret plan',
                           "2026-07-01", kind="fail")
         self._remember_on(proj, "ansi \x1b[31mred\x1b[0m bell \x01 end",
                           "2026-07-01")
         out = _out(["memory-status", "--project", str(proj), "--hook",
-                    "--date", "2026-07-01"])
+                    "--date", "2026-07-08"])
         ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("2 memory entries over 1 day-log(s)", ctx)
-        self.assertIn("oldest: 2026-07-01", ctx)
-        self.assertIn('said "quoted"', ctx)
-        self.assertIn("back\\slash", ctx)
-        self.assertIn("中文教训", ctx)
-        self.assertIn("ansi", ctx)
-        self.assertIn("end", ctx)
-        self.assertNotIn("\x1b", ctx)
-        self.assertNotIn("\x01", ctx)
+        self.assertIn("oldest: 2026-07-01, 7 days", ctx)
         self.assertIn(f"reflect --project {proj}", ctx)
+        self.assertIn("--check", ctx)
+        # Unreviewed entry text never rides into a session.
+        for leak in ("quoted", "中文教训", "secret plan", "ansi", "bell",
+                     "\x1b", "\x01"):
+            self.assertNotIn(leak, ctx)
         # Silent when nothing is waiting.
         self.assertEqual(_out(["memory-status", "--project",
                                str(self._new("quiet")), "--hook"]), "")
+
+    def test_hook_nudges_only_at_the_count_or_age_threshold(self):
+        def hook(proj, date):
+            return _out(["memory-status", "--project", str(proj), "--hook",
+                         "--date", date])
+        young = self._new("young")
+        self._remember_on(young, "fresh", "2026-07-01")
+        self.assertEqual(hook(young, "2026-07-07"), "")      # 6 days old
+        self.assertIn("1 memory entries", hook(young, "2026-07-08"))
+        many = self._new("many")
+        for i in range(vurctos.REFLECT_NUDGE_AT - 1):
+            self._remember_on(many, f"e{i}", "2026-07-01")
+        self.assertEqual(hook(many, "2026-07-01"), "")       # 59 entries
+        self._remember_on(many, "the sixtieth", "2026-07-01")
+        ctx = json.loads(hook(many, "2026-07-01"))[
+            "hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"{vurctos.REFLECT_NUDGE_AT} memory entries", ctx)
+        self.assertEqual((vurctos.REFLECT_NUDGE_AT, vurctos.REFLECT_NUDGE_DAYS),
+                         (60, 7))
 
     def _approve(self, staging, **adds):
         text = staging.read_text(encoding="utf-8").replace(
@@ -413,7 +440,7 @@ class VurctosMemoryTest(unittest.TestCase):
                       staging.read_text(encoding="utf-8"))
         self._remember_on(proj, "filed during drafting", "2026-06-30")
         self._approve(staging, SEC_USER="- fact")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(self._marker(proj), "2026-06-30 1")
         logs = vurctos._unreflected(proj, "2026-06-30")
@@ -426,7 +453,7 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("cursor-after: 2026-06-30 0",
                       staging.read_text(encoding="utf-8"))
         self._approve(staging, SEC_RATIONALE="- nothing yet")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(self._marker(proj), "2026-06-30 0")
         self._remember_on(proj, "first entry", "2026-06-30")
@@ -450,7 +477,7 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("cursor-before: 2026-06-30 0",
                       staging.read_text(encoding="utf-8"))
         self._approve(staging, SEC_RATIONALE="- already distilled")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(self._marker(proj), "2026-06-30 2")
 
@@ -472,7 +499,7 @@ class VurctosMemoryTest(unittest.TestCase):
         for name, text in cases.items():
             staging.write_text(text, encoding="utf-8")
             with self.assertRaises(SystemExit, msg=name):
-                vurctos.main(["reflect-apply", "--project", str(proj),
+                _apply(["reflect-apply", "--project", str(proj),
                               "--date", "2026-06-30"])
             self.assertEqual(_durable(proj), before, name)
             self.assertFalse(
@@ -486,7 +513,7 @@ class VurctosMemoryTest(unittest.TestCase):
                            .replace(line, "cursor-after: 2026-06-30 0"),
                            encoding="utf-8")
         with self.assertRaises(SystemExit) as cm:
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertIn("not a valid end", str(cm.exception))
         self.assertEqual(self._marker(proj), "2026-06-30 1")
@@ -495,13 +522,14 @@ class VurctosMemoryTest(unittest.TestCase):
                                         "cursor-before: 2026-06-30 1")
                            .replace(line, "cursor-after: 2026-06-30 2"),
                            encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(self._marker(proj), "2026-06-30 2")
 
     def test_one_pending_proposal_at_a_time(self):
         proj = self._new()
         staging = self._staged(proj)
+        self._approve(staging, SEC_RATIONALE="- started on it")
         with self.assertRaises(SystemExit) as cm:
             vurctos.main(["reflect", "--project", str(proj),
                           "--date", "2026-07-01"])
@@ -512,6 +540,27 @@ class VurctosMemoryTest(unittest.TestCase):
                       "--date", "2026-06-30", "--force"])
         self.assertIn("status: draft", staging.read_text(encoding="utf-8"))
 
+    def test_an_untouched_draft_is_archived_instead_of_blocking(self):
+        proj = self._new()
+        stale = self._staged(proj)          # nobody writes into it
+        self._remember_on(proj, "a month later", "2026-07-30")
+        out = _out(["reflect", "--project", str(proj), "--date", "2026-07-30"])
+        archived = proj / "reflections" / "archive" / "2026-06-30.empty-draft.md"
+        self.assertIn(f"archived an untouched draft: {archived.resolve()}", out)
+        self.assertFalse(stale.exists())
+        self.assertTrue(archived.exists())
+        fresh = proj / "reflections" / "2026-07-30.md"
+        self.assertIn("cursor-after: 2026-07-30 1",
+                      fresh.read_text(encoding="utf-8"))
+        # Archiving the same name twice never overwrites the first one.
+        archive = proj / "reflections" / "archive"
+        for _ in range(2):
+            vurctos.main(["reflect", "--project", str(proj),
+                          "--date", "2026-07-30", "--force"])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), [
+            "2026-06-30.empty-draft.md", "2026-07-30.empty-draft-2.md",
+            "2026-07-30.empty-draft.md"])
+
     def test_apply_refuses_when_the_cursor_moved_since_staging(self):
         proj = self._new()
         staging = self._staged(proj)
@@ -520,7 +569,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "2026-06-30 1\n", encoding="utf-8")
         before = _durable(proj)
         with self.assertRaises(SystemExit) as cm:
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertIn("cursor moved", str(cm.exception))
         self.assertEqual(_durable(proj), before)
@@ -531,7 +580,7 @@ class VurctosMemoryTest(unittest.TestCase):
         proj = self._new()
         first = self._staged(proj)
         self._approve(first, SEC_USER="- fact")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self._remember_on(proj, "later", "2026-06-30")
         vurctos.main(["reflect", "--project", str(proj), "--date", "2026-06-30"])
@@ -543,7 +592,7 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("cursor-after: 2026-06-30 2", text)
         self.assertEqual(vurctos._pending_draft(proj)[0], second)
         self._approve(second, SEC_RATIONALE="- nothing durable")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertEqual(self._marker(proj), "2026-06-30 2")
         self.assertIn("status: applied", second.read_text(encoding="utf-8"))
@@ -582,7 +631,7 @@ class VurctosMemoryTest(unittest.TestCase):
         proj = self._new()
         first = self._staged(proj)
         self._approve(first, SEC_USER="- fact")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self._remember_on(proj, "later", "2026-06-30")
         vurctos.main(["reflect", "--project", str(proj), "--date", "2026-06-30"])
@@ -595,7 +644,7 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("status: applied", first.read_text(encoding="utf-8"))
         self.assertFalse((proj / "reflections" / "2026-06-30-3.md").exists())
 
-    def test_hook_digest_skips_consumed_entries(self):
+    def test_hook_counts_only_unconsumed_entries(self):
         proj = self._new()
         for i in range(3):
             self._remember_on(proj, f"old {i}", "2026-07-01")
@@ -604,11 +653,9 @@ class VurctosMemoryTest(unittest.TestCase):
             "2026-07-01 3\n", encoding="utf-8")
         self._remember_on(proj, "fresh", "2026-07-01")
         out = _out(["memory-status", "--project", str(proj), "--hook",
-                    "--date", "2026-07-01"])
+                    "--date", "2026-07-08"])
         ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("1 memory entries", ctx)
-        self.assertIn("fresh", ctx)
-        self.assertNotIn("old 2", ctx)
+        self.assertIn("has 1 memory entries", ctx)
 
     def test_memory_status_verifies_legacy_capture_lines(self):
         proj = self._new()
@@ -675,28 +722,11 @@ class VurctosMemoryTest(unittest.TestCase):
         staging.write_text(text, encoding="utf-8")
         before = _durable(proj)
         with self.assertRaises(SystemExit) as cm:
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertIn("more than one", str(cm.exception))
         self.assertEqual(_durable(proj), before)
         self.assertFalse((proj / "reflections" / ".last-reflected").exists())
-
-    def test_autostage_after_an_applied_same_day_proposal(self):
-        proj = self._new()
-        staging = self._staged(proj)
-        self._approve(staging, SEC_USER="- fact")
-        vurctos.main(["reflect-apply", "--project", str(proj),
-                      "--date", "2026-06-30"])
-        for i in range(2):
-            self._remember_on(proj, f"later {i}", "2026-06-30")
-        out = _out(["memory-status", "--project", str(proj),
-                    "--date", "2026-06-30", "--stage-at", "2"])
-        second = proj / "reflections" / "2026-06-30-2.md"
-        self.assertIn(f"staged an empty draft (backlog reached 2 entries): "
-                      f"{second.resolve()}", out)
-        self.assertIn("cursor-before: 2026-06-30 1",
-                      second.read_text(encoding="utf-8"))
-        self.assertIn("status: applied", staging.read_text(encoding="utf-8"))
 
     def test_concurrent_staging_does_not_fork_drafts(self):
         proj = self._new()
@@ -716,23 +746,11 @@ class VurctosMemoryTest(unittest.TestCase):
         self.assertIn("staged concurrently", str(cm.exception))
         self.assertFalse((proj / "reflections" / "2026-06-30-2.md").exists())
 
-    def test_stage_at_bounds_and_wording(self):
-        proj = self._new()
-        self._remember_on(proj, "x", "2026-07-01")
-        with self.assertRaises(SystemExit):
-            vurctos.main(["memory-status", "--project", str(proj),
-                          "--stage-at", "-1"])
-        self.assertFalse((proj / "reflections" / "2026-07-01.md").exists())
-        out = _out(["memory-status", "--project", str(proj), "--hook",
-                    "--stage-at", "0"])
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        self.assertNotIn("automatically", ctx)
-
     def test_hook_commands_are_shell_quoted(self):
         proj = self._new("sp ace")
         self._remember_on(proj, "x", "2026-07-01")
         out = _out(["memory-status", "--project", str(proj), "--hook",
-                    "--date", "2026-07-01"])
+                    "--date", "2026-07-08"])
         ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"reflect --project '{proj}'", ctx)
 
@@ -742,7 +760,7 @@ class VurctosMemoryTest(unittest.TestCase):
         vurctos.main(["reflect", "--project", str(proj), "--date", date])
         staging = proj / "reflections" / f"{date}.md"
         self._approve(staging, SEC_USER=user_add)
-        vurctos.main(["reflect-apply", "--project", str(proj), "--date", date])
+        _apply(["reflect-apply", "--project", str(proj), "--date", date])
 
     def _pad_over_budget(self, proj, name="USER.md"):
         """Push a durable file over the budget without touching its blocks."""
@@ -809,7 +827,7 @@ class VurctosMemoryTest(unittest.TestCase):
         vurctos.main(["reflect", "--project", str(proj), "--date", "2026-01-01"])
         staging = proj / "reflections" / "2026-01-01.md"
         self._approve(staging, SEC_MEM="- ancient tool fact")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-01-01"])
         mem = proj / "MEMORY.md"
         base = mem.read_text(encoding="utf-8")
@@ -897,7 +915,7 @@ class VurctosMemoryTest(unittest.TestCase):
             f"## {vurctos.SEC_USER}\n", f"## {vurctos.SEC_USER}\n- Communication preferences:\n").replace(
             f"## {vurctos.SEC_PRUNE}\n", f"## {vurctos.SEC_PRUNE}\n- Communication preferences:\n")
         staging.write_text(t, encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         reflected = (proj / "USER.md").read_text(encoding="utf-8").split(
             "## Reflected Updates", 1)[1]
@@ -919,7 +937,7 @@ class VurctosMemoryTest(unittest.TestCase):
             f"## {vurctos.SEC_PRUNE}\n{duplicate}\n")
         staging.write_text(t, encoding="utf-8")
         with self.assertRaisesRegex(SystemExit, "matches more than one line"):
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         # Nothing mutated: both lines intact, staging not marked applied.
         self.assertEqual(_durable(proj), before)
@@ -942,7 +960,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "# Reflection 2026-06-30\nstatus: approved")
         staging.write_text(t, encoding="utf-8")
         with self.assertRaises(SystemExit):
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
 
     def test_reflect_apply_keeps_hash_lines_in_body(self):
@@ -954,7 +972,7 @@ class VurctosMemoryTest(unittest.TestCase):
             "status: draft", "status: approved").replace(
             f"## {vurctos.SEC_MEM}\n", f"## {vurctos.SEC_MEM}\n{body}\n")
         staging.write_text(t, encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         mem = (proj / "MEMORY.md").read_text(encoding="utf-8")
         self.assertIn("- trailing bullet", mem)  # not lost after the ## line
@@ -968,15 +986,368 @@ class VurctosMemoryTest(unittest.TestCase):
             "status: draft", "status: approved").replace(
             f"## {vurctos.SEC_USER}\n", f"## {vurctos.SEC_USER}\n- distinct fact\n")
         staging.write_text(t, encoding="utf-8")
-        vurctos.main(["reflect-apply", "--project", str(proj),
+        _apply(["reflect-apply", "--project", str(proj),
                       "--date", "2026-06-30"])
         self.assertIn("status: applied", staging.read_text(encoding="utf-8"))
         with self.assertRaises(SystemExit):
-            vurctos.main(["reflect-apply", "--project", str(proj),
+            _apply(["reflect-apply", "--project", str(proj),
                           "--date", "2026-06-30"])
         self.assertEqual(
             (proj / "USER.md").read_text(encoding="utf-8").count(
                 "- distinct fact"), 1)
+
+
+    # --- capture: ids, locking, metadata, privacy ---
+
+    def _log(self, proj, date="2026-06-30"):
+        return proj / "sessions" / f"{date}.md"
+
+    def _entries(self, proj, date="2026-06-30"):
+        return vurctos._log_entries(date, self._log(proj, date))
+
+    def _rem(self, proj, what, *extra, date="2026-06-30"):
+        return _out(["remember", "--project", str(proj), "--what", what,
+                     "--date", date] + list(extra))
+
+    def test_remember_prints_positional_ids(self):
+        proj = self._new()
+        self.assertIn("as 2026-06-30#1", self._rem(proj, "a"))
+        self.assertIn("as 2026-06-30#2", self._rem(proj, "b"))
+        self.assertEqual([(e["id"], e["what"]) for e in self._entries(proj)],
+                         [("2026-06-30#1", "a"), ("2026-06-30#2", "b")])
+
+    @unittest.skipIf(vurctos.fcntl is None, "no fcntl on this platform")
+    def test_remember_waits_for_the_lock_and_keeps_both_entries(self):
+        proj = self._new()
+        self._rem(proj, "first")
+        log = self._log(proj)
+        with open(log, "ab") as held:
+            vurctos.fcntl.flock(held.fileno(), vurctos.fcntl.LOCK_EX)
+            proc = subprocess.Popen(
+                [sys.executable, "-B", str(CLI), "remember", "--project",
+                 str(proj), "--what", "second", "--date", "2026-06-30"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8")
+            time.sleep(1.5)
+            # Still waiting on the lock: nothing written yet.
+            self.assertIsNone(proc.poll())
+            self.assertNotIn("second", log.read_text(encoding="utf-8"))
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("as 2026-06-30#2", out)
+        self.assertEqual([e["what"] for e in self._entries(proj)],
+                         ["first", "second"])
+
+    def test_index_failure_keeps_the_filed_entry(self):
+        proj = self._new()
+        real = vurctos._index_entry
+
+        def broken(*args, **kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+        vurctos._index_entry = broken
+        try:
+            out = self._rem(proj, "kept anyway")
+        finally:
+            vurctos._index_entry = real
+        self.assertIn("run `vurctos reindex`", out)
+        self.assertEqual([e["what"] for e in self._entries(proj)],
+                         ["kept anyway"])
+        vurctos.main(["reindex", "--project", str(proj)])
+        rows, _ = vurctos._search_index(proj / "sessions" / "index.db", "kept")
+        self.assertEqual(len(rows), 1)
+
+    def test_kind_tag_in_the_text_becomes_the_kind(self):
+        proj = self._new()
+        self._rem(proj, "[correction] fix the cut")
+        self._rem(proj, "[decision] explicit kind wins", "--kind", "fail")
+        self._rem(proj, "[weird] unknown tags stay text")
+        self._rem(proj, "plain")
+        self.assertEqual(
+            [(e["kind"], e["what"]) for e in self._entries(proj)],
+            [("correction", "fix the cut"),
+             ("fail", "[decision] explicit kind wins"),
+             ("note", "[weird] unknown tags stay text"),
+             ("note", "plain")])
+
+    def test_supersedes_scope_and_landed_become_sub_lines(self):
+        proj = self._new()
+        self._rem(proj, "old rule")
+        log = self._log(proj)
+        snapshot = log.read_bytes()
+        for bad in (["--supersedes", "2026-06-30#2"],
+                    ["--supersedes", "2026-06-30"],
+                    ["--supersedes", "2026-06-29#1"],
+                    ["--supersedes", "2026-06-30#0"],
+                    ["--scope", "everywhere"],
+                    ["--scope", "project:"],
+                    ["--landed", "two\nlines"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit):
+                    self._rem(proj, "new rule", *bad)
+                self.assertEqual(log.read_bytes(), snapshot)
+        self._rem(proj, "new rule", "--supersedes", "2026-06-30#1",
+                  "--scope", "project:Demo", "--landed", "skills/demo §2",
+                  "--evidence", "e")
+        self.assertEqual(self._entries(proj)[1]["subs"], {
+            "evidence": ["e"], "supersedes": ["2026-06-30#1"],
+            "scope": ["project:Demo"], "landed": ["skills/demo §2"]})
+        # Sub-lines are not entries: the cursor count and the index see two.
+        self.assertEqual(vurctos._entry_count(log), 2)
+        vurctos.main(["reindex", "--project", str(proj)])
+        rows, _ = vurctos._all_index_rows(proj / "sessions" / "index.db")
+        self.assertEqual(len(rows), 2)
+
+    def test_remember_refuses_personal_numbers(self):
+        proj = self._new()
+        for what in ("call 0412 345 678 later", "手机13800138000",
+                     "medicare 2123 45678 1", "id 11010519491231002X"):
+            with self.subTest(what=what):
+                with self.assertRaises(SystemExit) as cm:
+                    self._rem(proj, what)
+                self.assertIn("private profile", str(cm.exception))
+                self.assertNotIn("345 678", str(cm.exception))
+                self.assertNotIn("13800138000", str(cm.exception))
+                self.assertFalse(self._log(proj).exists())
+        for what in ("entry 2026-10-22#16 and 2026-09-24-2.md",
+                     "eight digits 80400477", "pi 3.14159265358",
+                     "channel UC3Jt-U30ypRFGTxzgxw1Pgw", "counts 120 300"):
+            with self.subTest(what=what):
+                self._rem(proj, what)
+        self._rem(proj, "build 1234567890", "--allow-pii")
+        self.assertEqual(len(self._entries(proj)), 6)
+
+    def test_reindex_fails_closed_when_counted_entries_vanish(self):
+        proj = self._new()
+        self._rem(proj, "a")
+        self._rem(proj, "b")
+        (proj / "reflections").mkdir(exist_ok=True)
+        (proj / "reflections" / ".last-reflected").write_text(
+            "2026-06-30 2\n", encoding="utf-8")
+        log = self._log(proj)
+        log.write_text(log.read_text(encoding="utf-8").replace(
+            "- [note] a\n", ""), encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "holds fewer"):
+            vurctos.main(["reindex", "--project", str(proj)])
+
+    def test_read_only_commands_never_seed_a_global_root(self):
+        ghome = self.root / "ghome-ro"
+        os.environ["VURCTOS_HOME"] = str(ghome)
+        try:
+            out = _out(["memory-status", "--global"])
+            self.assertEqual(_out(["memory-status", "--global", "--hook"]), "")
+            with self.assertRaises(SystemExit):
+                vurctos.main(["recall", "--global", "anything"])
+        finally:
+            del os.environ["VURCTOS_HOME"]
+        self.assertIn("USER.md missing", out)
+        self.assertFalse(ghome.exists())
+
+    # --- reflect and apply: digest, approval hash, budget, writes ---
+
+    def test_digest_lists_links_carriers_and_scopes_and_is_never_applied(self):
+        proj = self._new()
+        self._rem(proj, "old rule")
+        self._rem(proj, "new rule", "--supersedes", "2026-06-30#1")
+        self._rem(proj, "skill lesson", "--landed", "skills/x §1")
+        self._rem(proj, "project craft", "--scope", "project:Demo")
+        self._rem(proj, "applies everywhere", "--scope", "global")
+        vurctos.main(["reflect", "--project", str(proj), "--date", "2026-06-30"])
+        staging = proj / "reflections" / "2026-06-30.md"
+        text = staging.read_text(encoding="utf-8")
+        digest = text.split(f"## {vurctos.SEC_DIGEST}", 1)[1].split(
+            f"## {vurctos.SEC_USER}", 1)[0]
+        self.assertIn("- 5 entries over 1 day-log(s).", digest)
+        self.assertIn("  - 2026-06-30#1 -> 2026-06-30#2", digest)
+        self.assertIn("  - 2026-06-30#3: skills/x §1", digest)
+        self.assertIn("  - project:Demo: 2026-06-30#4", digest)
+        self.assertNotIn("#5", digest)
+        self.assertIn("- USER.md now:", digest)
+        self.assertIn("at most 512 bytes", digest)
+        sections = vurctos._split_sections(text, vurctos.REFLECT_SECTIONS)
+        self.assertEqual(sections[vurctos.SEC_USER], "")
+        self._approve(staging, SEC_RATIONALE="- nothing durable")
+        before = _durable(proj)
+        _apply(["reflect-apply", "--project", str(proj), "--date", "2026-06-30"])
+        self.assertEqual(_durable(proj), before)
+
+    def test_apply_needs_the_hash_of_what_was_checked(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        self._approve(staging, SEC_USER="- fact one")
+        argv = ["reflect-apply", "--project", str(proj), "--date", "2026-06-30"]
+        marker = proj / "reflections" / ".last-reflected"
+        user = proj / "USER.md"
+
+        def check():
+            out = _out(argv + ["--check"])
+            return re.search(r"approval hash: ([0-9a-f]{16})", out).group(1)
+        before = _durable(proj)
+        self.assertIn("nothing written", _out(argv + ["--check"]))
+        digest = check()
+        self.assertEqual(_durable(proj), before)
+        with self.assertRaisesRegex(SystemExit, "no --approved-hash"):
+            vurctos.main(argv)
+        # The proposal changed after the check: the old hash is refused.
+        staging.write_text(staging.read_text(encoding="utf-8").replace(
+            "- fact one", "- fact two"), encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "changed since"):
+            vurctos.main(argv + ["--approved-hash", digest])
+        # So is a hand edit to durable memory after the check.
+        digest = check()
+        user.write_text(user.read_text(encoding="utf-8") + "- hand edit\n",
+                        encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "changed since"):
+            vurctos.main(argv + ["--approved-hash", digest])
+        self.assertNotIn("fact two", user.read_text(encoding="utf-8"))
+        self.assertFalse(marker.exists())
+        # Flipping the status line on approval does not change the hash.
+        staging.write_text(staging.read_text(encoding="utf-8").replace(
+            "status: approved", "status: draft"), encoding="utf-8")
+        digest = check()
+        staging.write_text(staging.read_text(encoding="utf-8").replace(
+            "status: draft", "status: approved"), encoding="utf-8")
+        vurctos.main(argv + ["--approved-hash", digest])
+        self.assertIn("- fact two", user.read_text(encoding="utf-8"))
+        self.assertEqual(marker.read_text(encoding="utf-8").strip(),
+                         "2026-06-30 1")
+
+    def test_apply_refuses_a_result_over_budget_at_the_exact_byte(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        add = "- 中文事实 multibyte fact"
+        self._approve(staging, SEC_USER=add)
+        user = proj / "USER.md"
+        base = user.read_text(encoding="utf-8")
+        argv = ["reflect-apply", "--project", str(proj), "--date", "2026-06-30"]
+
+        def padded(k):
+            return base + "- " + "x" * k + "\n"
+
+        def final_size(text):
+            return len(vurctos._drop_empty_dated_headings(
+                vurctos._with_reflected_block(text, "2026-06-30", add))
+                .encode("utf-8"))
+        budget = vurctos.AGING_BUDGET["USER.md"][1]
+        self.assertEqual(budget, 6 * 1024)
+        k = budget - final_size(padded(0))
+        user.write_text(padded(k + 1), encoding="utf-8")
+        before = _durable(proj)
+        with self.assertRaisesRegex(SystemExit, "over the size budget"):
+            _apply(argv)
+        self.assertEqual(_durable(proj), before)
+        user.write_text(padded(k), encoding="utf-8")
+        self.assertIn(f"{budget} bytes after apply", _out(argv + ["--check"]))
+        _apply(argv)
+        self.assertEqual(len(user.read_bytes()), budget)
+
+    def test_apply_refuses_more_than_60_lines(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        user = proj / "USER.md"
+        lines = sum(1 for ln in user.read_text(encoding="utf-8").splitlines()
+                    if ln.strip())
+        # The block adds its own two headings (Reflected Updates and the date).
+        room = 60 - lines - 2
+        self._approve(staging, SEC_USER="\n".join(
+            f"- fact {i}" for i in range(room + 1)))
+        argv = ["reflect-apply", "--project", str(proj), "--date", "2026-06-30"]
+        with self.assertRaisesRegex(SystemExit, "61 lines"):
+            _apply(argv)
+        self._approve(staging)
+        staging.write_text(staging.read_text(encoding="utf-8").replace(
+            f"- fact {room}\n", ""), encoding="utf-8")
+        _apply(argv)
+
+    def test_added_lines_are_capped_at_512_bytes(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        ok = "- " + "中" * 170
+        self.assertEqual(len(ok.encode("utf-8")), vurctos.DURABLE_LINE_MAX)
+        self.assertEqual(vurctos.DURABLE_LINE_MAX, 512)
+        self._approve(staging, SEC_MEM=f"{ok}\n{ok}中")
+        argv = ["reflect-apply", "--project", str(proj), "--date", "2026-06-30"]
+        before = _durable(proj)
+        with self.assertRaisesRegex(SystemExit, "515 bytes"):
+            _apply(argv)
+        self.assertEqual(_durable(proj), before)
+        staging.write_text(staging.read_text(encoding="utf-8").replace(
+            f"{ok}中\n", ""), encoding="utf-8")
+        _apply(argv)
+        self.assertIn(ok, (proj / "MEMORY.md").read_text(encoding="utf-8"))
+
+    def test_apply_drops_emptied_dated_headings_and_keeps_a_backup(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        mem = proj / "MEMORY.md"
+        mem.write_text(mem.read_text(encoding="utf-8")
+                       + "\n## Reflected Updates\n\n### 2026-06-01\n\n\n"
+                       "- old fact\n\n### 2026-06-02\n\n- kept fact\n",
+                       encoding="utf-8")
+        original = mem.read_text(encoding="utf-8")
+        self._approve(staging, SEC_PRUNE="- old fact")
+        _apply(["reflect-apply", "--project", str(proj), "--date", "2026-06-30"])
+        text = mem.read_text(encoding="utf-8")
+        self.assertNotIn("### 2026-06-01", text)
+        self.assertIn("### 2026-06-02\n\n- kept fact\n", text)
+        self.assertNotIn("\n\n\n", text.split("## Reflected Updates", 1)[1])
+        backup = proj / "reflections" / "backup" / "2026-06-30"
+        self.assertEqual((backup / "MEMORY.md").read_text(encoding="utf-8"),
+                         original)
+
+    def test_an_interrupted_apply_never_leaves_half_a_file(self):
+        proj = self._new()
+        staging = self._staged(proj)
+        self._approve(staging, SEC_USER="- user fact", SEC_MEM="- mem fact")
+        argv = ["reflect-apply", "--project", str(proj), "--date", "2026-06-30"]
+        user, mem = proj / "USER.md", proj / "MEMORY.md"
+        marker = proj / "reflections" / ".last-reflected"
+        backup = proj / "reflections" / "backup" / "2026-06-30"
+        real_replace = vurctos.os.replace
+        calls = []
+
+        def crash_on(n):
+            def replace(src, dst):
+                calls.append(dst)
+                if len(calls) == n:
+                    raise OSError("power cut")
+                return real_replace(src, dst)
+            return replace
+
+        def run_with(replace):
+            digest = re.search(r"approval hash: ([0-9a-f]{16})",
+                               _out(argv + ["--check"])).group(1)
+            calls.clear()
+            vurctos.os.replace = replace
+            try:
+                with self.assertRaisesRegex(OSError, "power cut"):
+                    vurctos.main(argv + ["--approved-hash", digest])
+            finally:
+                vurctos.os.replace = real_replace
+        # Crash on the first replace: both files whole and unchanged.
+        before = _durable(proj)
+        run_with(crash_on(1))
+        self.assertEqual(_durable(proj), before)
+        self.assertFalse(marker.exists())
+        shutil.rmtree(backup)
+        # Crash between the two files: MEMORY.md is the new file, USER.md
+        # the old one, the cursor has not moved, and a re-run is refused
+        # until the backup is restored.
+        run_with(crash_on(2))
+        self.assertIn("- mem fact", mem.read_text(encoding="utf-8"))
+        self.assertEqual(user.read_bytes(), before[0])
+        self.assertFalse(marker.exists())
+        self.assertIn("status: approved", staging.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(SystemExit, "interrupted"):
+            _out(argv + ["--check"])
+        for name in ("USER.md", "MEMORY.md"):
+            shutil.copy2(backup / name, proj / name)
+        shutil.rmtree(backup)
+        self.assertEqual(_durable(proj), before)
+        _apply(argv)
+        self.assertEqual(mem.read_text(encoding="utf-8").count("- mem fact"), 1)
+        self.assertEqual(user.read_text(encoding="utf-8").count("- user fact"), 1)
+        self.assertEqual(marker.read_text(encoding="utf-8").strip(),
+                         "2026-06-30 1")
 
 
 BOARD_TWO_CARDS = """# Board
@@ -1832,7 +2203,7 @@ class VurctosGlobalMemoryTest(unittest.TestCase):
             f"## {vurctos.SEC_USER}\n",
             f"## {vurctos.SEC_USER}\n- cross-project: values rigor\n")
         staging.write_text(t, encoding="utf-8")
-        vurctos.main(["reflect-apply", "--global", "--date", "2026-07-02"])
+        _apply(["reflect-apply", "--global", "--date", "2026-07-02"])
         user = (self.root / "ghome" / "USER.md").read_text(encoding="utf-8")
         self.assertIn("## Reflected Updates", user)
         self.assertIn("cross-project: values rigor", user)
@@ -2055,7 +2426,7 @@ class VurctosWireIntegrityTest(unittest.TestCase):
         out = self._run_hook(TEMPLATE_HOOK, CLAUDE_PROJECT_DIR=proj)
         self.assertEqual(out, "")
 
-    def test_template_hook_emits_valid_json_with_digest(self):
+    def test_template_hook_emits_valid_json_without_entry_text(self):
         proj = self._new()
         vurctos.main(["remember", "--project", str(proj), "--kind", "fail",
                       "--what", 'said "quoted" and back\\slash 中文教训',
@@ -2067,36 +2438,31 @@ class VurctosWireIntegrityTest(unittest.TestCase):
         ctx = self._ctx(out)  # raises if the JSON is broken
         self.assertIn("This VurctOS project has 2 memory entries", ctx)
         self.assertIn("oldest: 2026-07-01", ctx)
-        self.assertIn('said "quoted"', ctx)
-        self.assertIn("back\\slash", ctx)
-        self.assertIn("中文教训", ctx)
-        self.assertNotIn("not in digest", ctx)
-        self.assertIn("ansi", ctx)
-        self.assertIn("end", ctx)
-        self.assertNotIn("\x1b", ctx)
-        self.assertNotIn("\x01", ctx)
+        for leak in ("quoted", "slash", "中文教训", "not in digest", "ansi",
+                     "\x1b", "\x01"):
+            self.assertNotIn(leak, ctx)
         self.assertIn(f"{CLI} reflect --project {proj}", ctx)
 
-    def test_template_hook_points_at_the_staged_draft_once_large(self):
+    def test_template_hook_never_stages_and_points_at_a_waiting_draft(self):
         proj = self._new()
-        for i in range(vurctos.REFLECT_STAGE_AT):
+        for i in range(vurctos.REFLECT_NUDGE_AT):
             vurctos.main(["remember", "--project", str(proj),
                           "--what", f"entry {i}", "--date", "2026-07-01"])
         before = _durable(proj)
 
         def drafts():
-            return [p for p in (proj / "reflections").glob("*.md")
-                    if vurctos._DAY_LOG_RE.match(p.name)]
+            refl = proj / "reflections"
+            return [p for p in refl.glob("*.md")
+                    if vurctos._DAY_LOG_RE.match(p.name)] if refl.is_dir() else []
         ctx = self._ctx(self._run_hook(TEMPLATE_HOOK, CLAUDE_PROJECT_DIR=proj))
-        self.assertEqual(len(drafts()), 1)
-        draft = drafts()[0].resolve()
-        self.assertIn(f"A reflection draft is waiting at {draft}", ctx)
-        self.assertIn("status: draft", draft.read_text(encoding="utf-8"))
+        self.assertEqual(drafts(), [])
+        self.assertIn("offer the user a short consolidation", ctx)
         self.assertEqual(_durable(proj), before)
-        # The next session sees the same draft, not a second one.
+        vurctos.main(["reflect", "--project", str(proj), "--date", "2026-07-01"])
+        draft = drafts()[0].resolve()
         ctx = self._ctx(self._run_hook(TEMPLATE_HOOK, CLAUDE_PROJECT_DIR=proj))
+        self.assertIn(f"A reflection draft is waiting at {draft}", ctx)
         self.assertEqual(len(drafts()), 1)
-        self.assertIn(str(draft), ctx)
 
     def test_scaffolded_hook_finds_the_cli_on_its_own(self):
         proj = self._new()
@@ -2153,7 +2519,9 @@ class VurctosWireIntegrityTest(unittest.TestCase):
             ["sh", str(installed)], env={**env, "VURCTOS_HOME": str(ghome)},
             capture_output=True, text=True, encoding="utf-8", timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("installed hook", self._ctx(proc.stdout))
+        ctx = self._ctx(proc.stdout)
+        self.assertIn("Global VurctOS memory has 1 memory entries", ctx)
+        self.assertNotIn("installed hook", ctx)
 
     def test_global_hook_fires_against_temp_home(self):
         ghome = self.root / "ghome"
@@ -2165,7 +2533,7 @@ class VurctosWireIntegrityTest(unittest.TestCase):
             del os.environ["VURCTOS_HOME"]
         ctx = self._ctx(self._run_hook(GLOBAL_HOOK, VURCTOS_HOME=ghome))
         self.assertIn("Global VurctOS memory has 1 memory entries", ctx)
-        self.assertIn("global lesson", ctx)
+        self.assertNotIn("global lesson", ctx)
         self.assertIn("oldest: 2026-07-01", ctx)
         self.assertIn("reflect --global", ctx)
         self.assertEqual(

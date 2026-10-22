@@ -1,9 +1,10 @@
 #!/bin/sh
 # SessionStart nudge (user-level): surface the global VurctOS memory backlog
 # at ~/.vurctos, and any reflection draft waiting for review, once at session
-# start in every project. The numbers come from `vurctos memory-status
-# --global --hook`, which also stages an empty draft once the backlog is
-# large. Silent when nothing is waiting or ~/.vurctos does not exist.
+# start in every project. The numbers come from the read-only `vurctos
+# memory-status --global --hook`, which reports counts only and speaks once a
+# short consolidation is worthwhile. Silent when nothing needs attention or
+# ~/.vurctos does not exist.
 # Install (bakes in the CLI path): see docs/memory-system.md.
 cli="${VURCTOS_CLI:-}"
 [ -n "$cli" ] || cli=__VURCTOS_CLI__

@@ -1,8 +1,9 @@
 #!/bin/sh
 # SessionStart nudge: surface this project's unconsolidated memory, and any
 # reflection draft waiting for review, once at session start as hook JSON.
-# The numbers come from `vurctos memory-status --hook`, which also stages an
-# empty draft once the backlog is large. Silent when nothing is waiting.
+# The numbers come from the read-only `vurctos memory-status --hook`, which
+# reports counts only and speaks once a short consolidation is worthwhile.
+# Silent when nothing needs attention.
 # `vurctos new` bakes the CLI path in below; VURCTOS_CLI overrides it.
 cli="${VURCTOS_CLI:-}"
 [ -n "$cli" ] || cli=__VURCTOS_CLI__

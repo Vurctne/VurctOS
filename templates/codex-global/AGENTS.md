@@ -15,9 +15,9 @@ Do not blind-overwrite an existing `~/.codex/AGENTS.md`: append instead, so your
 
 User-level durable memory lives in two plain files:
 
-- `~/.vurctos/USER.md`: durable, cross-project facts and decision patterns about the user.
-- `~/.vurctos/MEMORY.md`: consolidated cross-project memory.
+- `~/.vurctos/USER.md`: durable, cross-project facts and decision patterns about the user that nearly every session needs.
+- `~/.vurctos/MEMORY.md`: consolidated cross-project knowledge for particular kinds of task (tools, platforms, methods), one fact per line under a `[tag]`.
 
-At the start of each session, open both files (if they exist) and treat their contents as known context for every project. They are named here in prose because Codex does not expand `@file` imports.
+At the start of each session, open `USER.md` (if it exists) and treat its contents as known context for every project, the same file a Claude Code session imports. Do not load `MEMORY.md` up front: when a task touches one of its topics, search it for the matching `[tag]` lines and read those. If the task's own instructions say not to read personal memory, follow them. The files are named here in prose because Codex does not expand `@file` imports.
 
 Do not write to these files directly. Global memory is filed and consolidated only through the human-gated `vurctos remember --global` / `vurctos reflect --global` CLI.
