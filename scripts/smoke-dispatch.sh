@@ -41,22 +41,31 @@ if [ "$mode" = "negative" ]; then
   # project, so dispatch must refuse it before running and the card must land in
   # blocked, no matter what the model does.
   expected="../escape.txt"
-  notes="Write only the handoff file. Do not create any file outside the project directory."
+  notes="Write only the handoff file."
+  decided="Do not create any file outside the project directory."
+  acceptance='dispatch refuses the card before running it'
 else
   expected="final/smoke.txt"
-  notes="Create the file final/smoke.txt containing exactly the single line: vurctos smoke ok (no other text, no trailing commentary). Do not modify any other file."
+  notes="Create the file final/smoke.txt containing exactly the single line: vurctos smoke ok (no other text, no trailing commentary)."
+  decided="Do not modify any other file."
+  acceptance='`cat final/smoke.txt` prints exactly: vurctos smoke ok'
 fi
 
 cat >> "$proj/BOARD.md" <<EOF
 
 - id: smoke-001
   title: Dispatch smoke test card
+  goal: Show that vurctos dispatch runs one real card end to end on the local login
   assignee: $agent
   channel: local
   status: ready
   inputs:
   expected_outputs:
     - $expected
+  decided:
+    - $decided
+  acceptance:
+    - $acceptance
   handoff: handoffs/smoke-001.md
   notes: $notes
 EOF
@@ -77,6 +86,7 @@ else
   content=$(cat "$proj/final/smoke.txt")
   [ "$content" = "vurctos smoke ok" ] || fail "wrong content: $content"
   [ -f "$proj/handoffs/smoke-001.md" ] || fail "handoff file missing"
-  echo "PASS: card -> review, output content verified, handoff written"
+  grep -qi '^#* *deviations' "$proj/handoffs/smoke-001.md" || fail "handoff has no Deviations section"
+  echo "PASS: card -> review, output content verified, handoff written with Deviations"
 fi
 rm -rf "$tmp"

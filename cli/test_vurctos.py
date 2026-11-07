@@ -1381,6 +1381,93 @@ BOARD_TWO_CARDS = """# Board
 ```
 """
 
+# Golden captures, taken from the code BEFORE cards gained goal / decided /
+# acceptance and handoffs gained Deviations. Never regenerate them from the
+# current code: an invariance baseline written after an edit can only record
+# whatever the edited code happens to do.
+OLD_PARSE_TWO_CARDS = [
+    {"id": "card-101", "inputs": ["input/a.mp4"],
+     "expected_outputs": ["analysis/hook.md"], "_line": 5,
+     "title": "Analyze hook", "assignee": "gemini", "channel": "handoff",
+     "status": "ready", "handoff": "handoffs/card-101.md",
+     "notes": "subscription web tool card, human handoff only"},
+    {"id": "card-102", "inputs": ["task.md"],
+     "expected_outputs": ["analysis/org.md"], "_line": 17,
+     "title": "Organize files", "assignee": "claude-exec",
+     "channel": "local", "status": "ready",
+     "handoff": "handoffs/card-102.md", "notes": "local execution card"},
+]
+OLD_PROMPT_CARD_102 = (
+    "You are the Executor (claude) for exactly one board card in this "
+    "VurctOS project.\n"
+    "Card card-102: Organize files\n"
+    "Notes: local execution card\n"
+    "Inputs to read: task.md\n"
+    "Expected outputs to produce: analysis/org.md\n"
+    "When the outputs are written, also write the typed handoff file "
+    "handoffs/card-102.md in the format shown in handoffs/README.md "
+    "(frontmatter: card, from: claude-exec, to: claude, status: done, "
+    "inputs, outputs; body: Summary, Result, Notes For Review).\n"
+    "If you hit an unknown the card does not answer (missing input, "
+    "ambiguous requirement, an assumption you would otherwise guess), "
+    "do not guess silently: state it under Notes For Review in the "
+    "handoff.\n"
+    "Do only this card. Do not mark anything done in BOARD.md.")
+OLD_PROMPT_SKELETON = (
+    "You are the Executor (claude) for exactly one board card in this "
+    "VurctOS project.\n"
+    "Card card-001: \n"
+    "Notes: \n"
+    "Inputs to read: (none listed)\n"
+    "Expected outputs to produce: (none listed)\n"
+    "When the outputs are written, also write the typed handoff file "
+    "handoffs/card-001.md in the format shown in handoffs/README.md "
+    "(frontmatter: card, from: claude-exec, to: claude, status: done, "
+    "inputs, outputs; body: Summary, Result, Notes For Review).\n"
+    "If you hit an unknown the card does not answer (missing input, "
+    "ambiguous requirement, an assumption you would otherwise guess), "
+    "do not guess silently: state it under Notes For Review in the "
+    "handoff.\n"
+    "Do only this card. Do not mark anything done in BOARD.md.")
+NEW_CARD_FIELDS = ("goal", "decided", "acceptance")
+# Written out here, not read from vurctos, so wording drift fails a test.
+DEVIATION_RULE = (
+    "If something forces you to depart from what the card states, take the "
+    "conservative option, record it under Deviations (what the card said, "
+    "what you did instead, why), and keep going; write \"None.\" under "
+    "Deviations when you followed the card exactly. The conservative option "
+    "keeps every Decided item, touches the fewest files, and is the easiest "
+    "to undo. Decided items outrank Notes, review feedback included: if you "
+    "cannot keep one, leave that part undone and record it rather than "
+    "change it.")
+ACCEPTANCE_RULE = (
+    "Before writing the handoff, run the Acceptance checks you are able to "
+    "and put their raw results under Result; if one cannot run here, say so "
+    "under Notes For Review. Do not edit a file or test that an Acceptance "
+    "item names unless it is an expected output.")
+BOARD_NEW_FIELDS = """## Cards
+
+- id: c1
+  title: Config loader
+  goal: One config source: no drift
+  assignee: claude-exec
+  channel: local
+  status: ready
+  inputs:
+    - src/config.py
+  expected_outputs:
+    - src/config.py
+  decided:
+    - Keep the public function signatures unchanged.
+    - No new dependencies: standard library only.
+  acceptance:
+    - cd cli; python3 -B -m unittest
+    - compare src/config.py against docs/config.md, section 2
+    - `grep -c x: y` prints 0
+  handoff: handoffs/c1.md
+  notes: context
+"""
+
 
 class VurctosDispatchTest(unittest.TestCase):
     def setUp(self):
@@ -1591,6 +1678,34 @@ class VurctosDispatchTest(unittest.TestCase):
         prompt = vurctos._dispatch_prompt(card)
         self.assertIn("do not guess silently", prompt)
         self.assertIn("Notes For Review", prompt)
+
+    def test_acceptance_paths_are_not_required_outputs(self):
+        # C3. Acceptance names things to check, not things to produce: a
+        # test file it names, which the run never touches, must not be
+        # gated on.
+        board = BOARD_TWO_CARDS.replace(
+            "  handoff: handoffs/card-102.md",
+            "  acceptance:\n    - `python3 -m unittest tests/test_x.py`\n"
+            "    - tests/test_x.py\n"
+            "  handoff: handoffs/card-102.md")
+        (self.proj / "BOARD.md").write_text(board, encoding="utf-8")
+        card = vurctos._parse_cards(board)[1]
+        self.assertEqual(len(card["acceptance"]), 2)
+        self.assertEqual(vurctos._output_paths(self.proj, card),
+                         ["handoffs/card-102.md", "analysis/org.md"])
+
+        def fake_ok(prompt, project, timeout):
+            (project / "analysis").mkdir(exist_ok=True)
+            (project / "analysis" / "org.md").write_text("done",
+                                                         encoding="utf-8")
+            (project / "handoffs" / "card-102.md").write_text(
+                "## Summary\nok\n", encoding="utf-8")
+            return 0, "{}", ""
+        vurctos._run_claude = fake_ok
+        vurctos.main(["dispatch", "--project", str(self.proj)])
+        self.assertIn("status: review",
+                      self._board().split("- id: card-102")[1])
+        self.assertFalse((self.proj / "tests" / "test_x.py").exists())
 
     # --- template doc-example and duplicate-id hardening ---
 
@@ -1991,6 +2106,190 @@ class VurctosDispatchTest(unittest.TestCase):
         board = self._board()
         self.assertIn("status: blocked", board.split("- id: card-102")[1])
         self.assertNotIn("status: review", board)
+
+
+class VurctosCardFieldsTest(unittest.TestCase):
+    """Card fields goal / decided / acceptance and the handoff Deviations
+    section. Pure functions and repo files only: no temp project."""
+
+    def _skeleton_card(self):
+        board = (vurctos.TEMPLATE_DIR / "BOARD.md").read_text(encoding="utf-8")
+        return vurctos._parse_cards(board)[0]
+
+    def test_old_board_parses_exactly_as_before(self):
+        # A5. Every old key keeps its old value; only the new keys are new.
+        cards = vurctos._parse_cards(BOARD_TWO_CARDS)
+        old_view = [{k: v for k, v in c.items() if k not in NEW_CARD_FIELDS}
+                    for c in cards]
+        self.assertEqual(old_view, OLD_PARSE_TWO_CARDS)
+
+    def test_old_card_prompt_changes_only_by_the_deviation_rule(self):
+        # B1. An old card's prompt is the golden capture with exactly two
+        # edits, which together are the deviation rule: the handoff body
+        # list (now authoritative, with Deviations) and the deviation
+        # paragraph. Anything else (an empty Goal/Decided label, reordering,
+        # wording drift) breaks equality.
+        def expected(old):
+            return old.replace(
+                "body: Summary, Result, Notes For Review).",
+                "body sections in this order, even if that README is older: "
+                "Summary, Result, Deviations, Notes For Review).").replace(
+                "Do only this card.", DEVIATION_RULE + "\nDo only this card.")
+        card = vurctos._parse_cards(BOARD_TWO_CARDS)[1]
+        self.assertEqual(vurctos._dispatch_prompt(card),
+                         expected(OLD_PROMPT_CARD_102))
+        self.assertEqual(vurctos._dispatch_prompt(self._skeleton_card()),
+                         expected(OLD_PROMPT_SKELETON))
+
+    def test_new_fields_parse_as_exact_lists(self):
+        # A1. Items keep ':', ';', ',' and backticks; nothing is split.
+        cards = vurctos._parse_cards(BOARD_NEW_FIELDS)
+        card = cards[0]
+        self.assertEqual(card["goal"], ["One config source: no drift"])
+        self.assertEqual(card["decided"], [
+            "Keep the public function signatures unchanged.",
+            "No new dependencies: standard library only.",
+        ])
+        self.assertEqual(card["acceptance"], [
+            "cd cli; python3 -B -m unittest",
+            "compare src/config.py against docs/config.md, section 2",
+            "`grep -c x: y` prints 0",
+        ])
+        self.assertEqual(card["notes"], "context")
+
+    def test_inline_value_comes_first_and_is_not_split(self):
+        # A2. Inline only, and inline plus items.
+        board = ("## Cards\n"
+                 "- id: c1\n"
+                 "  decided: keep a, b; and c\n"
+                 "  acceptance: `make test`\n"
+                 "    - read docs/x.md\n")
+        card = vurctos._parse_cards(board)[0]
+        self.assertEqual(card["decided"], ["keep a, b; and c"])
+        self.assertEqual(card["acceptance"], ["`make test`", "read docs/x.md"])
+
+    def test_empty_and_missing_fields_are_empty_lists(self):
+        # A3. Blank goal, item-less decided, absent acceptance, and the
+        # template skeleton card all give [].
+        board = ("## Cards\n"
+                 "- id: c1\n"
+                 "  goal:\n"
+                 "  decided:\n"
+                 "  notes: n\n")
+        card = vurctos._parse_cards(board)[0]
+        for key in NEW_CARD_FIELDS:
+            self.assertEqual(card[key], [], key)
+        skeleton = self._skeleton_card()
+        for key in NEW_CARD_FIELDS:
+            self.assertEqual(skeleton[key], [], key)
+
+    def test_goal_written_as_list_reaches_prompt(self):
+        # A4. A list-written goal is not dropped.
+        board = ("## Cards\n"
+                 "- id: c1\n"
+                 "  goal:\n"
+                 "    - serve the release\n"
+                 "    - keep users: happy\n")
+        card = vurctos._parse_cards(board)[0]
+        self.assertNotIn("- keep users", card)
+        self.assertIn("\nGoal: serve the release; keep users: happy\n",
+                      vurctos._dispatch_prompt(card))
+
+    def test_list_grammar_is_strict(self):
+        # A6 (characterization). Inside a list, a line that is not '- item'
+        # is ignored, and an indented 'word: text' line ends the list, so
+        # the items after it are orphaned. Loosening this later is
+        # compatible; make it a deliberate change by updating this test.
+        board = ("## Cards\n"
+                 "- id: c1\n"
+                 "  decided:\n"
+                 "    - a\n"
+                 "    wrapped continuation of a\n"
+                 "    - b\n"
+                 "    caveat: not an item\n"
+                 "    - c\n")
+        card = vurctos._parse_cards(board)[0]
+        self.assertEqual(card["decided"], ["a", "b"])
+        self.assertEqual(card["caveat"], "not an item")
+
+    def test_new_fields_render_in_place_one_item_per_line(self):
+        # B2.
+        card = vurctos._parse_cards(BOARD_NEW_FIELDS)[0]
+        prompt = vurctos._dispatch_prompt(card)
+        self.assertIn("Card c1: Config loader\nGoal: One config source: "
+                      "no drift\nNotes: ", prompt)
+        self.assertIn("Decided (fixed; do not change):\n"
+                      "- Keep the public function signatures unchanged.\n"
+                      "- No new dependencies: standard library only.\n",
+                      prompt)
+        self.assertIn("Acceptance (how someone other than you will check "
+                      "the result):\n"
+                      "- cd cli; python3 -B -m unittest\n"
+                      "- compare src/config.py against docs/config.md, "
+                      "section 2\n"
+                      "- `grep -c x: y` prints 0\n" + ACCEPTANCE_RULE + "\n",
+                      prompt)
+        outputs = prompt.index("Expected outputs to produce:")
+        decided = prompt.index("Decided (fixed")
+        accept = prompt.index("Acceptance (how")
+        handoff = prompt.index("When the outputs")
+        self.assertTrue(outputs < decided < accept < handoff)
+
+    def test_handoff_sections_and_deviation_rule_in_every_prompt(self):
+        # B3. The prompt carries the section list and the deviation rule
+        # itself, whatever the project's own handoffs/README.md says.
+        self.assertEqual(vurctos.HANDOFF_SECTIONS,
+                         ("Summary", "Result", "Deviations",
+                          "Notes For Review"))
+        for card in (vurctos._parse_cards(BOARD_TWO_CARDS)[1],
+                     vurctos._parse_cards(BOARD_NEW_FIELDS)[0]):
+            prompt = vurctos._dispatch_prompt(card)
+            self.assertIn("even if that README is older: "
+                          + ", ".join(vurctos.HANDOFF_SECTIONS) + ").",
+                          prompt)
+            self.assertIn('write "None." under Deviations', prompt)
+            self.assertIn("Decided items outrank Notes", prompt)
+        old_card = vurctos._parse_cards(BOARD_TWO_CARDS)[1]
+        self.assertNotIn("Acceptance", vurctos._dispatch_prompt(old_card))
+
+    def test_codex_prompt_names_codex_exec_with_new_fields(self):
+        # B4.
+        card = vurctos._parse_cards(BOARD_NEW_FIELDS)[0]
+        prompt = vurctos._dispatch_prompt(card, agent="codex")
+        self.assertIn("You are the Executor (codex)", prompt)
+        self.assertIn("from: codex-exec", prompt)
+        self.assertNotIn("claude-exec", prompt)
+
+    # --- doc sync: the documented formats are the ones the code reads ---
+
+    @staticmethod
+    def _first_text_fence(path, after_heading):
+        text = (vurctos.REPO_ROOT / path).read_text(encoding="utf-8")
+        rest = text[text.index(after_heading):]
+        start = rest.index("```text\n") + len("```text\n")
+        return rest[start:rest.index("```", start)]
+
+    def test_documented_card_examples_parse_with_all_fields(self):
+        # D1.
+        for path, heading in (("ORCHESTRATION.md", "## 2. The Board"),
+                              ("templates/project-template/BOARD.md",
+                               "## Card Format")):
+            cards = vurctos._parse_cards(
+                "## Cards\n" + self._first_text_fence(path, heading))
+            self.assertEqual(len(cards), 1, path)
+            self.assertTrue(cards[0]["goal"], path)
+            self.assertEqual(len(cards[0]["decided"]), 2, path)
+            self.assertEqual(len(cards[0]["acceptance"]), 2, path)
+
+    def test_documented_handoff_sections_match_the_prompt(self):
+        # D2.
+        for path, heading in (("ORCHESTRATION.md", "## 4. The Handoff"),
+                              ("templates/project-template/handoffs/README.md",
+                               "## Handoff Template")):
+            fence = self._first_text_fence(path, heading)
+            heads = [ln[3:].strip() for ln in fence.splitlines()
+                     if ln.startswith("## ")]
+            self.assertEqual(heads, list(vurctos.HANDOFF_SECTIONS), path)
 
 
 class VurctosRejectTest(unittest.TestCase):

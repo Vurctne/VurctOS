@@ -45,6 +45,7 @@ Each task is a card:
 ```text
 - id: card-003
   title: Refactor the config loader to read from a single source
+  goal: One config source, so the settings page and the CLI can never disagree
   assignee: claude-exec
   channel: local
   status: ready
@@ -54,11 +55,19 @@ Each task is a card:
   expected_outputs:
     - src/config.py
     - tests/test_config.py
+  decided:
+    - Keep the public function signatures unchanged.
+    - No new dependencies: standard library only.
+  acceptance:
+    - `python3 -m unittest tests.test_config` passes
+    - every key listed in docs/config.md section 2 is read from config.toml
   handoff: handoffs/card-003.md
-  notes: Keep the public function signatures unchanged.
+  notes: Free-form context for this run (review feedback from reject lands here).
 ```
 
 Card status values: `backlog`, `ready`, `in-progress`, `review`, `done`, `blocked`.
+
+`goal`, `decided` and `acceptance` are optional; a card without them runs exactly as before. `goal` is one line: what the work ultimately serves. `decided` lists what is settled and must not change. `acceptance` lists how someone other than the executor will check the result: a command to run (write commands in backticks) or a source to compare against. `vurctos dispatch` puts each one that is non-empty into the executor prompt, and tells the executor that `decided` outranks `notes`. Write `decided` and `acceptance` as `- item` lists, one item per line (a single inline value also works). The scanner is strict on purpose: every field line stays indented under `- id:`, a line at column 0 ends the card, a line that is neither `key: value` nor `- item` is ignored, and an indented `key: value` line ends the list above it. So check a new card with `vurctos dispatch --dry-run`, which prints the exact prompt. (If an older board already used one of these three names informally, that text now reaches the prompt too.)
 
 The Orchestrator is responsible for creating cards during task decomposition, moving cards through statuses, and never marking a card `done` before result review (loop step 7).
 
@@ -112,11 +121,27 @@ One paragraph on what was produced.
 ## Result
 The concrete output, or a pointer to the output files.
 
+## Deviations
+One bullet per forced departure from the card: which field or item, what you did instead, and why. Write None. if you followed the card exactly.
+
 ## Notes For Review
 Anything the Orchestrator should check, known limitations, and any unknowns the card did not answer (an Executor records these here instead of guessing silently; see the base rule in `CORE.md`).
 ```
 
-The Orchestrator reads the handoff during result review (loop step 7), checks it against intent, project constraints, and style memory, then either accepts it (card to `done`) or reopens the card with feedback. Reopening is mechanized by `vurctos reject <card-id> --reason "..."`: the reason is filed into memory, stamped into the card notes so the re-run carries it, and the card returns to `ready`.
+Deviations is for results that contradict something the card states, and each bullet names that field; Notes For Review is for what the card left silent or unclear. The test: can I point to the card line my result contradicts? The section is always present, so a missing one means an old template or a skipped step, not "nothing to report".
+
+The Orchestrator reads the handoff during result review (loop step 7), checks it against intent, project constraints, and style memory, then either accepts it (card to `done`) or reopens the card with feedback. Reopening is mechanized by `vurctos reject <card-id> --reason "..."`: the reason is filed into memory, stamped into the card notes so the re-run carries it, and the card returns to `ready`. Reject never edits `decided`, and `decided` outranks notes, so to overturn a decided item, edit it in `BOARD.md` before the next dispatch.
+
+### Writing A Card
+
+An executor knows only the card and the repository, so write the card for that reader. `goal` says what the work is for, so the executor can make the calls the card does not cover. `decided` says what is settled, so judgement does not wander into it; anything not listed is the executor's call. `acceptance` names a check that is not the executor's own opinion of its work. `inputs` should point at original material (the source, the spec, the failing log), not at a summary of it, because a summary has already dropped the detail the executor may need. These fields carry the base rule in `CORE.md` onto the card: `decided` fixes the known knowns in place, `goal` writes down the assumption that usually goes unsaid, and `acceptance` is the check on the method. A card that cannot be followed as written comes back with a Deviation, and that is feedback on the card as much as on the work.
+
+Further reading on writing task prompts for models and agents:
+
+- https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models
+- https://claude.com/blog/a-field-guide-to-claude-fable-finding-your-unknowns
+- https://felixrieseberg.com/how-to-be-more-ambitious-a-tutorial-for-humans-with-models/
+- https://felixrieseberg.com/hunger-beats-tenure-advice-for-junior-engineers/
 
 ## 5. Memory Model: Three Layers
 

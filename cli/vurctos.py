@@ -1689,6 +1689,15 @@ def cmd_skill_new(args):
 #     used, so runs ride the existing Claude subscription login and can not
 #     silently switch to metered API billing.
 
+# Card fields parsed as lists. One constant drives both the card initializer
+# and the key test, so a key can never be in one and missing from the other.
+LIST_KEYS = ("inputs", "expected_outputs", "goal", "decided", "acceptance")
+# Handoff body sections, in order. The dispatch prompt states this list as
+# authoritative, because a project's own handoffs/README.md is copied once by
+# `new` and never updated.
+HANDOFF_SECTIONS = ("Summary", "Result", "Deviations", "Notes For Review")
+
+
 def _parse_cards(board_text):
     """Parse card blocks under the '## Cards' heading. Return a list of dicts.
 
@@ -1696,9 +1705,10 @@ def _parse_cards(board_text):
     documentation example in the board's 'Card Format' section is never
     parsed as a real card. Each card records the line index of its '- id:'
     line as '_line' so the status writer targets the exact block instead of
-    re-matching by id. Scalar fields are '  key: value' lines; 'inputs' and
-    'expected_outputs' are indented '- item' lists. A small line scanner,
-    not YAML.
+    re-matching by id. Scalar fields are '  key: value' lines; every
+    LIST_KEYS field is an indented '- item' list, an inline value, or both
+    (inline first), and is always present ([] when empty). A small line
+    scanner, not YAML.
     """
     cards, card, list_key = [], None, None
     in_cards = False
@@ -1709,8 +1719,8 @@ def _parse_cards(board_text):
         if not in_cards:
             continue
         if line.startswith("- id:"):
-            card = {"id": line.split(":", 1)[1].strip(), "inputs": [],
-                    "expected_outputs": [], "_line": i}
+            card = {"id": line.split(":", 1)[1].strip(),
+                    **{k: [] for k in LIST_KEYS}, "_line": i}
             cards.append(card)
             list_key = None
             continue
@@ -1724,7 +1734,7 @@ def _parse_cards(board_text):
         elif ":" in body:
             key, _, val = body.partition(":")
             key, val = key.strip(), val.strip()
-            if key in ("inputs", "expected_outputs"):
+            if key in LIST_KEYS:
                 list_key = key
                 if val:
                     card[list_key].append(val)
@@ -1793,30 +1803,69 @@ def _set_card_status(board_path, card, new_status, expect=None):
     return True
 
 
+def _list_block(label, items):
+    """A label line plus one '- item' line each; nothing when empty, so a
+    card without the field gets no empty label."""
+    if not items:
+        return []
+    return [f"{label}:"] + [f"- {i}" for i in items]
+
+
 def _dispatch_prompt(card, agent="claude"):
     """One tiny instruction; project context loads itself via CLAUDE.md
     (for Codex, via AGENTS.md). Agent-neutral so the same card can be run
-    by either executor."""
+    by either executor. Goal, Decided and Acceptance appear only when the
+    card has them; the handoff sections and the deviation rule always do."""
     inputs = ", ".join(card["inputs"]) or "(none listed)"
     outputs = ", ".join(card["expected_outputs"]) or "(none listed)"
     handoff = card.get("handoff") or f"handoffs/{card['id']}.md"
-    return (
+    goal = card.get("goal") or []
+    acceptance = card.get("acceptance") or []
+    lines = [
         f"You are the Executor ({agent}) for exactly one board card in this "
-        f"VurctOS project.\n"
-        f"Card {card['id']}: {card.get('title', '(untitled)')}\n"
-        f"Notes: {card.get('notes', '')}\n"
-        f"Inputs to read: {inputs}\n"
-        f"Expected outputs to produce: {outputs}\n"
+        f"VurctOS project.",
+        f"Card {card['id']}: {card.get('title', '(untitled)')}",
+    ]
+    if goal:
+        lines.append("Goal: " + "; ".join(goal))
+    lines += [
+        f"Notes: {card.get('notes', '')}",
+        f"Inputs to read: {inputs}",
+        f"Expected outputs to produce: {outputs}",
+    ]
+    lines += _list_block("Decided (fixed; do not change)",
+                         card.get("decided") or [])
+    lines += _list_block(
+        "Acceptance (how someone other than you will check the result)",
+        acceptance)
+    if acceptance:
+        lines.append(
+            "Before writing the handoff, run the Acceptance checks you are "
+            "able to and put their raw results under Result; if one cannot "
+            "run here, say so under Notes For Review. Do not edit a file or "
+            "test that an Acceptance item names unless it is an expected "
+            "output.")
+    lines += [
         f"When the outputs are written, also write the typed handoff file "
         f"{handoff} in the format shown in handoffs/README.md (frontmatter: "
         f"card, from: {agent}-exec, to: claude, status: done, inputs, "
-        f"outputs; body: Summary, Result, Notes For Review).\n"
-        f"If you hit an unknown the card does not answer (missing input, "
-        f"ambiguous requirement, an assumption you would otherwise guess), "
-        f"do not guess silently: state it under Notes For Review in the "
-        f"handoff.\n"
-        f"Do only this card. Do not mark anything done in BOARD.md."
-    )
+        f"outputs; body sections in this order, even if that README is "
+        f"older: {', '.join(HANDOFF_SECTIONS)}).",
+        "If you hit an unknown the card does not answer (missing input, "
+        "ambiguous requirement, an assumption you would otherwise guess), "
+        "do not guess silently: state it under Notes For Review in the "
+        "handoff.",
+        "If something forces you to depart from what the card states, take "
+        "the conservative option, record it under Deviations (what the card "
+        "said, what you did instead, why), and keep going; write \"None.\" "
+        "under Deviations when you followed the card exactly. The "
+        "conservative option keeps every Decided item, touches the fewest "
+        "files, and is the easiest to undo. Decided items outrank Notes, "
+        "review feedback included: if you cannot keep one, leave that part "
+        "undone and record it rather than change it.",
+        "Do only this card. Do not mark anything done in BOARD.md.",
+    ]
+    return "\n".join(lines)
 
 
 def _child_env():
