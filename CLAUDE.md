@@ -1,18 +1,14 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this repository is
 
 This is **VurctOS**, a small, local-first tool that gives users of AI coding assistants (Claude Code and OpenAI Codex) a shared, persistent memory plus lightweight coordination, so their tools remember their preferences and decisions across sessions and across tools, running on their own subscriptions with no API keys.
-
-Your AI coding tools forget you and do not talk to each other. VurctOS is a small local layer that gives Claude Code and Codex a shared memory, so they stop re-asking and start acting as one team.
 
 It is plain markdown files plus a Python standard-library CLI. Public, Apache 2.0. It is for anyone who uses Claude Code and/or Codex, in any field (software, data, research, founders, students, anyone who codes with these tools).
 
 The product center is the **Core Assistant**, realized concretely by **Claude acting as Orchestrator**. The local project folder is the first context and memory substrate, not the product center.
 
-Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the coordination, memory, and skills layers are inspectable markdown files. Heavier automation (a continuous dispatcher loop, MCP, a GUI) is explicitly future. Do not introduce a runtime, dependencies, frameworks, MCP servers, or GUI code without explicit user approval, and do not overbuild.
+Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the coordination, memory, and skills layers are inspectable markdown files.
 
 > Note: if a sibling directory in the same local tooling folder contains an unrelated project with its own CLAUDE.md, it is not part of VurctOS and this guidance does not apply to it.
 
@@ -53,7 +49,7 @@ The kept example is a **vibe coding** workflow (`workflows/vibe-coding.md`): it 
 - `ORCHESTRATION.md` - the coordination system: board, agent profiles, delegation channels, handoff contract, memory and skills.
 - `ARCHITECTURE.md` - layer diagram and agent roles.
 - `MVP.md`, `ROADMAP.md` - scope of now versus the phased plan.
-- `AGENTS.md` - the authoritative working rules, and the Codex memory bridge; read before substantive changes.
+- `AGENTS.md` - the authoritative working rules; read before substantive changes.
 - `docs/` - per-subsystem docs (memory-system, skills-system, subscription-first, getting-started, privacy-model).
 - `cli/vurctos.py`, `cli/README.md` - the local CLI and its docs.
 - `templates/project-template/` - the blank project skeleton (`BOARD.md`, `USER.md`, `MEMORY.md`, `task.md`, `agents/`, `handoffs/`, `skills/`, and `sessions/`).
@@ -63,7 +59,7 @@ The kept example is a **vibe coding** workflow (`workflows/vibe-coding.md`): it 
 - **Open-source the system, not the user's private instance.** Never commit real personal memory, a real project's `USER.md` or `MEMORY.md`, source registers from real projects, agent logs with private context, secrets, tokens, browser profiles, or session files. Private instance data lives outside this repo. Examples must be fake or fully sanitized. Full policy: `docs/privacy-model.md`.
 - **Commit author.** Commit as `Vurctne <contact@vurctne.com>` (the public Vurctne address). VurctOS is intended as a public open-source repo; confirm with the user before the first push or before adding a remote, since pushing publishes.
 - **No em dash.** Never use the long em dash character anywhere. Use commas, colons, parentheses, short hyphens, or new lines instead.
-- **Stdlib only.** No new dependencies, package manager, framework, runtime, or API keys without explicit approval.
+- **Stdlib only, and do not overbuild.** No new dependencies, package manager, framework, runtime, MCP servers, GUI code, or API keys without explicit approval.
 - **Brand naming, used consistently:** Vurctne (parent brand), VurctOS (the OS), Vurctne Skills (future marketplace).
 - **Separate now versus future.** Never describe a future system as already implemented. Single-card `dispatch` ships; a continuous dispatcher loop, MCP, and a GUI are still future. Do not delete source files or project documents unless the user explicitly asks. Keep affected docs internally consistent.
 
