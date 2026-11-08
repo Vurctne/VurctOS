@@ -35,6 +35,17 @@ Durable memory (`USER.md`, `MEMORY.md`) is not touched: only an approved `reflec
 
 `--kind` is one of `decision`, `style`, `tool`, `fail`, `note`, `correction`, or `fact`; without it, a leading `[kind]` tag in the text becomes the kind, and anything else is a `note`. `--evidence` is optional. `--supersedes <id>` (repeatable) marks an earlier entry this one replaces, `--scope global|project:<name>` says where the lesson applies, and `--landed "<where>"` says it is already written into a skill, a rule file or a project record; each is stored as a line under the entry and shows up in the next reflect's digest. Text that looks like a phone, ID-card or card number is refused (personal form data belongs in a private profile, not in day logs); `--allow-pii` files a number that only looks personal. `--date YYYY-MM-DD` overrides today. The CLI only files what you give it; deciding what is worth remembering stays with Claude as Orchestrator.
 
+```bash
+python3 cli/vurctos.py remember --global \
+  --what "setup skipped the review checklist" \
+  --skill vibe-coding-setup --signal correction --rule "steps/4" \
+  --evidence "review of the new repo, missing checklist file"
+python3 cli/vurctos.py remember --global --what "that lesson was wrong" \
+  --signal retract --supersedes 2026-06-30#2
+```
+
+Skill feedback: `--skill NAME` (repeatable) names the skill folder, or a target registered in the private `<memory root>/skill-loop.json`, the lesson is about, and needs `--signal` (`correction`, `reject`, `pick`, `review`, `check`, `deviation`, `data`; `retract` / `decline` withdraw the entry given by `--supersedes` and may name no skill). `--outcome fail|held|mixed` is fixed for correction, reject, deviation (`fail`) and pick (`mixed`), defaults to `fail` for check, and is required for review (`fail` or `held`, and `held` needs `--rule`) and data. `--rule REF` (repeatable; `NAME:REF` when more than one `--skill`) and `--model TEXT` are optional single lines. An unknown name is refused with close matches; the entry also gets a `skillver` line, the hash of each skill's files (left out with a note when it cannot be computed). `skill-loop.json` is optional: `skills_dirs` (default `~/.claude/skills` for `--global`, `<project>/skills` for a project), `targets` (name to file or directory) and `history_globs`.
+
 ### Recall past memory
 
 ```bash
@@ -80,6 +91,16 @@ python3 cli/vurctos.py memory-status --global
 ```
 
 Prints the reflect backlog (unreflected entries and day-logs, the oldest date), the cursor, any staged reflection not yet applied, and the size of `USER.md` / `MEMORY.md`. Read-only: it never stages a draft and never creates or seeds anything. `--hook` prints the same facts as a Claude Code `SessionStart` payload, numbers only (unreviewed entry text never enters a session); both shipped nudge hooks call it. The backlog part speaks once there are 60 waiting entries or the oldest is 7 days old, and asks the assistant to offer a short consolidation at a natural pause; a waiting draft, or a durable file over its size budget (USER.md: 60 non-empty lines or 6 KiB; MEMORY.md: 60 non-empty lines or 24 KiB, since it holds dense tool and method facts), always shows, and an over-budget file points at `aging`.
+
+### Skill status (feedback no revision has answered)
+
+```bash
+python3 cli/vurctos.py skill-status --global
+python3 cli/vurctos.py skill-status --project my-project --skill vibe-coding-setup --json
+python3 cli/vurctos.py skill-status --global --hook
+```
+
+Read-only (it never creates or seeds anything, not even the index or the global root). For every skill or target named by a feedback entry, or only the one given by `--skill` even when it has none, it lists the pending entries: those no `fb:<id>` citation in the skill's `.md` files answers and no later `retract` / `decline` withdraws. It also shows entries marked `landed` but not cited, cited entries a later retract withdrew, entries filed after an `fb-retired` line that name the retired rule, whether each entry was filed against the current `skillver`, character counts of `SKILL.md`, the rule files and the history files, and a score (3 per pending correction or reject, 1 per other pending failure, 3 per retracted-but-cited entry, 2 per entry naming a retired rule). `--json` prints the same data; `--hook` prints one line of numbers only and always exits 0. See `docs/skills-system.md`.
 
 ### Aging (retire old durable lines)
 
@@ -138,9 +159,10 @@ To verify dispatch end to end against a real logged-in CLI once (the unit tests 
 
 ```bash
 python3 cli/vurctos.py reject card-001 --project my-project --reason "pacing too slow in shot 3"
+python3 cli/vurctos.py reject card-001 --project my-project --reason "checklist missing" --skill vibe-coding-setup
 ```
 
-When a `review` card fails your review, one command closes the learning loop: the reason is filed as a `fail` entry into the day log and the index (it reaches `MEMORY.md` through the next approved reflection), stamped into the card's `notes:` (so the re-run prompt carries the feedback explicitly), and the card flips back to `ready` for the next dispatch. The stamp goes into `notes:` only; the prompt tells the executor that `decided` outranks notes, so if the reason overturns a decided item, edit `decided` in `BOARD.md` before the next dispatch. Rejection reasons are the highest-value learning signal; never let one evaporate.
+When a `review` card fails your review, one command closes the learning loop: the reason is filed as a `fail` entry into the day log and the index (it reaches `MEMORY.md` through the next approved reflection), stamped into the card's `notes:` (so the re-run prompt carries the feedback explicitly), and the card flips back to `ready` for the next dispatch. The stamp goes into `notes:` only; the prompt tells the executor that `decided` outranks notes, so if the reason overturns a decided item, edit `decided` in `BOARD.md` before the next dispatch. Rejection reasons are the highest-value learning signal; never let one evaporate. `--skill NAME` (repeatable, validated like `remember --skill`) also files the lesson as feedback for the skill the work used (`signal: reject`, `outcome: fail`), so `skill-status` shows it until a revision of that skill cites it.
 
 ### Promote a proven pattern to a skill
 

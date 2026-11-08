@@ -72,6 +72,18 @@ This is the one worked example carried through the current docs. It is deliberat
 5. The skill gains quality checks.
 6. Only then should automation be added.
 
+## Feedback Loop
+
+A lesson about a skill is filed as a feedback entry (`vurctos remember --skill NAME --signal ...`, or `vurctos reject --skill NAME`; see `docs/memory-system.md`). The day log stays the only record of the lesson. Whether the skill has answered it is recorded in the skill's own files:
+
+- A revision that answers entry `2026-11-10#4` cites `fb:2026-11-10#4` in any `.md` file of the skill, usually on the version-log line that describes the change. A bare id in prose does not count, nor does a token glued to an ASCII letter, digit, underscore or colon (`xfb:`); text in other scripts may run straight into it. `.git`, `__pycache__`, `.DS_Store`, `evals/` and nested skills (a subfolder with its own `SKILL.md`) are not part of the skill's files.
+- `fb-retired: YYYY-MM-DD <ref>` records that a rule was retired; a pending entry filed later that still names that rule is flagged, since it suggests the retirement was premature. `fb-renumbered: YYYY-MM-DD <old> -> <new>` records a renumber, so a rule ref is compared in the numbering of its own date. Either line may sit in a list item.
+- An entry found wrong is withdrawn with `remember --signal retract --supersedes <id>` (or `--signal decline` for one that will not be acted on), naming the skill or no skill.
+
+`vurctos skill-status (--global | --project P) [--skill NAME] [--json] [--hook]` is read-only. For each skill or target with feedback it shows the pending entries (counts by signal and outcome, the oldest date), entries marked `landed` but not yet cited, cited entries that were later retracted, pending entries that name a retired rule, the current `skillver` against the one each entry was filed with, the character counts of `SKILL.md`, the rule files and the history files (`history_globs`), and a score for ordering the work: 3 per pending correction or reject, 1 per other pending failure, 3 per retracted-but-cited entry, 2 per entry naming a retired rule. `--json` prints the same data; `--hook` prints one line of numbers only and never entry text.
+
+Why the record lives in the skill's files rather than in a separate ledger: when a skill is rolled back (a restored copy, a revert, a hand edit), its citations go back with it, so the entries it had answered become pending again without anyone remembering to undo them. A ledger would keep them marked answered while the fix is gone, and the lesson would be lost silently. The opposite mistake, a forgotten citation, only shows the entry again. Checking a revision against its feedback automatically is future work; today whoever revises the skill writes the citation.
+
 ## Skill Storage
 
 Repository-level skills live in the top-level `skills/` directory, each as its own SKILL.md directory. Project-specific skill notes can also live inside a project folder under `skills/` when the skill is still experimental.

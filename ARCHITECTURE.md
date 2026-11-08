@@ -163,7 +163,7 @@ Workflows should be markdown-first until repeated steps justify scripts.
 
 ## Skill Layer
 
-Skills are reusable workflows promoted from the Workflow layer after they prove useful. They follow the SKILL.md open standard. New skills are scaffolded with `vurctos skill-new`. The skill model and the example skills are defined in `docs/skills-system.md`.
+Skills are reusable workflows promoted from the Workflow layer after they prove useful. They follow the SKILL.md open standard. New skills are scaffolded with `vurctos skill-new`. Lessons about a skill are filed as feedback entries in the day logs, and a revision answers one by citing `fb:<id>` in the skill's own files, so a rollback reopens it; `vurctos skill-status` reports what is still open. The skill model and the example skills are defined in `docs/skills-system.md`.
 
 ## Subscription-First Execution Layer
 

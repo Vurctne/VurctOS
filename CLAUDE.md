@@ -26,6 +26,7 @@ Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the co
   - `python3 cli/vurctos.py dispatch --project <p> [--agent claude|codex] [--dry-run]` - run one `ready` + `channel: local` board card via the chosen agent (headless `claude -p` or the Codex CLI) on the user's subscription; card moves to `review`, never `done`.
   - `python3 cli/vurctos.py reject <card-id> --project <p> --reason "..."` - reject reviewed work: files the lesson into memory, stamps it into the card notes, re-queues the card.
   - `python3 cli/vurctos.py skill-new <name> --project <p>` - scaffold a new procedural skill in the SKILL.md format.
+  - `python3 cli/vurctos.py skill-status --global [--skill <name>] [--json | --hook]` - read-only: per skill, the feedback entries (`remember --skill <name> --signal <type>`) that no `fb:<id>` citation in the skill's own files answers yet.
 - **Tests**: `python3 cli/test_vurctos.py` (stdlib `unittest`; no test framework dependency).
 - No build or lint step, and no external tools. `vurctos.bundle` / `vurctossource.zip` are local repo snapshots, not source to edit.
 

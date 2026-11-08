@@ -11,6 +11,7 @@ fallback when FTS5 is unavailable, and the invalid-FTS-query retry path.
 
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -2852,6 +2853,787 @@ class VurctosWireIntegrityTest(unittest.TestCase):
         user = GLOBAL_ROOT / "USER.md"
         self.assertTrue(user.exists() and user.stat().st_size > 0,
                         "the @import target is missing or empty")
+
+
+class VurctosRememberGoldenTest(unittest.TestCase):
+    """The feedback flags are additive: a `remember` that uses none of them
+    writes exactly what the CLI wrote before they existed."""
+
+    GOLDEN_PROJECT_LOG = (
+        b"# Session: 2026-06-30\n\n## Entries\n\n"
+        b"- [note] first plain note\n\n"
+        b"- [correction] tagged text\n  - evidence: ev one\n\n"
+        b"- [decision] replaces the first\n  - supersedes: 2026-06-30#1\n"
+        b"  - scope: project:demo\n  - landed: skills/x/SKILL.md\n")
+    GOLDEN_GLOBAL_LOG = (b"# Session: 2026-07-01\n\n## Entries\n\n"
+                         b"- [fact] global fact\n  - scope: global\n")
+    GOLDEN_STDOUT = (
+        "remembered [note] on 2026-06-30 as 2026-06-30#1\n"
+        "  session: <ROOT>/proj/sessions/2026-06-30.md\n"
+        "  index:   <ROOT>/proj/sessions/index.db (<MODE>)\n"
+        "  unreflected: 1 entries over 1 day-log(s), oldest 2026-06-30; "
+        "draft: none\n"
+        "remembered [correction] on 2026-06-30 as 2026-06-30#2\n"
+        "  session: <ROOT>/proj/sessions/2026-06-30.md\n"
+        "  index:   <ROOT>/proj/sessions/index.db (<MODE>)\n"
+        "  unreflected: 2 entries over 1 day-log(s), oldest 2026-06-30; "
+        "draft: none\n"
+        "remembered [decision] on 2026-06-30 as 2026-06-30#3\n"
+        "  session: <ROOT>/proj/sessions/2026-06-30.md\n"
+        "  index:   <ROOT>/proj/sessions/index.db (<MODE>)\n"
+        "  unreflected: 3 entries over 1 day-log(s), oldest 2026-06-30; "
+        "draft: none\n"
+        "remembered [fact] on 2026-07-01 as 2026-07-01#1\n"
+        "  session: <ROOT>/ghome/sessions/2026-07-01.md\n"
+        "  index:   <ROOT>/ghome/sessions/index.db (<MODE>)\n"
+        "  unreflected: 1 entries over 1 day-log(s), oldest 2026-07-01; "
+        "draft: none\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.environ["VURCTOS_HOME"] = str(self.root / "ghome")
+
+    def tearDown(self):
+        del os.environ["VURCTOS_HOME"]
+        self.tmp.cleanup()
+
+    def test_remember_without_feedback_flags_is_byte_identical(self):
+        """Every pre-existing flag (kind tag, --kind, --evidence,
+        --supersedes, --scope, --landed, --global) is used once, with a
+        malformed skill-loop.json lying in the root, which such a call must
+        never read. The expected bytes were produced by the CLI before the
+        feedback flags existed.
+        Fails if: cmd_remember changes what a call without --skill, --signal, --outcome, --rule or --model writes or prints (for example it always loads skill-loop.json, appends a signal: line, or reorders supersedes/scope/landed)."""
+        _out(["new", "proj", "--dir", str(self.root)])
+        proj = self.root / "proj"
+        (proj / "skill-loop.json").write_text("{not json", encoding="utf-8")
+        calls = [
+            ["--project", str(proj), "--what", "first plain note",
+             "--date", "2026-06-30"],
+            ["--project", str(proj), "--what", "[correction] tagged text",
+             "--evidence", "ev one", "--date", "2026-06-30"],
+            ["--project", str(proj), "--what", "replaces the first",
+             "--kind", "decision", "--supersedes", "2026-06-30#1",
+             "--scope", "project:demo", "--landed", "skills/x/SKILL.md",
+             "--date", "2026-06-30"],
+            ["--global", "--what", "global fact", "--kind", "fact",
+             "--scope", "global", "--date", "2026-07-01"],
+        ]
+        out = "".join(_out(["remember"] + c) for c in calls)
+        out = out.replace(str(self.root.resolve()), "<ROOT>").replace(
+            str(self.root), "<ROOT>")
+        out = re.sub(r"\((fts|like)\)", "(<MODE>)", out)
+        self.assertEqual(out, self.GOLDEN_STDOUT)
+        self.assertEqual((proj / "sessions" / "2026-06-30.md").read_bytes(),
+                         self.GOLDEN_PROJECT_LOG)
+        g = self.root / "ghome"
+        self.assertEqual((g / "sessions" / "2026-07-01.md").read_bytes(),
+                         self.GOLDEN_GLOBAL_LOG)
+        self.assertEqual(sorted(str(p.relative_to(g)) for p in g.rglob("*")),
+                         ["MEMORY.md", "USER.md", "reflections", "sessions",
+                          "sessions/2026-07-01.md", "sessions/index.db"])
+        self.assertEqual((g / "MEMORY.md").read_bytes(),
+                         b"# Memory (global)\n")
+        rows, _ = vurctos._all_index_rows(proj / "sessions" / "index.db")
+        self.assertEqual(sorted(rows), [
+            ("2026-06-30", "correction", "tagged text", "ev one",
+             "sessions/2026-06-30.md"),
+            ("2026-06-30", "decision", "replaces the first", "",
+             "sessions/2026-06-30.md"),
+            ("2026-06-30", "note", "first plain note", "",
+             "sessions/2026-06-30.md")])
+        rows, _ = vurctos._all_index_rows(g / "sessions" / "index.db")
+        self.assertEqual(rows, [("2026-07-01", "fact", "global fact", "",
+                                 "sessions/2026-07-01.md")])
+
+
+class VurctosSkillFeedbackTest(unittest.TestCase):
+    """Skill feedback: capture through `remember --skill`, the read-only
+    `skill-status`, and the reflect digest, against fixture skill trees in
+    a temp root (the global root is VURCTOS_HOME, configured to read them)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "ghome"
+        os.environ["VURCTOS_HOME"] = str(self.home)
+        self.skills = self.root / "skills"
+        self._write("skills/caption-translate/SKILL.md",
+                    "# Caption translate\n")
+        self._write("skills/caption-translate/references/terms.md",
+                    "- terms/1 keep the title\n")
+        self._write("skills/caption-translate/CHANGELOG.md", "# Changes\n")
+        self._write("skills/story-writer/SKILL.md", "# Story writer\n")
+        self._write("skills/story-writer/short-form/SKILL.md", "# Nested\n")
+        self._write("skills/notaskill/README.md", "no SKILL.md here\n")
+        self._write("docs/dispatch.md", "# Dispatch standard\n")
+        self._config({"skills_dirs": [str(self.skills)],
+                      "targets": {"dispatch-standard":
+                                  str(self.root / "docs" / "dispatch.md")}})
+
+    def tearDown(self):
+        del os.environ["VURCTOS_HOME"]
+        self.tmp.cleanup()
+
+    def _write(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _config(self, data):
+        self.home.mkdir(exist_ok=True)
+        (self.home / "skill-loop.json").write_text(
+            data if isinstance(data, str) else json.dumps(data),
+            encoding="utf-8")
+
+    def _rem(self, what, *flags, date="2026-11-10"):
+        return _out(["remember", "--global", "--what", what, "--date", date]
+                    + list(flags))
+
+    def _refused(self, what, *flags, date="2026-11-10"):
+        with self.assertRaises(SystemExit) as cm:
+            self._rem(what, *flags, date=date)
+        return str(cm.exception.code)
+
+    def _entries(self, date="2026-11-10"):
+        path = self.home / "sessions" / f"{date}.md"
+        return vurctos._log_entries(date, path) if path.exists() else []
+
+    def _status(self, *extra):
+        return json.loads(_out(["skill-status", "--global", "--json"]
+                               + list(extra)))
+
+    def _target(self, name, *extra):
+        return next(t for t in self._status(*extra)["targets"]
+                    if t["name"] == name)
+
+    def _pending_ids(self, name):
+        return [r["id"] for r in self._target(name)["pending"]["entries"]]
+
+    # --- capture ---
+
+    def test_feedback_sublines_round_trip_in_order(self):
+        """T1: every feedback sub-line parses back through _log_entries, in
+        the decided order after evidence/supersedes/scope/landed.
+        Fails if: a feedback sub-line key is written with a hyphen, an underscore or a capital (for example `skill_ver`), which `_SUB_LINE_RE` silently drops, or the feedback sub-lines are written before supersedes/scope/landed."""
+        self._rem("first")
+        self._rem("term lock missed", "--evidence", "cue 12",
+                  "--supersedes", "2026-11-10#1", "--scope", "project:demo",
+                  "--landed", "references/terms.md",
+                  "--skill", "caption-translate", "--skill", "story-writer",
+                  "--signal", "correction",
+                  "--rule", "caption-translate:terms/1",
+                  "--rule", "story-writer:2.3", "--model", "model-x (writer)")
+        text = (self.home / "sessions" / "2026-11-10.md").read_text(
+            encoding="utf-8")
+        block = text.split("- [correction] term lock missed\n")[1]
+        keys = [ln.split(":", 1)[0].strip(" -") for ln in block.splitlines()]
+        self.assertEqual(keys, ["evidence", "supersedes", "scope", "landed",
+                                "skill", "skill", "signal", "outcome",
+                                "rule", "rule", "model", "skillver",
+                                "skillver"])
+        subs = self._entries()[1]["subs"]
+        self.assertEqual(subs["skill"], ["caption-translate", "story-writer"])
+        self.assertEqual(subs["signal"], ["correction"])
+        self.assertEqual(subs["outcome"], ["fail"])
+        self.assertEqual(subs["rule"], ["caption-translate:terms/1",
+                                        "story-writer:2.3"])
+        self.assertEqual(subs["model"], ["model-x (writer)"])
+        self.assertEqual([v.split()[0] for v in subs["skillver"]],
+                         ["caption-translate", "story-writer"])
+        for value in subs["skillver"]:
+            self.assertRegex(value.split()[1], r"\A[0-9a-f]{12}\Z")
+
+    def test_unknown_skill_exits_with_close_matches(self):
+        """T2: an alias or a folder without SKILL.md is refused, with close
+        matches, and nothing is filed.
+        Fails if: `_find_skill` accepts a name that has neither `<skills dir>/<name>/SKILL.md` nor a configured target (for example its SKILL.md check becomes a bare directory check), or `_resolve_skill` stops listing close matches."""
+        msg = self._refused("x", "--skill", "captran",
+                            "--signal", "correction")
+        self.assertIn("close matches: caption-translate", msg)
+        msg = self._refused("x", "--skill", "Caption-Translate",
+                            "--signal", "correction")
+        self.assertIn("close matches: caption-translate", msg)
+        self._refused("x", "--skill", "notaskill", "--signal", "correction")
+        self.assertFalse((self.home / "sessions" / "2026-11-10.md").exists())
+
+    def test_rule_and_model_must_be_single_lines(self):
+        """T3: a newline in a feedback field cannot forge a day-log entry.
+        Fails if: the single-line check in `_feedback_texts` is dropped, so a newline in --rule or --model forges a second `- [decision]` entry."""
+        sk = ["--skill", "caption-translate", "--signal", "correction"]
+        self._refused("x", *sk, "--rule", "a\n- [decision] forged")
+        self._refused("x", *sk, "--model", "m\r- [decision] forged")
+        self.assertEqual(self._entries(), [])
+
+    def test_retract_and_decline_need_supersedes_and_take_no_outcome(self):
+        """T4, lifecycle half: retract and decline withdraw an entry, so
+        they must say which one, and they carry no outcome.
+        Fails if: `_feedback_subs` files a retract or decline without --supersedes, or accepts --outcome on one."""
+        self._rem("wrong lesson", "--skill", "caption-translate",
+                  "--signal", "correction")
+        for sig in ("retract", "decline"):
+            with self.subTest(sig):
+                self.assertIn("--supersedes",
+                              self._refused("why", "--signal", sig))
+                self._refused("why", "--signal", sig, "--supersedes",
+                              "2026-11-10#1", "--outcome", "fail")
+        self._rem("it was wrong", "--signal", "retract",
+                  "--supersedes", "2026-11-10#1")
+        subs = self._entries()[-1]["subs"]
+        self.assertEqual(subs["signal"], ["retract"])
+        self.assertNotIn("outcome", subs)
+        self.assertNotIn("skill", subs)
+        self.assertEqual(len(self._entries()), 2)
+
+    def test_outcome_rules_per_signal(self):
+        """T4, outcome half: the outcome each signal allows, requires or
+        defaults to.
+        Fails if: `SIGNAL_OUTCOMES` or its checks change, for example correction, reject or deviation accept held, pick accepts fail, review or data are filed without --outcome, check refuses an explicit held or accepts mixed, or a fixed or default outcome (fail; mixed for pick; fail for check) is not written."""
+        base = ["--skill", "caption-translate", "--rule", "r1", "--signal"]
+        refused = [("correction", "held"), ("correction", "mixed"),
+                   ("reject", "held"), ("reject", "mixed"),
+                   ("deviation", "held"), ("deviation", "mixed"),
+                   ("pick", "fail"), ("pick", "held"), ("review", None),
+                   ("review", "mixed"), ("data", None), ("check", "mixed")]
+        for sig, outcome in refused:
+            with self.subTest(refused=(sig, outcome)):
+                self._refused("x", *base, sig,
+                              *(["--outcome", outcome] if outcome else []))
+        self.assertEqual(self._entries(), [])
+        filed = [("correction", None, "fail"), ("correction", "fail", "fail"),
+                 ("reject", None, "fail"), ("deviation", None, "fail"),
+                 ("pick", None, "mixed"), ("pick", "mixed", "mixed"),
+                 ("review", "fail", "fail"), ("review", "held", "held"),
+                 ("data", "fail", "fail"), ("data", "held", "held"),
+                 ("data", "mixed", "mixed"), ("check", None, "fail"),
+                 ("check", "held", "held"), ("check", "fail", "fail")]
+        for sig, outcome, want in filed:
+            with self.subTest(filed=(sig, outcome)):
+                self._rem("x", *base, sig,
+                          *(["--outcome", outcome] if outcome else []))
+                self.assertEqual(self._entries()[-1]["subs"]["outcome"],
+                                 [want])
+
+    def test_review_held_needs_a_rule(self):
+        """A held review is a positive observation, so it must name the
+        rule that was tested; a failed review need not.
+        Fails if: `--signal review --outcome held` is filed without --rule."""
+        sk = ["--skill", "caption-translate", "--signal", "review"]
+        self.assertIn("--rule", self._refused("x", *sk, "--outcome", "held"))
+        self._rem("x", *sk, "--outcome", "fail")
+        self.assertEqual(len(self._entries()), 1)
+
+    def test_signal_and_skill_requirements(self):
+        """--skill needs --signal; every signal but retract and decline
+        needs --skill; the other feedback flags need --signal.
+        Fails if: `_feedback_subs` stops refusing --skill, --outcome, --rule or --model given without --signal (for example its `if not signal` check is dropped), or files a non-lifecycle --signal without --skill."""
+        self.assertIn("--signal", self._refused("x", "--skill",
+                                                "caption-translate"))
+        self.assertIn("--skill", self._refused("x", "--signal", "correction"))
+        for flags in (["--outcome", "fail"], ["--rule", "r"],
+                      ["--model", "m"]):
+            with self.subTest(flags):
+                self._refused("x", *flags)
+        self.assertEqual(self._entries(), [])
+
+    def test_multi_skill_rules_must_be_qualified(self):
+        """T5: with more than one --skill, each rule names its skill.
+        Fails if: the NAME:REF check in `_feedback_subs` is skipped when more than one --skill is given, or accepts a NAME that is not one of those skills, or an empty REF."""
+        two = ["--skill", "caption-translate", "--skill", "story-writer",
+               "--signal", "correction"]
+        self.assertIn("NAME:REF", self._refused("x", *two, "--rule", "3.6"))
+        self._refused("x", *two, "--rule", "other-skill:3.6")
+        self._refused("x", *two, "--rule", "story-writer:")
+        self.assertEqual(self._entries(), [])
+        self._rem("x", *two, "--rule", "caption-translate:3.6",
+                  "--rule", "story-writer:2")
+        self._rem("y", "--skill", "caption-translate", "--signal",
+                  "correction", "--rule", "3.6")
+        self.assertEqual([e["subs"]["rule"] for e in self._entries()],
+                         [["caption-translate:3.6", "story-writer:2"],
+                          ["3.6"]])
+
+    def test_pii_check_covers_the_feedback_fields(self):
+        """T6: a personal-looking number in a feedback field is refused
+        like one in --what.
+        Fails if: the feedback texts are left out of the `_pii_hits` check in cmd_remember, so a 10-digit number in --rule or --model is filed."""
+        sk = ["--skill", "caption-translate", "--signal", "correction"]
+        self.assertIn("phone, ID", self._refused("x", *sk, "--rule",
+                                                 "call 0412345678"))
+        self._refused("x", *sk, "--model", "0412345678")
+        self.assertEqual(self._entries(), [])
+        self._rem("x", *sk, "--rule", "0412345678", "--allow-pii")
+        self.assertEqual(len(self._entries()), 1)
+
+    def test_kind_precedence_with_a_signal(self):
+        """With --signal, the kind is an explicit --kind, else a leading
+        [kind] tag, else the signal's default.
+        Fails if: with --signal given, an explicit --kind or a leading [kind] tag stops winning over the signal's default kind, or a default in `SIGNAL_KIND` changes (correction to correction; reject, check and deviation to fail; review, pick, data, retract and decline to note)."""
+        sk = ["--skill", "caption-translate"]
+        self._rem("explicit wins", *sk, "--signal", "correction",
+                  "--kind", "decision")
+        self._rem("[style] tag wins", *sk, "--signal", "correction")
+        expected = [("correction", "correction"), ("reject", "fail"),
+                    ("check", "fail"), ("deviation", "fail"),
+                    ("review", "note"), ("pick", "note"), ("data", "note")]
+        for sig, _ in expected:
+            outcome = (["--outcome", "fail"] if sig in ("review", "data")
+                       else [])
+            self._rem(f"default for {sig}", *sk, "--signal", sig, *outcome)
+        self._rem("default for retract", "--signal", "retract",
+                  "--supersedes", "2026-11-10#1")
+        self._rem("default for decline", "--signal", "decline",
+                  "--supersedes", "2026-11-10#2")
+        got = [(e["kind"], e["what"]) for e in self._entries()]
+        self.assertEqual(got[:2], [("decision", "explicit wins"),
+                                   ("style", "tag wins")])
+        self.assertEqual([k for k, _ in got[2:]],
+                         [k for _, k in expected] + ["note", "note"])
+
+    # --- names, config, version ---
+
+    def test_config_defaults_when_the_file_is_absent(self):
+        """Without skill-loop.json the generic defaults apply.
+        Fails if: a default in `_skill_loop_config` changes (skills_dirs `~/.claude/skills` for the global root and `<project>/skills` for a project, targets empty, history_globs CHANGELOG.md, **/CHANGELOG.md and **/HISTORY.md), or a relative path in the file stops resolving against the memory root."""
+        (self.home / "skill-loop.json").unlink()
+        cfg = vurctos._skill_loop_config(self.home, True)
+        self.assertEqual(cfg["skills_dirs"],
+                         [Path.home() / ".claude" / "skills"])
+        self.assertEqual(cfg["targets"], {})
+        self.assertEqual(cfg["history_globs"],
+                         ["CHANGELOG.md", "**/CHANGELOG.md", "**/HISTORY.md"])
+        proj = self.root / "proj"
+        self.assertEqual(vurctos._skill_loop_config(proj, False)
+                         ["skills_dirs"], [proj / "skills"])
+        self._config({"skills_dirs": ["rel-skills"],
+                      "targets": {"a-doc": "docs/a.md"}})
+        cfg = vurctos._skill_loop_config(self.home, True)
+        self.assertEqual(cfg["skills_dirs"], [self.home / "rel-skills"])
+        self.assertEqual(cfg["targets"],
+                         {"a-doc": self.home / "docs" / "a.md"})
+
+    def test_malformed_config_is_an_error_naming_the_file(self):
+        """A broken skill-loop.json stops feedback capture and skill-status
+        with an error that names it.
+        Fails if: `_skill_loop_config` falls back to the defaults, or raises a traceback, on a file that is not JSON, not an object, has a wrongly shaped skills_dirs, targets or history_globs, an invalid target name or an unknown key, instead of exiting with an error that names the file."""
+        cfg = self.home / "skill-loop.json"
+        for text in ("{not json", "[]", '{"skills_dirs": "one/dir"}',
+                     '{"targets": {"a-doc": 3}}',
+                     '{"targets": {"Bad Name": "x.md"}}',
+                     '{"history_globs": [""]}', '{"skill_dirs": []}'):
+            with self.subTest(text):
+                self._config(text)
+                msg = self._refused("x", "--skill", "caption-translate",
+                                    "--signal", "correction")
+                self.assertIn(f"malformed {cfg}", msg)
+                with self.assertRaises(SystemExit) as cm:
+                    _out(["skill-status", "--global"])
+                self.assertIn(f"malformed {cfg}", str(cm.exception.code))
+        self.assertEqual(self._entries(), [])
+
+    def test_configured_targets_resolve_as_files_or_directories(self):
+        """Non-skill documents are registered as targets, a file or a
+        directory, and a target wins over a skills dir entry of the same
+        name.
+        Fails if: a configured target name is refused, a target stops taking precedence over a skills dir entry of the same name, or a single-file target's skillver is computed over anything but the one line `<file name>\\0<sha256 of its bytes>\\n`."""
+        doc = self.root / "docs" / "dispatch.md"
+        self._config({"skills_dirs": [str(self.skills)],
+                      "targets": {"dispatch-standard": str(doc),
+                                  "story-writer": str(self.root / "docs")}})
+        self._rem("word cap", "--skill", "dispatch-standard",
+                  "--skill", "story-writer", "--signal", "deviation")
+        vers = dict(v.split() for v in self._entries()[0]["subs"]["skillver"])
+        line = "dispatch.md\0" + hashlib.sha256(doc.read_bytes()).hexdigest()
+        self.assertEqual(vers["dispatch-standard"], hashlib.sha256(
+            (line + "\n").encode("utf-8")).hexdigest()[:12])
+        self.assertEqual(vers["story-writer"],
+                         vurctos._skill_tree_hash(self.root / "docs"))
+        self.assertEqual(self._target("story-writer")["path"],
+                         os.path.realpath(self.root / "docs"))
+        self.assertEqual(self._target("dispatch-standard")["chars"]
+                         ["rule_files"], len(doc.read_text(encoding="utf-8")))
+
+    def test_tree_hash_excludes_volatile_entries_and_nested_skills(self):
+        """T7: the version hash covers the skill's own files only.
+        Fails if: an entry in `TREE_EXCLUDED` (.git, __pycache__, .DS_Store, evals) or a nested skill directory stops being excluded by `_tree_files`, or the hashed line format `relpath\\0<sha256>\\n`, their sorting or the 12-hex truncation in `_skill_tree_hash` changes."""
+        tree = self.skills / "story-writer"
+
+        def expected(files):
+            lines = sorted(f"{rel}\0{hashlib.sha256(data).hexdigest()}\n"
+                           for rel, data in files.items())
+            return hashlib.sha256("".join(lines).encode("utf-8")
+                                  ).hexdigest()[:12]
+        base = expected({"SKILL.md": b"# Story writer\n"})
+        self.assertEqual(vurctos._skill_tree_hash(tree), base)
+        for rel in (".git/HEAD", "__pycache__/x.pyc", ".DS_Store",
+                    "evals/case.md", "references/evals/case.md",
+                    "references/.DS_Store", "short-form/SKILL.md",
+                    "short-form/references/x.md"):
+            with self.subTest(rel):
+                self._write(f"skills/story-writer/{rel}", "changed\n")
+                self.assertEqual(vurctos._skill_tree_hash(tree), base)
+        self._write("skills/story-writer/references/rules.md", "new rule\n")
+        self._write("skills/story-writer/a.md", "first\n")
+        self.assertEqual(vurctos._skill_tree_hash(tree), expected(
+            {"SKILL.md": b"# Story writer\n", "a.md": b"first\n",
+             "references/rules.md": b"new rule\n"}))
+
+    def test_a_symlinked_skill_is_read_through_its_real_path(self):
+        """Skills dirs often hold symlinks; the tree is the real directory.
+        Fails if: skill-status reports the symlink instead of the real path of the skill directory (for example `_target_status` returns `path` as it was configured)."""
+        linked = self.root / "linked"
+        linked.mkdir()
+        try:
+            (linked / "caption-translate").symlink_to(
+                self.skills / "caption-translate", target_is_directory=True)
+        except OSError:
+            self.skipTest("no symlinks on this platform")
+        self._config({"skills_dirs": [str(linked)]})
+        self._rem("x", "--skill", "caption-translate",
+                  "--signal", "correction")
+        ver = self._entries()[0]["subs"]["skillver"][0].split()[1]
+        self.assertEqual(ver, vurctos._skill_tree_hash(
+            self.skills / "caption-translate"))
+        t = self._target("caption-translate")
+        self.assertEqual(t["path"],
+                         os.path.realpath(self.skills / "caption-translate"))
+        self.assertEqual(t["skillver_now"], ver)
+
+    def test_skillver_is_best_effort(self):
+        """A version that cannot be computed is left out with a note; the
+        capture itself never fails for it.
+        Fails if: a skillver that cannot be computed aborts the capture, or a skillver line is written for it anyway, or no note is printed."""
+        self._config({"skills_dirs": [str(self.skills)],
+                      "targets": {"gone-doc": str(self.root / "missing.md")}})
+        out = self._rem("x", "--skill", "gone-doc", "--skill",
+                        "caption-translate", "--signal", "correction")
+        self.assertIn("note: no skillver recorded for gone-doc", out)
+        subs = self._entries()[0]["subs"]
+        self.assertEqual(subs["skill"], ["gone-doc", "caption-translate"])
+        self.assertEqual([v.split()[0] for v in subs["skillver"]],
+                         ["caption-translate"])
+
+    # --- consumption ---
+
+    def test_entry_is_pending_until_an_fb_citation_appears(self):
+        """T8: only an `fb:<id>` token in a .md file of the tree answers an
+        entry.
+        Fails if: `FB_TOKEN_RE` stops requiring the `fb:` prefix or its left boundary (so a bare id in prose, `xfb:<id>` or `a:fb:<id>` counts), or citations are read from a non-.md file, from evals/ or from a nested skill."""
+        self._rem("terms missed", "--skill", "story-writer",
+                  "--signal", "correction")
+        eid = "2026-11-10#1"
+        for rel, text in (("references/notes.md", f"replaces {eid} here\n"),
+                          ("references/a.md", f"see xfb:{eid}\n"),
+                          ("references/b.md", f"see a:fb:{eid}\n"),
+                          ("references/c.md", f"fb:{eid}0 is another id\n"),
+                          ("references/d.txt", f"fb:{eid}\n"),
+                          ("evals/case.md", f"fb:{eid}\n"),
+                          ("short-form/CHANGELOG.md", f"fb:{eid}\n")):
+            self._write(f"skills/story-writer/{rel}", text)
+            with self.subTest(rel):
+                self.assertEqual(self._pending_ids("story-writer"), [eid])
+        self._write("skills/story-writer/CHANGELOG.md",
+                    f"- 2026-11-12 term lock fixed (fb:{eid})\n")
+        self.assertEqual(self._pending_ids("story-writer"), [])
+
+    def test_a_citation_may_follow_non_ascii_text_directly(self):
+        """A version-log line in a language without spaces may put `fb:`
+        straight after its last word; only an ASCII word character or a
+        colon right before the token stops it counting.
+        Fails if: `FB_TOKEN_RE` is compiled without re.ASCII, so a CJK
+        character right before `fb:` hides the citation."""
+        self._rem("terms missed", "--skill", "story-writer",
+                  "--signal", "correction")
+        eid = "2026-11-10#1"
+        self._write("skills/story-writer/CHANGELOG.md",
+                    f"- 2026-11-12 \u672f\u8bed\u9501fb:{eid}\n")
+        self.assertEqual(self._pending_ids("story-writer"), [])
+
+    def test_rollback_of_the_skill_restores_pending(self):
+        """T9: consumption lives in the skill's files, so restoring the old
+        files brings the entry back.
+        Fails if: citations are remembered outside the target's current files (for example `_target_status` keeps cited ids in a module-level cache between runs), so restoring the old files leaves the entry answered."""
+        self._rem("x", "--skill", "caption-translate",
+                  "--signal", "correction")
+        tree = self.skills / "caption-translate"
+        orig = self.root / "orig"
+        shutil.copytree(tree, orig)
+        self._write("skills/caption-translate/CHANGELOG.md",
+                    "- fixed the term lock (fb:2026-11-10#1)\n")
+        self.assertEqual(self._pending_ids("caption-translate"), [])
+        shutil.rmtree(tree)
+        shutil.copytree(orig, tree)
+        self.assertEqual(self._pending_ids("caption-translate"),
+                         ["2026-11-10#1"])
+
+    def test_retracting_a_cited_entry_is_flagged(self):
+        """T10: a retract resolves a pending entry, but one the skill
+        already cites is raised, since a revision may encode a wrong
+        lesson.
+        Fails if: a retract of an id the tree cites is not reported under retracted_but_consumed, a decline is reported there, a retract naming another skill resolves this skill's entry, a lifecycle entry counts as pending, or the weight 3 for retracted_but_consumed leaves the score."""
+        sk = ["--skill", "caption-translate", "--signal", "correction"]
+        for what in ("cited then retracted", "cited then declined",
+                     "pending then retracted", "retracted for another skill",
+                     "declined for every skill"):
+            self._rem(what, *sk)
+        self._write("skills/caption-translate/CHANGELOG.md",
+                    "- fix (fb:2026-11-10#1, fb:2026-11-10#2)\n")
+        later = {"date": "2026-11-11"}
+        self._rem("wrong", "--skill", "caption-translate", "--signal",
+                  "retract", "--supersedes", "2026-11-10#1", **later)
+        self._rem("not doing it", "--signal", "decline", "--supersedes",
+                  "2026-11-10#2", **later)
+        self._rem("wrong", "--skill", "caption-translate", "--signal",
+                  "retract", "--supersedes", "2026-11-10#3", **later)
+        self._rem("wrong there", "--skill", "story-writer", "--signal",
+                  "retract", "--supersedes", "2026-11-10#4", **later)
+        self._rem("not doing it", "--signal", "decline", "--supersedes",
+                  "2026-11-10#5", **later)
+        t = self._target("caption-translate")
+        self.assertEqual(t["retracted_but_consumed"], ["2026-11-10#1"])
+        self.assertEqual([r["id"] for r in t["pending"]["entries"]],
+                         ["2026-11-10#4"])
+        self.assertEqual(t["score"], 3 + 3)
+        sw = self._target("story-writer")  # named only by a lifecycle entry
+        self.assertEqual((sw["pending"]["count"], sw["score"]), (0, 0))
+
+    def test_entries_citing_a_retired_rule_after_it_are_flagged(self):
+        """T11: an entry filed after `fb-retired` that names the retired
+        rule is evidence the retirement was premature.
+        Fails if: cites_retired misses a pending entry dated after the `fb-retired` line that names the retired rule, or flags one dated before or on that date, or one naming another rule, or the weight 2 leaves the score."""
+        self._write("skills/caption-translate/CHANGELOG.md",
+                    "# Changes\n\n- fb-retired: 2026-11-11 terms/1\n")
+        sk = ["--skill", "caption-translate", "--signal", "check", "--rule"]
+        self._rem("before", *sk, "terms/1", date="2026-11-10")
+        self._rem("same day", *sk, "terms/1", date="2026-11-11")
+        self._rem("after", *sk, "terms/1", date="2026-11-12")
+        self._rem("after, other rule", *sk, "terms/2", date="2026-11-12")
+        t = self._target("caption-translate")
+        self.assertEqual(t["cites_retired"], ["2026-11-12#1"])
+        self.assertEqual(t["score"], 4 * 1 + 2)
+
+    def test_renumber_lines_carry_a_retired_ref_forward(self):
+        """A retired ref is compared in each entry's own numbering: carried
+        through the `fb-renumbered` lines dated between the retirement and
+        the entry, and dropped once another rule takes its number.
+        Fails if: `_ref_carried` is bypassed (the retired ref is compared unmapped), a renumber that gives the retired number to another rule still flags entries filed after it, a ref qualified for another skill counts, or the list-marker forms of `fb-retired` and `fb-renumbered` stop parsing."""
+        self._write("skills/caption-translate/CHANGELOG.md", "\n".join([
+            "- fb-retired: 2026-11-05 3.6",
+            "  * fb-renumbered: 2026-11-08 3.6 -> 4.2",
+            "1. fb-retired: 2026-11-05 7",
+            "fb-renumbered: 2026-11-08 8 -> 7", ""]))
+        sk = ["--skill", "caption-translate", "--skill", "story-writer",
+              "--signal", "correction", "--rule"]
+        self._rem("old 3.6 under its new number", *sk,
+                  "caption-translate:4.2", date="2026-11-10")
+        self._rem("old 7 before the reuse", *sk, "caption-translate:7",
+                  date="2026-11-06")
+        self._rem("new 7 after the reuse", *sk, "caption-translate:7",
+                  date="2026-11-10")
+        self._rem("another skill's 4.2", *sk, "story-writer:4.2",
+                  date="2026-11-10")
+        self.assertEqual(self._target("caption-translate")["cites_retired"],
+                         ["2026-11-06#1", "2026-11-10#1"])
+
+    # --- the report ---
+
+    def test_skill_status_counts_pending_and_scores(self):
+        """The per-target report: counts, oldest date, landed entries,
+        version drift and the score.
+        Fails if: a score weight changes (3 per pending correction or reject, 1 per other pending fail, nothing for held or mixed), landed entries stop being listed as landed_uncited, the per-signal or per-outcome counts or the oldest date are wrong, skillver_differs does not flip once the skill's tree changes, or a target named by --skill with no feedback is not reported."""
+        sk = ["--skill", "caption-translate", "--signal"]
+        self._rem("a", *sk, "correction", "--landed", "references/terms.md",
+                  date="2026-11-09")
+        self._rem("b", *sk, "reject")
+        self._rem("c", *sk, "check")
+        self._rem("d", *sk, "deviation")
+        self._rem("e", *sk, "review", "--outcome", "held", "--rule", "r1")
+        self._rem("f", *sk, "pick")
+        self._rem("g", *sk, "data", "--outcome", "fail")
+        t = self._target("caption-translate")
+        p = t["pending"]
+        self.assertEqual(p["count"], 7)
+        self.assertEqual(p["by_signal"], {s: 1 for s in (
+            "correction", "reject", "check", "deviation", "review", "pick",
+            "data")})
+        self.assertEqual(p["by_outcome"], {"fail": 5, "held": 1, "mixed": 1})
+        self.assertEqual(p["oldest"], "2026-11-09")
+        self.assertEqual(t["landed_uncited"], ["2026-11-09#1"])
+        self.assertEqual(t["score"], 3 * 2 + 3)
+        self.assertEqual({r["skillver_differs"] for r in p["entries"]},
+                         {False})
+        self._write("skills/caption-translate/references/terms.md", "edited\n")
+        t = self._target("caption-translate")
+        self.assertEqual({r["skillver_differs"] for r in t["pending"]
+                          ["entries"]}, {True})
+        named = self._status("--skill", "story-writer")["targets"]
+        self.assertEqual([(x["name"], x["pending"]["count"], x["score"])
+                          for x in named], [("story-writer", 0, 0)])
+        with self.assertRaises(SystemExit) as cm:
+            _out(["skill-status", "--global", "--skill", "captran"])
+        self.assertIn("close matches: caption-translate",
+                      str(cm.exception.code))
+        out = _out(["skill-status", "--global"])
+        self.assertIn("caption-translate (score 9)", out)
+        self.assertIn("2026-11-09#1 correction/fail [filed against another "
+                      "version]: a", out)
+        self.assertIn("landed, not cited yet: 2026-11-09#1", out)
+
+    def test_a_removed_skill_keeps_its_feedback_pending(self):
+        """Feedback for a skill that no longer resolves stays visible.
+        Fails if: skill-status drops, or crashes on, feedback for a skill that no longer resolves, instead of listing it with no path and every entry pending."""
+        self._rem("x", "--skill", "story-writer", "--signal", "correction")
+        shutil.rmtree(self.skills / "story-writer")
+        t = self._target("story-writer")
+        self.assertIsNone(t["path"])
+        self.assertEqual(t["pending"]["count"], 1)
+        self.assertIn("story-writer (score 3): not found",
+                      _out(["skill-status", "--global"]))
+
+    def test_char_counts_are_characters_split_by_history_globs(self):
+        """T15: sizes are characters, like the volume check, and history
+        files are counted apart from rule files.
+        Fails if: sizes are counted in UTF-8 bytes (ten CJK characters report 30, not 10), SKILL.md is left out of the rule files, a file matching history_globs (including `**/HISTORY.md` at the tree root) is counted as a rule file, or a configured history_globs is ignored."""
+        tree = "skills/story-writer"
+        self._write(f"{tree}/SKILL.md", "\u6587" * 10)
+        self._write(f"{tree}/references/rules.md", "12345")
+        self._write(f"{tree}/CHANGELOG.md", "1234567")
+        self._write(f"{tree}/HISTORY.md", "123")
+        self._write(f"{tree}/references/notes.txt", "not markdown")
+        self._rem("x", "--skill", "story-writer", "--signal", "correction")
+        self.assertEqual(self._target("story-writer")["chars"],
+                         {"skill_md": 10, "rule_files": 15,
+                          "history_files": 10})
+        self._config({"skills_dirs": [str(self.skills)],
+                      "history_globs": ["references/*.md"]})
+        self.assertEqual(self._target("story-writer")["chars"],
+                         {"skill_md": 10, "rule_files": 20,
+                          "history_files": 5})
+
+    def test_skill_status_is_read_only(self):
+        """T12: skill-status writes nothing in any mode, not even the index
+        or the global root.
+        Fails if: skill-status creates or modifies any file or directory under the temp root in any of its modes (for example it calls `_resolve_root(args)` without seed=False, or opens the SQLite index, which creates index.db)."""
+        self._rem("x", "--skill", "caption-translate", "--signal",
+                  "correction", "--landed", "references/terms.md")
+        (self.home / "sessions" / "index.db").unlink()
+
+        def snapshot():
+            return sorted((str(p), p.is_dir(), p.stat().st_mtime_ns,
+                           0 if p.is_dir() else p.stat().st_size)
+                          for p in self.root.rglob("*"))
+        before = snapshot()
+        for extra in ([], ["--json"], ["--hook"], ["--skill", "story-writer"],
+                      ["--skill", "story-writer", "--json"]):
+            with self.subTest(extra=extra):
+                _out(["skill-status", "--global"] + extra)
+                self.assertEqual(snapshot(), before)
+        empty = self.root / "never-created"
+        os.environ["VURCTOS_HOME"] = str(empty)
+        for extra in ([], ["--json"], ["--hook"]):
+            _out(["skill-status", "--global"] + extra)
+        self.assertFalse(empty.exists())
+
+    def test_hook_prints_one_line_of_numbers_only(self):
+        """T13: the hook line never carries text from the day log.
+        Fails if: the --hook line carries entry text, evidence, rule refs, model text or target names, is more than one line, or the hook exits non-zero (on an empty root or a malformed config)."""
+        self._rem("SECRET-TEXT here", "--evidence", "SECRET-EVIDENCE",
+                  "--skill", "caption-translate", "--signal", "correction",
+                  "--rule", "SECRET-RULE", "--model", "SECRET-MODEL")
+        out = _out(["skill-status", "--global", "--hook"])
+        self.assertRegex(out, r"\Askill-status:( [a-z_]+=\d+)+\n\Z")
+        self.assertNotIn("SECRET", out)
+        self.assertNotIn("caption-translate", out)
+        self.assertIn(" pending=1 ", out)
+        self.assertIn(" max_score=3", out)
+        self._config("{broken")
+        self.assertEqual(_out(["skill-status", "--global", "--hook"]),
+                         "skill-status: error=1\n")
+        os.environ["VURCTOS_HOME"] = str(self.root / "nowhere")
+        self.assertRegex(_out(["skill-status", "--global", "--hook"]),
+                         r"\Askill-status: targets=0 pending=0 ")
+
+    def test_reflect_digest_routes_feedback_and_the_cursor_passes_it(self):
+        """T14: the digest lists feedback per target, and applying the
+        reflection still moves the cursor over those entries.
+        Fails if: `_reflection_digest` loses the Routed to skills section, lists a non-feedback entry in it, or the reflect cursor stops before the feedback entries."""
+        self._rem("plain note")
+        self._rem("a", "--skill", "caption-translate",
+                  "--signal", "correction")
+        self._rem("b", "--skill", "caption-translate", "--skill",
+                  "story-writer", "--signal", "pick")
+        self._rem("c", "--signal", "retract", "--supersedes", "2026-11-10#2")
+        _out(["reflect", "--global", "--date", "2026-11-10"])
+        staging = self.home / "reflections" / "2026-11-10.md"
+        text = staging.read_text(encoding="utf-8")
+        digest = text.split(f"## {vurctos.SEC_DIGEST}")[1].split(
+            f"## {vurctos.SEC_USER}")[0]
+        section = digest.split("- Routed to skills")[1].split("\n- ")[0]
+        self.assertIn("\n  - caption-translate: 2026-11-10#2, 2026-11-10#3",
+                      section)
+        self.assertIn("\n  - story-writer: 2026-11-10#3", section)
+        self.assertIn("\n  - (retract/decline, no skill): 2026-11-10#4",
+                      section)
+        self.assertNotIn("2026-11-10#1", section)
+        staging.write_text(text.replace("status: draft", "status: approved")
+                           .replace(f"## {vurctos.SEC_RATIONALE}\n",
+                                    f"## {vurctos.SEC_RATIONALE}\nrouted "
+                                    f"to skills, nothing durable\n"),
+                           encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _apply(["reflect-apply", "--global", "--date", "2026-11-10"])
+        self.assertEqual((self.home / "reflections" / ".last-reflected")
+                         .read_text(encoding="utf-8").strip(), "2026-11-10 4")
+
+
+class VurctosRejectSkillTest(unittest.TestCase):
+    """`reject --skill` files the rejection as feedback for the skill."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _out(["new", "proj", "--dir", str(self.root)])
+        self.proj = self.root / "proj"
+        (self.proj / "BOARD.md").write_text(BOARD_TWO_CARDS.replace(
+            "  channel: local\n  status: ready",
+            "  channel: local\n  status: review"), encoding="utf-8")
+        skill = self.proj / "skills" / "caption-format" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("# Caption format\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reject_with_skill_files_the_lesson_as_skill_feedback(self):
+        """The filed entry carries skill, signal reject, outcome fail and
+        skillver; an unknown name is refused before anything is written.
+        Fails if: `cmd_reject --skill` drops the skill, signal, outcome or skillver sub-lines from the filed entry, stops validating the name the way remember does, or files the lesson or re-queues the card before refusing an unknown --skill."""
+        board = (self.proj / "BOARD.md").read_text(encoding="utf-8")
+        log = self.proj / "sessions" / f"{datetime.date.today()}.md"
+        with self.assertRaises(SystemExit) as cm:
+            _out(["reject", "card-102", "--project", str(self.proj),
+                  "--reason", "captions overlap", "--skill", "captionformat"])
+        self.assertIn("close matches: caption-format", str(cm.exception.code))
+        self.assertEqual((self.proj / "BOARD.md").read_text(encoding="utf-8"),
+                         board)
+        self.assertFalse(log.exists())
+        _out(["reject", "card-102", "--project", str(self.proj),
+              "--reason", "captions overlap", "--skill", "caption-format"])
+        entry = vurctos._log_entries(str(datetime.date.today()), log)[0]
+        self.assertEqual(entry["kind"], "fail")
+        self.assertEqual(entry["what"], "review rejected card-102: "
+                                        "captions overlap")
+        self.assertEqual(entry["subs"]["skill"], ["caption-format"])
+        self.assertEqual(entry["subs"]["signal"], ["reject"])
+        self.assertEqual(entry["subs"]["outcome"], ["fail"])
+        self.assertEqual(entry["subs"]["skillver"][0].split()[0],
+                         "caption-format")
+        status = json.loads(_out(["skill-status", "--project",
+                                  str(self.proj), "--json"]))
+        self.assertEqual([(t["name"], t["score"]) for t in status["targets"]],
+                         [("caption-format", 3)])
 
 
 if __name__ == "__main__":

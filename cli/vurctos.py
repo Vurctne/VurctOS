@@ -16,6 +16,7 @@ steps:
   vurctos dispatch         run one ready local board card via a headless agent
   vurctos reject           reject reviewed work: file the lesson, re-queue it
   vurctos skill-new        scaffold a SKILL.md for a proven repeated pattern
+  vurctos skill-status     read-only: the feedback each skill has not answered
 
 Design rules (see AGENTS.md):
   - local-first, subscription-first, no API keys
@@ -25,6 +26,8 @@ Design rules (see AGENTS.md):
 
 import argparse
 import datetime
+import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -400,16 +403,16 @@ def _pii_hits(text):
             if 9 <= len(re.sub(r"\D", "", m.group(1))) <= 18]
 
 
-def _entry_kind(kind, what):
+def _entry_kind(kind, what, default="note"):
     """Resolve the kind: an explicit --kind wins; otherwise a leading
-    `[kind]` tag in the text becomes the kind instead of sitting behind a
-    default `[note]`. Return (kind, what)."""
+    `[kind]` tag in the text becomes the kind instead of sitting behind the
+    default (`note`, or the feedback signal's kind). Return (kind, what)."""
     if kind:
         return kind, what
     m = re.match(r"^\[([a-z]+)\]\s+(.+)$", what)
     if m and m.group(1) in MEMORY_KINDS:
         return m.group(1), m.group(2)
-    return "note", what
+    return default, what
 
 
 def cmd_remember(args):
@@ -420,7 +423,8 @@ def cmd_remember(args):
     """
     project = _resolve_root(args)
     date = _today(args)
-    kind, what = _entry_kind(args.kind, args.what.strip())
+    kind, what = _entry_kind(args.kind, args.what.strip(),
+                             SIGNAL_KIND.get(args.signal, "note"))
     evidence = (args.evidence or "").strip()
     landed = (args.landed or "").strip()
     if not what:
@@ -432,6 +436,7 @@ def cmd_remember(args):
         sys.exit("error: --what, --evidence and --landed must be single "
                  "lines; file long detail as its own entry or a file "
                  "reference")
+    feedback = _feedback_texts(args)  # None when no feedback flag is given
     subs = []
     for target in args.supersedes or []:
         m = _ENTRY_ID_RE.match(target)
@@ -446,13 +451,18 @@ def cmd_remember(args):
         subs.append(("scope", args.scope))
     if landed:
         subs.append(("landed", landed))
-    hits = _pii_hits(" ".join((what, evidence, landed)))
+    hits = _pii_hits(" ".join((what, evidence, landed)
+                              + tuple(feedback or ())))
     if hits and not args.allow_pii:
         masked = ", ".join(h[:2] + "*" * (len(h) - 4) + h[-2:] for h in hits)
         sys.exit(f"error: this entry contains what looks like a phone, ID "
                  f"or card number ({masked}). Personal form data belongs in "
                  f"the private profile, not in day logs; drop the number, "
                  f"or pass --allow-pii if it is not personal.")
+    notes = []
+    if feedback is not None:
+        fb_subs, notes = _feedback_subs(args, project)
+        subs += fb_subs
 
     # A backdated entry behind the cursor, or inside the window a pending
     # proposal will consume on apply, would never be reflected.
@@ -469,6 +479,8 @@ def cmd_remember(args):
     print(f"  index:   {project / INDEX_DB_RELPATH} ({mode})")
     today = datetime.date.today().isoformat()
     print(f"  {_status_line(project, max(date, today))}")
+    for note in notes:
+        print(f"  {note}")
 
 
 def cmd_recall(args):
@@ -807,6 +819,19 @@ def _reflection_digest(project, logs):
         out.append("- Project-scoped (keep out of global durable memory "
                    "unless it generalizes):")
         out += [f"  - {s}: {', '.join(i)}" for s, i in sorted(scoped.items())]
+    routed = {}
+    for e in window:
+        if _is_feedback(e["subs"]):
+            for name in (e["subs"].get("skill")
+                         or ["(retract/decline, no skill)"]):
+                routed.setdefault(name, []).append(e["id"])
+    if routed:
+        out.append("- Routed to skills (a skill revision answers these by "
+                   "citing fb:<id> in the skill's own files, not this "
+                   "cursor; keep them out of durable memory unless the "
+                   "lesson holds beyond the skill; `vurctos skill-status` "
+                   "shows what is still open):")
+        out += [f"  - {n}: {', '.join(i)}" for n, i in sorted(routed.items())]
     for name in AGING_BUDGET:
         lines, size = _durable_stats(project / name)
         out.append(f"- {name} now: {lines} lines, {size} bytes (budget "
@@ -1675,6 +1700,496 @@ def cmd_skill_new(args):
           "skill; a single prompt is not a skill")
 
 
+# --- Skill feedback loop: capture and read-only status --------------------
+#
+# A lesson about a skill is filed like any other entry, plus sub-lines that
+# name the skill(s) or other target documents, where the evidence came from
+# (the signal) and what it says about the rule (the outcome). The day log
+# stays the single source of truth. Consumption is recorded where the change
+# lives: a revision that answers entry E cites `fb:<E>` in one of the
+# target's own .md files, so rolling the skill back brings the entry back as
+# pending by construction, and there is no ledger to fall out of step.
+
+FEEDBACK_SIGNALS = ("correction", "reject", "pick", "review", "check",
+                    "deviation", "data", "retract", "decline")
+LIFECYCLE_SIGNALS = ("retract", "decline")
+FEEDBACK_OUTCOMES = ("fail", "held", "mixed")
+# signal -> (allowed outcomes, default outcome; None means it must be given)
+SIGNAL_OUTCOMES = {
+    "correction": (("fail",), "fail"),
+    "reject": (("fail",), "fail"),
+    "deviation": (("fail",), "fail"),
+    "pick": (("mixed",), "mixed"),
+    "review": (("fail", "held"), None),
+    "data": (FEEDBACK_OUTCOMES, None),
+    "check": (("fail", "held"), "fail"),
+    "retract": ((), None),
+    "decline": ((), None),
+}
+# The memory kind a signal files under when neither --kind nor a leading
+# [kind] tag gives one.
+SIGNAL_KIND = {"correction": "correction", "reject": "fail", "check": "fail",
+               "deviation": "fail", "review": "note", "pick": "note",
+               "data": "note", "retract": "note", "decline": "note"}
+SKILL_LOOP_FILE = "skill-loop.json"
+SKILL_LOOP_KEYS = ("skills_dirs", "targets", "history_globs")
+DEFAULT_HISTORY_GLOBS = ("CHANGELOG.md", "**/CHANGELOG.md", "**/HISTORY.md")
+# Never part of a target's tree (version hash, citations, sizes).
+TREE_EXCLUDED = (".git", "__pycache__", ".DS_Store", "evals")
+# ASCII word characters only: a version-log line written in a language
+# without spaces may put the token straight after its last word.
+FB_TOKEN_RE = re.compile(r"(?<![\w:])fb:(\d{4}-\d{2}-\d{2}#[1-9]\d*)(?!\d)",
+                         re.ASCII)
+_FB_LIST_MARKERS = r"^\s*(?:(?:[-*+]|\d+[.)])\s+)*"
+FB_RETIRED_RE = re.compile(_FB_LIST_MARKERS + r"fb-retired:\s+"
+                           r"(\d{4}-\d{2}-\d{2})\s+(\S.*?)\s*$")
+FB_RENUMBERED_RE = re.compile(_FB_LIST_MARKERS + r"fb-renumbered:\s+"
+                              r"(\d{4}-\d{2}-\d{2})\s+(\S.*?)\s+->\s+"
+                              r"(\S.*?)\s*$")
+
+
+def _is_feedback(subs):
+    """An entry is feedback iff it names a skill or is a lifecycle entry."""
+    return bool(subs.get("skill")) or \
+        (subs.get("signal") or [None])[0] in LIFECYCLE_SIGNALS
+
+
+def _skill_loop_config(root, is_global):
+    """The optional private config `<root>/skill-loop.json`, with defaults.
+
+    Returns {"file", "skills_dirs", "targets", "history_globs"}. `~` is
+    expanded and a relative path resolves against the memory root. A file
+    that is not valid JSON, has the wrong shapes, or carries an unknown key
+    (a typo would otherwise fall back to the defaults unnoticed) is an error
+    that names the file.
+    """
+    path = root / SKILL_LOOP_FILE
+    raw = {}
+    if path.exists():
+        def bad(why):
+            sys.exit(f"error: malformed {path}: {why}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            bad(exc)
+        if not isinstance(raw, dict):
+            bad("the top level must be a JSON object")
+        unknown = sorted(set(raw) - set(SKILL_LOOP_KEYS))
+        if unknown:
+            bad(f"unknown key {unknown[0]!r} (known: "
+                f"{', '.join(SKILL_LOOP_KEYS)})")
+        for key in ("skills_dirs", "history_globs"):
+            if key in raw and not (isinstance(raw[key], list) and all(
+                    isinstance(v, str) and v for v in raw[key])):
+                bad(f"{key} must be a list of non-empty strings")
+        targets = raw.get("targets", {})
+        if not (isinstance(targets, dict) and all(
+                isinstance(v, str) and v for v in targets.values())):
+            bad("targets must map each name to a file or directory path")
+        named = [k for k in targets if not SKILL_NAME_RE.match(k)]
+        if named:
+            bad(f"target name {named[0]!r} must be lowercase letters, "
+                f"numbers and single hyphens")
+
+    def place(value):
+        p = Path(value).expanduser()
+        return p if p.is_absolute() else root / p
+    default_dirs = (["~/.claude/skills"] if is_global
+                    else [str(root / "skills")])
+    return {
+        "file": path,
+        "skills_dirs": [place(d) for d in
+                        raw.get("skills_dirs", default_dirs)],
+        "targets": {k: place(v) for k, v in raw.get("targets", {}).items()},
+        "history_globs": list(raw.get("history_globs",
+                                      DEFAULT_HISTORY_GLOBS)),
+    }
+
+
+def _find_skill(name, cfg):
+    """The path a feedback target name stands for, or None. A configured
+    target wins; then the first skills dir holding `<name>/SKILL.md`."""
+    if not SKILL_NAME_RE.match(name):
+        return None
+    if name in cfg["targets"]:
+        return cfg["targets"][name]
+    for d in cfg["skills_dirs"]:
+        if (d / name / "SKILL.md").is_file():
+            return d / name
+    return None
+
+
+def _resolve_skill(name, cfg):
+    """_find_skill, or exit listing up to three close matches. An alias
+    accepted here would become a bucket of feedback nobody reads."""
+    found = _find_skill(name, cfg)
+    if found is not None:
+        return found
+    known = set(cfg["targets"])
+    for d in cfg["skills_dirs"]:
+        try:
+            known.update(p.name for p in d.iterdir()
+                         if (p / "SKILL.md").is_file())
+        except OSError:
+            pass
+    close = difflib.get_close_matches(name.lower(), sorted(known), n=3,
+                                      cutoff=0.5)
+    hint = (f"close matches: {', '.join(close)}" if close
+            else "no close match")
+    dirs = ", ".join(str(d) for d in cfg["skills_dirs"]) or "(none)"
+    sys.exit(f"error: --skill {name!r} is neither a skill directory with a "
+             f"SKILL.md under {dirs} nor a target in {cfg['file']}; {hint}. "
+             f"Use the skill's folder name, not an alias.")
+
+
+def _tree_files(path):
+    """The files a target's version and citations are read from, as sorted
+    [(relpath, Path)]. The tree is the real path of the skill directory
+    minus TREE_EXCLUDED entries and nested skills (a subdirectory with its
+    own SKILL.md); a target that is one file is that file alone. Raises
+    OSError when the tree cannot be read."""
+    real = Path(os.path.realpath(path))
+    if real.is_file():
+        return [(real.name, real)]
+    if not real.is_dir():
+        raise FileNotFoundError(f"{real} does not exist")
+
+    def fail(exc):
+        raise exc
+    out, seen = [], set()
+    for top, dirs, files in os.walk(real, onerror=fail, followlinks=True):
+        here = Path(top)
+        if os.path.realpath(top) in seen:  # a symlink loop
+            dirs[:] = []
+            continue
+        seen.add(os.path.realpath(top))
+        dirs[:] = [d for d in dirs if d not in TREE_EXCLUDED
+                   and not (here / d / "SKILL.md").exists()]
+        out += [((here / f).relative_to(real).as_posix(), here / f)
+                for f in files if f not in TREE_EXCLUDED]
+    return sorted(out)
+
+
+def _skill_tree_hash(path):
+    """12 hex of a sha256 over the sorted lines `relpath\\0<sha256 of the
+    file bytes>\\n` of the target's tree."""
+    lines = sorted(f"{rel}\0{hashlib.sha256(p.read_bytes()).hexdigest()}\n"
+                   for rel, p in _tree_files(path))
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:12]
+
+
+def _skillver_subs(found):
+    """`skillver` sub-lines for [(name, path)], and a note for each one that
+    could not be computed. Best effort: it never fails the capture."""
+    subs, notes = [], []
+    for name, path in found:
+        try:
+            subs.append(("skillver", f"{name} {_skill_tree_hash(path)}"))
+        except (OSError, ValueError) as exc:
+            notes.append(f"note: no skillver recorded for {name} ({exc})")
+    return subs, notes
+
+
+def _feedback_texts(args):
+    """The free-text feedback fields of `remember`, after the single-line
+    check, or None when no feedback flag was given (the entry is then
+    filed exactly as before these flags existed)."""
+    if not (args.skill or args.signal or args.outcome or args.rule
+            or args.model is not None):
+        return None
+    texts = list(args.skill or []) + list(args.rule or []) + \
+        ([args.model] if args.model is not None else [])
+    if any(c in t for t in texts for c in "\n\r"):
+        sys.exit("error: --skill, --rule and --model must be single lines")
+    return texts
+
+
+def _feedback_subs(args, root):
+    """Validate the feedback flags of `remember`. Return (subs, notes): the
+    sub-lines that follow supersedes/scope/landed, and notes to print."""
+    skills = list(dict.fromkeys(args.skill or []))
+    rules = [r.strip() for r in args.rule or []]
+    signal, outcome = args.signal, args.outcome
+    model = args.model.strip() if args.model is not None else None
+    if not signal:
+        sys.exit("error: --skill, --outcome, --rule and --model describe "
+                 "feedback and need --signal (one of "
+                 f"{', '.join(FEEDBACK_SIGNALS)})")
+    lifecycle = signal in LIFECYCLE_SIGNALS
+    if not skills and not lifecycle:
+        sys.exit(f"error: --signal {signal} needs --skill NAME; only "
+                 f"retract and decline may name no skill")
+    allowed, default = SIGNAL_OUTCOMES[signal]
+    if lifecycle:
+        if outcome:
+            sys.exit(f"error: --signal {signal} takes no --outcome")
+        if not args.supersedes:
+            sys.exit(f"error: --signal {signal} needs --supersedes <id> of "
+                     f"the entry it withdraws")
+    elif outcome is None:
+        if default is None:
+            sys.exit(f"error: --signal {signal} needs --outcome "
+                     f"{'|'.join(allowed)}")
+        outcome = default
+    elif outcome not in allowed:
+        sys.exit(f"error: --signal {signal} allows --outcome "
+                 f"{'|'.join(allowed)} only (got {outcome})")
+    if signal == "review" and outcome == "held" and not rules:
+        sys.exit("error: --signal review --outcome held needs --rule: a "
+                 "held rule must name the rule that was tested")
+    if any(not r for r in rules) or model == "":
+        sys.exit("error: --rule and --model must not be empty")
+    if len(skills) > 1:
+        for r in rules:
+            if not any(r.startswith(s + ":") and r[len(s) + 1:].strip()
+                       for s in skills):
+                sys.exit(f"error: --rule {r!r} is ambiguous with more than "
+                         f"one --skill; write it as NAME:REF, where NAME is "
+                         f"one of {', '.join(skills)}")
+    cfg = _skill_loop_config(root, getattr(args, "global_", False))
+    found = [(s, _resolve_skill(s, cfg)) for s in skills]
+    ver, notes = _skillver_subs(found)
+    subs = ([("skill", s) for s in skills] + [("signal", signal)]
+            + ([("outcome", outcome)] if outcome else [])
+            + [("rule", r) for r in rules]
+            + ([("model", model)] if model else []) + ver)
+    return subs, notes
+
+
+def _glob_match(relpath, pattern):
+    """Glob match on `/` segments, where a `**` segment matches zero or
+    more segments, so `**/HISTORY.md` also matches a HISTORY.md at the
+    root of the tree."""
+    def match(parts, pats):
+        if not pats:
+            return not parts
+        if pats[0] == "**":
+            return any(match(parts[i:], pats[1:])
+                       for i in range(len(parts) + 1))
+        return bool(parts) and fnmatch.fnmatchcase(parts[0], pats[0]) \
+            and match(parts[1:], pats[1:])
+    return match(relpath.split("/"), pattern.strip("/").split("/"))
+
+
+def _feedback_entries(root):
+    """Every feedback entry in the day logs, oldest first, as the
+    _log_entries dicts plus date, skills, signal and outcome."""
+    out = []
+    for date, path in _day_logs(root):
+        for e in _log_entries(date, path):
+            subs = e["subs"]
+            if _is_feedback(subs):
+                out.append(dict(e, date=date, skills=subs.get("skill", []),
+                                signal=(subs.get("signal") or [""])[0],
+                                outcome=(subs.get("outcome") or [""])[0]))
+    return out
+
+
+def _rule_refs(entry, name):
+    """The rule refs an entry names for target `name`: `name:REF` gives
+    REF; an unqualified ref counts only on an entry naming one target."""
+    refs = []
+    for r in entry["subs"].get("rule", []):
+        if r.startswith(name + ":"):
+            refs.append(r[len(name) + 1:].strip())
+        elif len(entry["skills"]) <= 1:
+            refs.append(r)
+    return refs
+
+
+def _ref_carried(ref, since, until, renumbered):
+    """Carry a ref written on `since` through the renumber lines dated after
+    it and before `until` (an entry filed on a renumber's own date is read
+    as filed before it). None once another rule takes over its number."""
+    by_date = {}
+    for d, old, new in renumbered:
+        by_date.setdefault(d, {})[old] = new
+    for d in sorted(by_date):
+        if since < d < until:
+            if ref in by_date[d]:
+                ref = by_date[d][ref]
+            elif ref in by_date[d].values():
+                return None
+    return ref
+
+
+def _target_status(name, path, entries, cfg):
+    """The read model of one target: what its tree cites, retires and
+    renumbers, and which of its feedback entries are still open."""
+    texts, now, tree_error = {}, None, None
+    if path is not None:
+        try:
+            files = _tree_files(path)
+            texts = {rel: p.read_text(encoding="utf-8", errors="replace")
+                     for rel, p in files if rel.endswith(".md")}
+            now = _skill_tree_hash(path)
+        except (OSError, ValueError) as exc:
+            texts, tree_error = {}, str(exc)
+    cited, retired, renumbered = set(), [], []
+    for text in texts.values():
+        cited.update(m.group(1) for m in FB_TOKEN_RE.finditer(text))
+        for ln in text.splitlines():
+            m = FB_RETIRED_RE.match(ln)
+            if m:
+                retired.append(m.groups())
+            m = FB_RENUMBERED_RE.match(ln)
+            if m:
+                renumbered.append(m.groups())
+
+    def withdrawn(entry_id, signals):
+        """A later lifecycle entry, for this target or for none, that
+        supersedes entry_id."""
+        return any(l["signal"] in signals
+                   and entry_id in l["subs"].get("supersedes", [])
+                   and (not l["skills"] or name in l["skills"])
+                   and _entry_sort_key(l["id"]) > _entry_sort_key(entry_id)
+                   for l in entries)
+    pending = [e for e in entries
+               if name in e["skills"] and e["signal"] not in LIFECYCLE_SIGNALS
+               and e["id"] not in cited
+               and not withdrawn(e["id"], LIFECYCLE_SIGNALS)]
+    rows = []
+    for e in pending:
+        filed = next((v.split()[1] for v in e["subs"].get("skillver", [])
+                      if len(v.split()) == 2 and v.split()[0] == name), None)
+        rows.append({
+            "id": e["id"], "date": e["date"], "kind": e["kind"],
+            "signal": e["signal"], "outcome": e["outcome"],
+            "what": e["what"], "rules": _rule_refs(e, name),
+            "landed": e["subs"].get("landed", []), "skillver_filed": filed,
+            "skillver_differs": (filed != now) if filed and now else None})
+    cites_retired = sorted(
+        (r["id"] for r in rows
+         if any(r["date"] > d and _ref_carried(ref, d, r["date"], renumbered)
+                in r["rules"] for d, ref in retired)), key=_entry_sort_key)
+    consumed_retracted = sorted(
+        (i for i in cited if withdrawn(i, ("retract",))), key=_entry_sort_key)
+    by_signal, by_outcome = {}, {}
+    for r in rows:
+        by_signal[r["signal"]] = by_signal.get(r["signal"], 0) + 1
+        by_outcome[r["outcome"]] = by_outcome.get(r["outcome"], 0) + 1
+    history = {rel for rel in texts
+               if any(_glob_match(rel, g) for g in cfg["history_globs"])}
+    hard = sum(1 for r in rows if r["signal"] in ("correction", "reject"))
+    soft = sum(1 for r in rows if r["signal"] not in ("correction", "reject")
+               and r["outcome"] == "fail")
+    return {
+        "name": name,
+        "path": (str(Path(os.path.realpath(path))) if path is not None
+                 else None),
+        "tree_error": tree_error,
+        "skillver_now": now,
+        "pending": {"count": len(rows), "by_signal": by_signal,
+                    "by_outcome": by_outcome,
+                    "oldest": min((r["date"] for r in rows), default=None),
+                    "entries": rows},
+        "landed_uncited": [r["id"] for r in rows if r["landed"]],
+        "retracted_but_consumed": consumed_retracted,
+        "cites_retired": cites_retired,
+        "chars": {"skill_md": len(texts["SKILL.md"]) if "SKILL.md" in texts
+                  else None,
+                  "rule_files": sum(len(t) for rel, t in texts.items()
+                                    if rel not in history),
+                  "history_files": sum(len(texts[rel]) for rel in history)},
+        "score": 3 * hard + soft + 3 * len(consumed_retracted)
+                 + 2 * len(cites_retired),
+    }
+
+
+def _skill_status(root, is_global, only=None):
+    """Status of every target with feedback, or of `only`; highest score
+    first. Reads the day logs, the config and the targets' trees; writes
+    nothing."""
+    cfg = _skill_loop_config(root, is_global)
+    entries = _feedback_entries(root)
+    names = sorted({s for e in entries for s in e["skills"]})
+    if only is not None:
+        if only not in names:
+            _resolve_skill(only, cfg)  # exits with close matches
+        names = [only]
+    out = [_target_status(n, _find_skill(n, cfg), entries, cfg)
+           for n in names]
+    out.sort(key=lambda t: (-t["score"], t["name"]))
+    return cfg, out
+
+
+def _skill_status_hook_line(targets):
+    """One line of numbers: no entry text, no rule refs, no names."""
+    n = lambda key: sum(len(t[key]) for t in targets)  # noqa: E731
+    outcomes = {o: sum(t["pending"]["by_outcome"].get(o, 0) for t in targets)
+                for o in FEEDBACK_OUTCOMES}
+    hard = sum(t["pending"]["by_signal"].get(s, 0) for t in targets
+               for s in ("correction", "reject"))
+    return (f"skill-status: targets={len(targets)} "
+            f"pending={sum(t['pending']['count'] for t in targets)} "
+            f"correction_reject={hard} fail={outcomes['fail']} "
+            f"held={outcomes['held']} mixed={outcomes['mixed']} "
+            f"landed_uncited={n('landed_uncited')} "
+            f"retracted_but_consumed={n('retracted_but_consumed')} "
+            f"cites_retired={n('cites_retired')} "
+            f"max_score={max((t['score'] for t in targets), default=0)}")
+
+
+def cmd_skill_status(args):
+    """Per skill (or other target), the feedback no revision has answered
+    yet. Strictly read-only: it creates, seeds and modifies nothing."""
+    is_global = getattr(args, "global_", False)
+    if args.hook:
+        # A session-start hook must never break a session or leak text.
+        try:
+            root = _resolve_root(args, seed=False)
+            _, targets = _skill_status(root, is_global, args.skill)
+        except (SystemExit, OSError, ValueError):
+            print("skill-status: error=1")
+            return
+        print(_skill_status_hook_line(targets))
+        return
+    root = _resolve_root(args, seed=False)
+    cfg, targets = _skill_status(root, is_global, args.skill)
+    scope = _scope_flag(args)
+    if args.json:
+        print(json.dumps({"scope": scope, "root": str(root),
+                          "config": str(cfg["file"]) if cfg["file"].exists()
+                          else None, "targets": targets},
+                         ensure_ascii=False, indent=2))
+        return
+    print(f"skill status ({scope}): {len(targets)} target(s) with feedback")
+    for t in targets:
+        p = t["pending"]
+        print(f"\n{t['name']} (score {t['score']}): "
+              f"{t['path'] or 'not found in the skills dirs or targets'}")
+        if t["tree_error"]:
+            print(f"  tree unreadable: {t['tree_error']}")
+        counts = "; ".join(
+            ", ".join(f"{k} {v}" for k, v in sorted(group.items()))
+            for group in (p["by_signal"], p["by_outcome"]) if group)
+        print(f"  pending: {p['count']}"
+              + (f" ({counts}), oldest {p['oldest']}" if p["count"] else ""))
+        for r in p["entries"]:
+            rules = f" rule {', '.join(r['rules'])}" if r["rules"] else ""
+            older = " [filed against another version]" \
+                if r["skillver_differs"] else ""
+            what = r["what"] if len(r["what"]) <= 80 \
+                else r["what"][:77] + "..."
+            print(f"    {r['id']} {r['signal']}/{r['outcome'] or '-'}{rules}"
+                  f"{older}: {what}")
+        for label, key in (("landed, not cited yet", "landed_uncited"),
+                           ("retracted but cited (a revision may encode a "
+                            "wrong lesson)", "retracted_but_consumed"),
+                           ("filed after its rule was retired",
+                            "cites_retired")):
+            if t[key]:
+                print(f"  {label}: {', '.join(t[key])}")
+        c = t["chars"]
+        print(f"  skillver now: {t['skillver_now'] or 'unknown'}; chars: "
+              f"SKILL.md {c['skill_md'] if c['skill_md'] is not None else '-'}"
+              f", rule files {c['rule_files']}, history {c['history_files']}")
+    if targets:
+        print("\nnext: a revision answers an entry by citing fb:<id> in the "
+              "target's own files (its version log line); file `remember "
+              "--signal retract --supersedes <id>` for an entry found wrong")
+
+
 # --- Dispatch: run one board card via headless Claude (Milestone: agent) ---
 #
 # The dispatcher automates the reader/writer role the Orchestrator does by
@@ -2183,9 +2698,10 @@ def _agent_message(out, err):
     return ""
 
 
-def _file_memory(project, kind, what, evidence):
+def _file_memory(project, kind, what, evidence, subs=()):
     """File a dispatch event the same way `remember` does (day log + index)."""
-    _capture(project, datetime.date.today().isoformat(), kind, what, evidence)
+    _capture(project, datetime.date.today().isoformat(), kind, what, evidence,
+             subs)
 
 
 # --- Reject: the verdict-to-memory wire -----------------------------------
@@ -2258,14 +2774,24 @@ def cmd_reject(args):
     if card.get("status") != "review":
         sys.exit(f"error: card {args.card_id} is '{card.get('status')}', "
                  f"not 'review'; reject applies to reviewed work")
+    subs, notes = [], []
+    skills = list(dict.fromkeys(args.skill or []))
+    if skills:  # validated before anything is written
+        cfg = _skill_loop_config(project, False)
+        found = [(s, _resolve_skill(s, cfg)) for s in skills]
+        ver, notes = _skillver_subs(found)
+        subs = ([("skill", s) for s in skills]
+                + [("signal", "reject"), ("outcome", "fail")] + ver)
     date = datetime.date.today().isoformat()
     # Memory first: if the board write then fails, the card stays in review
     # and reject can be re-run; the reverse order could lose the lesson.
     _file_memory(project, "fail",
-                 f"review rejected {card['id']}: {reason}", "")
+                 f"review rejected {card['id']}: {reason}", "", subs)
     _apply_reject(board, card, date, reason)
     print(f"card {card['id']} rejected -> ready (re-queued)")
     print(f"  lesson filed: sessions/{date}.md, index")
+    for note in notes:
+        print(f"  {note}")
     print("  feedback stamped into the card notes; the next dispatch run "
           "carries it in the prompt")
 
@@ -2306,6 +2832,21 @@ def build_parser():
                        help="file a long number that looks personal but is "
                             "not")
     p_rem.add_argument("--date", help="entry date YYYY-MM-DD (default: today)")
+    p_rem.add_argument("--skill", action="append", metavar="NAME",
+                       help="feedback: the skill folder (or configured "
+                            "target) this lesson is about; repeatable, "
+                            "needs --signal")
+    p_rem.add_argument("--signal", choices=FEEDBACK_SIGNALS,
+                       help="feedback: where the evidence came from")
+    p_rem.add_argument("--outcome", choices=FEEDBACK_OUTCOMES,
+                       help="feedback: what it says about the rule (fixed "
+                            "or defaulted per signal)")
+    p_rem.add_argument("--rule", action="append", metavar="REF",
+                       help="feedback: the rule concerned; repeatable, "
+                            "NAME:REF when more than one --skill")
+    p_rem.add_argument("--model", metavar="TEXT",
+                       help="feedback: the model that produced the judged "
+                            "output")
     p_rem.set_defaults(func=cmd_remember)
 
     p_rec = sub.add_parser("recall",
@@ -2414,6 +2955,9 @@ def build_parser():
     p_rej.add_argument("--reason", required=True,
                        help="why it was rejected; this is the lesson that "
                             "gets remembered and fed to the re-run")
+    p_rej.add_argument("--skill", action="append", metavar="NAME",
+                       help="the skill the rejected work used; files the "
+                            "lesson as feedback for it (repeatable)")
     p_rej.set_defaults(func=cmd_reject)
 
     p_sk = sub.add_parser("skill-new",
@@ -2424,6 +2968,24 @@ def build_parser():
     p_sk.add_argument("--project", default=None,
                       help="project folder (default: cwd)")
     p_sk.set_defaults(func=cmd_skill_new)
+
+    p_ss = sub.add_parser("skill-status",
+                          help="per skill, the feedback no revision has "
+                               "answered yet (read-only)")
+    p_ss.add_argument("--project", default=None,
+                      help="project folder (default: cwd)")
+    p_ss.add_argument("--global", dest="global_", action="store_true",
+                      help="report on the user-level memory at ~/.vurctos")
+    p_ss.add_argument("--skill", metavar="NAME",
+                      help="report only this skill or target, even with no "
+                           "feedback")
+    p_ss_out = p_ss.add_mutually_exclusive_group()
+    p_ss_out.add_argument("--json", action="store_true",
+                          help="print the same report as JSON")
+    p_ss_out.add_argument("--hook", action="store_true",
+                          help="print one line of numbers only (no entry "
+                               "text, no rule refs); always exits 0")
+    p_ss.set_defaults(func=cmd_skill_status)
 
     return p
 

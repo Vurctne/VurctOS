@@ -130,7 +130,7 @@ Anything the Orchestrator should check, known limitations, and any unknowns the 
 
 Deviations is for results that contradict something the card states, and each bullet names that field; Notes For Review is for what the card left silent or unclear. The test: can I point to the card line my result contradicts? The section is always present, so a missing one means an old template or a skipped step, not "nothing to report".
 
-The Orchestrator reads the handoff during result review (loop step 7), checks it against intent, project constraints, and style memory, then either accepts it (card to `done`) or reopens the card with feedback. Reopening is mechanized by `vurctos reject <card-id> --reason "..."`: the reason is filed into memory, stamped into the card notes so the re-run carries it, and the card returns to `ready`. Reject never edits `decided`, and `decided` outranks notes, so to overturn a decided item, edit it in `BOARD.md` before the next dispatch.
+The Orchestrator reads the handoff during result review (loop step 7), checks it against intent, project constraints, and style memory, then either accepts it (card to `done`) or reopens the card with feedback. Reopening is mechanized by `vurctos reject <card-id> --reason "..."`: the reason is filed into memory, stamped into the card notes so the re-run carries it, and the card returns to `ready`. With `--skill NAME` the lesson is also filed as feedback for the skill the work used, so `vurctos skill-status` lists it until a revision of that skill cites it (`docs/skills-system.md`). Reject never edits `decided`, and `decided` outranks notes, so to overturn a decided item, edit it in `BOARD.md` before the next dispatch.
 
 ### Writing A Card
 
