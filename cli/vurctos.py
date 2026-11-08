@@ -19,6 +19,8 @@ steps:
   vurctos skill-status     read-only: the feedback each skill has not answered
   vurctos skill-snapshot   copy a skill's tree: a work pair or the baseline
   vurctos skill-check      static check of a skill edit: pass, hold or fail
+  vurctos skill-eval       run a skill's eval cases on two copies, headlessly
+  vurctos skill-pick       a blind pick page for cases only a person can judge
 
 Design rules (see AGENTS.md):
   - local-first, subscription-first, no API keys
@@ -34,12 +36,15 @@ import fnmatch
 import hashlib
 import json
 import os
+import random
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 try:
@@ -1738,7 +1743,9 @@ SKILL_LOOP_FILE = "skill-loop.json"
 SKILL_LOOP_KEYS = ("skills_dirs", "targets", "history_globs", "evals_dir",
                    "work_dir", "mirror_home", "protected_line_patterns",
                    "protected_category_words", "protected_files",
-                   "lint_cmds", "lint_timeout_s", "budget_file")
+                   "lint_cmds", "lint_timeout_s", "budget_file",
+                   "eval_model", "eval_effort", "eval_runs", "eval_max_runs",
+                   "eval_blocked_bins")
 DEFAULT_HISTORY_GLOBS = ("CHANGELOG.md", "**/CHANGELOG.md", "**/HISTORY.md")
 # Never part of a target's tree (version hash, citations, sizes).
 TREE_EXCLUDED = (".git", "__pycache__", ".DS_Store", "evals")
@@ -1825,6 +1832,12 @@ def _skill_loop_config(root, is_global):
         "lint_cmds": [list(c) for c in raw.get("lint_cmds", [])],
         "lint_timeout_s": raw.get("lint_timeout_s", 300),
         "budget_file": place(budget) if budget is not None else None,
+        "eval_model": raw.get("eval_model"),
+        "eval_effort": raw.get("eval_effort"),
+        "eval_runs": raw.get("eval_runs", 2),
+        "eval_max_runs": raw.get("eval_max_runs", 24),
+        "eval_blocked_bins": list(raw.get("eval_blocked_bins",
+                                          EVAL_BLOCKED_BINS)),
     }
 
 
@@ -1866,6 +1879,25 @@ def _check_static_config(raw, bad):
     if isinstance(timeout, bool) or not isinstance(timeout, int) \
             or timeout <= 0:
         bad("lint_timeout_s must be a positive integer")
+    _check_eval_config(raw, bad)
+
+
+def _check_eval_config(raw, bad):
+    """Validate the eval-runner keys of skill-loop.json."""
+    model = raw.get("eval_model")
+    if model is not None and not (isinstance(model, str) and model.strip()):
+        bad("eval_model must be a non-empty model id string or null")
+    if raw.get("eval_effort") not in (None,) + EVAL_EFFORTS:
+        bad(f"eval_effort must be one of {', '.join(EVAL_EFFORTS)} or null")
+    for key in ("eval_runs", "eval_max_runs"):
+        value = raw.get(key, 1)
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or value <= 0:
+            bad(f"{key} must be a positive integer")
+    bins = raw.get("eval_blocked_bins", [])
+    if not (isinstance(bins, list) and all(
+            isinstance(b, str) and b and "/" not in b for b in bins)):
+        bad("eval_blocked_bins must be a list of non-empty names without /")
 
 
 def _find_skill(name, cfg):
@@ -1954,9 +1986,15 @@ def _skill_tree_hash(path):
 
 def _files_hash(files):
     """The tree hash of [(relpath, Path)]."""
+    return _files_digest(files)[:12]
+
+
+def _files_digest(files):
+    """The full sha256 (64 hex) behind _files_hash: over the sorted lines
+    `relpath\0<sha256 of the file bytes>\n`."""
     lines = sorted(f"{rel}\0{hashlib.sha256(p.read_bytes()).hexdigest()}\n"
                    for rel, p in files)
-    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
 
 
 def _skillver_subs(found):
@@ -2297,7 +2335,7 @@ CHECK_CATEGORIES = ("protected", "touch", "volume", "lint", "coverage",
 CHECK_EXIT = {"pass": 0, "fail": 1, "hold": 3}
 LINT_REPORT_MAX = 20
 SNAPSHOTS_DIRNAME = "_snapshots"
-ACCEPTED_POINTER = "accepted"  # phase 4 adds `evaluated` beside it
+ACCEPTED_POINTER = "accepted"  # phase 6 adds `evaluated` beside it
 CURATED_FILE = "_protected.txt"
 _HASH_NAME_RE = re.compile(r"^[0-9a-f]{12}$")
 _RULE_MARKERS_RE = re.compile(r"^(?:(?:[-*+]|[0-9]+[.)])(?:\s+|$))*")
@@ -2982,11 +3020,9 @@ def _print_check(args, result, notes=()):
         print(note)
 
 
-def _check_workdir(args, ctx):
-    """Base W/orig, cand W/cand; nothing is advanced."""
-    name = ctx["name"]
-    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
-    _refuse_inside(name, ctx["live"], [w])
+def _read_manifest(w, name):
+    """W/manifest.json from skill-snapshot --workdir, validated, for NAME;
+    exits naming the file otherwise."""
     path = w / "manifest.json"
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -3003,6 +3039,15 @@ def _check_workdir(args, ctx):
     if manifest.get("skill") != name:
         sys.exit(f"error: {path} is a snapshot of "
                  f"{manifest.get('skill')!r}, not {name}")
+    return manifest
+
+
+def _check_workdir(args, ctx):
+    """Base W/orig, cand W/cand; nothing is advanced."""
+    name = ctx["name"]
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    _refuse_inside(name, ctx["live"], [w])
+    manifest = _read_manifest(w, name)
     base_arm, cand_arm = w / "orig", w / "cand"
     try:
         base_tree, cand_tree = _arm_hash(base_arm), _arm_hash(cand_arm)
@@ -3105,6 +3150,1998 @@ def cmd_skill_check(args):
              else _check_since_accepted(args, ctx))
     if CHECK_EXIT[level]:
         sys.exit(CHECK_EXIT[level])
+
+
+# --- Eval runner: skill-eval and skill-pick --------------------------------
+#
+# A skill edit can pass the static check and still make the skill worse at
+# its job. skill-eval runs the base and the candidate copy of a skill on the
+# same cases, headlessly on the subscription login, and compares them grader
+# by grader. Two failures matter more than anything else here:
+#
+#   - Both arms silently run the same copy. If the loader reached the live
+#     skill, every change would look "not worse". So each run gets its own
+#     mirror of the home in which every hop to the subject leads to that
+#     arm, and each run must prove from its own transcript which copy it
+#     loaded (the per-run audit). A run that cannot prove it is invalid,
+#     never passed.
+#   - A model grading a model. The runner judges only what it can compute:
+#     regexes, tool calls, created files and owner-pinned judge scripts.
+#     `llm` and `baseline` graders load, so a case stays readable by
+#     `claude plugin eval`, but they are reported as unjudged.
+#
+# Cases live in the private evals_dir, never inside a skill, so a candidate
+# cannot edit what judges it, and judge scripts are content-addressed
+# directories. Cases where only a person can judge quality get a blind pick
+# page (skill-pick).
+
+EVAL_SCHEMA = 1
+EVAL_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EVAL_BLOCKED_BINS = ("codex", "gh", "curl", "wget", "ssh", "scp", "osascript",
+                     "open")
+EVAL_ARMS = ("base", "cand")
+EVAL_PROMPT_KEYS = ("schema_version", "name", "description", "tags",
+                    "plugins", "runs", "expected_outcome", "model",
+                    "max_turns", "timeout_seconds", "allowed_tools",
+                    "append_system_prompt", "env")
+EVAL_GRADER_OPTIONS = {
+    "regex": ("pattern", "flags", "match", "target"),
+    "tool_used": ("tool", "input_match", "min", "max"),
+    "tool_order": ("before", "after"),
+    "file_exists": ("path", "exists"),
+    "llm": (),
+    "baseline": (),
+}
+EVAL_GRADER_COMMON = ("type", "weight", "arm")
+EVAL_UNJUDGED = ("llm", "baseline")
+EVAL_SIDECAR_KEYS = ("fails_on", "status", "approved_hash", "targets",
+                     "judge", "expect_skill", "read_roots", "allow_rules",
+                     "checks", "flaky")
+EVAL_CHECK_KEYS = ("name", "argv", "expect_exit", "timeout_s")
+EVAL_JUDGES = ("runner", "human", "mixed")
+EVAL_ENV_PASS = ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+                 "TMPDIR", "TERM", "TZ")
+EVAL_WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
+EVAL_OUTPUT_TAIL = 2000
+JUDGES_DIRNAME = "_judges"
+SIDECARS_DIRNAME = "_sidecars"
+SKILL_LOAD_PREFIX = "Base directory for this skill: "
+SHIM_EXIT = 97
+DIGEST_EXCLUDED = ("__pycache__", ".DS_Store")
+PICK_ANSWERS = ("A", "B", "same", "both-bad")
+PICK_TEXT_MAX = 20000
+_JUDGE_REF_RE = re.compile(r"\{judge:([^{}]*)\}")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
+_EVAL_ENV_RE = re.compile(r"^EVAL_[A-Z0-9_]*\Z")
+_FM_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*?))?[ \t]*$")
+_FM_ITEM_RE = re.compile(r"^[ \t]*-[ \t]+(.*?)[ \t]*$")
+_FM_FLOW_ITEM_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*):(?:\s+(.*))?$",
+                              re.S)
+_FM_INT_RE = re.compile(r"^[-+]?[0-9]+\Z")
+_FM_BARE_START = tuple("[]{},#&*!|>'\"%@`")
+_COUNT_RE = re.compile(r"^count:([0-9]+)\Z")
+_BATCH_NAME_RE = re.compile(r"^([0-9]{8}T[0-9]{6}Z)(?:-([0-9]+))?\Z")
+_TARGET_RANK = {"not-discriminating": 1, "discriminating": 2, "fixed": 2,
+                "not-fixed": 3}
+
+
+class _CaseError(Exception):
+    """A case that cannot load; the message names the file."""
+
+
+def _want(ok, message):
+    if not ok:
+        raise _CaseError(message)
+
+
+def _is_int(value, lo=None, hi=None):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and (lo is None or value >= lo) and (hi is None or value <= hi))
+
+
+def _is_names(value):
+    return isinstance(value, list) and all(
+        isinstance(v, str) and v.strip() for v in value)
+
+
+def _regex_flags(letters):
+    flags = 0
+    for c in letters:
+        flags |= {"i": re.I, "m": re.M, "s": re.S}[c]
+    return flags
+
+
+def _fm_scalar(text, where, flow=False):
+    """One front-matter scalar of the subset. A bare value that YAML would
+    read differently (a comment, a nested mapping, an indicator) is
+    refused, so whatever loads here means the same to `claude plugin
+    eval`."""
+    s = text.strip()
+    _want(s, f"{where}: empty value")
+    if s[0] == '"':
+        try:
+            value, end = json.JSONDecoder().raw_decode(s)
+        except ValueError:
+            value, end = None, -1
+        _want(end == len(s) and isinstance(value, str),
+              f"{where}: bad double-quoted string {s}")
+        return value
+    if s[0] == "'":
+        inner = s[1:-1] if len(s) >= 2 and s.endswith("'") else None
+        _want(inner is not None and "'" not in inner.replace("''", ""),
+              f"{where}: bad single-quoted string {s}")
+        return inner.replace("''", "'")
+    if s in ("true", "false"):
+        return s == "true"
+    if s == "null":
+        return None
+    if _FM_INT_RE.match(s):
+        return int(s)
+    bad = (s.startswith(_FM_BARE_START) or s[:2] in ("- ", "? ", ": ")
+           or s in ("-", "?", ":") or ": " in s or " #" in s
+           or "\t#" in s or s.endswith(":")
+           or (flow and any(c in s for c in ",[]{}")))
+    _want(not bad, f"{where}: quote the value {s!r} (only a small YAML "
+                   f"subset is read)")
+    return s
+
+
+def _fm_flow_items(inner, where):
+    """The comma-separated items of a flow list or map body, quotes kept."""
+    items, buf, quote, i = [], "", None, 0
+    while i < len(inner):
+        c = inner[i]
+        if quote:
+            buf += c
+            if quote == '"' and c == "\\":
+                buf += inner[i + 1:i + 2]
+                i += 2
+                continue
+            if c == quote:
+                if quote == "'" and inner[i + 1:i + 2] == "'":
+                    buf += "'"
+                    i += 2
+                    continue
+                quote = None
+        elif c in "\"'" and (not buf.strip() or buf.rstrip().endswith(":")):
+            quote = c
+            buf += c
+        elif c == ",":
+            items.append(buf)
+            buf = ""
+        else:
+            _want(c not in "[]{}", f"{where}: nested flow collections are "
+                                   f"not read")
+            buf += c
+        i += 1
+    _want(quote is None, f"{where}: unterminated quote")
+    items.append(buf)
+    if len(items) == 1 and not items[0].strip():
+        return []
+    _want(all(it.strip() for it in items),
+          f"{where}: empty item in a flow collection")
+    return items
+
+
+def _fm_value(raw, where):
+    if raw.startswith("["):
+        _want(raw.endswith("]"), f"{where}: unclosed flow list")
+        return [_fm_scalar(it, where, flow=True)
+                for it in _fm_flow_items(raw[1:-1], where)]
+    if raw.startswith("{"):
+        _want(raw.endswith("}"), f"{where}: unclosed flow map")
+        out = {}
+        for it in _fm_flow_items(raw[1:-1], where):
+            m = _FM_FLOW_ITEM_RE.match(it)
+            _want(m and m.group(2) is not None and m.group(2).strip(),
+                  f"{where}: flow map item {it.strip()!r} is not "
+                  f"`key: value`")
+            _want(m.group(1) not in out,
+                  f"{where}: duplicate key {m.group(1)!r}")
+            out[m.group(1)] = _fm_scalar(m.group(2), where, flow=True)
+        return out
+    return _fm_scalar(raw, where)
+
+
+def _parse_front_matter(text, path):
+    """(data, body) of a prompt.md or grader file. Read: `key: value` lines
+    with scalars, flow lists, flow maps, or `key:` followed by `- item`
+    lines; blank and `#` lines are skipped. Anything else is a _CaseError
+    naming the file and line. The body (after the closing ---) has its
+    trailing whitespace stripped; a file with no front matter is all
+    body."""
+    lines = text.replace("\r\n", "\n").lstrip("\ufeff").split("\n")
+    if lines[0].rstrip() != "---":
+        return {}, "\n".join(lines).rstrip()
+    end = next((i for i in range(1, len(lines))
+                if lines[i].rstrip() == "---"), None)
+    _want(end is not None, f"{path}: the front matter has no closing ---")
+    data, i = {}, 1
+    while i < end:
+        line, where = lines[i], f"{path}:{i + 1}"
+        i += 1
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _FM_KEY_RE.match(line)
+        _want(m, f"{where}: not a line of the front-matter subset this "
+                 f"runner reads: {line.strip()!r}")
+        key, raw = m.group(1), m.group(2)
+        _want(key not in data, f"{where}: duplicate key {key!r}")
+        if raw:
+            data[key] = _fm_value(raw, where)
+            continue
+        items = []
+        while i < end:
+            im = _FM_ITEM_RE.match(lines[i])
+            if not im:
+                break
+            items.append(_fm_scalar(im.group(1), f"{path}:{i + 1}"))
+            i += 1
+        data[key] = items if items else None
+    return data, "\n".join(lines[end + 1:]).rstrip()
+
+
+def _read_case_file(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        raise _CaseError(f"{path}: cannot read it ({exc})")
+
+
+def _compile_case_regex(pattern, flags, where):
+    try:
+        re.compile(pattern, flags)
+    except (re.error, TypeError, ValueError) as exc:
+        raise _CaseError(f"{where}: {pattern!r} is not a regex Python can "
+                         f"compile ({exc})")
+
+
+def _load_prompt(path, eval_model):
+    fm, body = _parse_front_matter(_read_case_file(path), path)
+    unknown = sorted(set(fm) - set(EVAL_PROMPT_KEYS))
+    if unknown:
+        raise _CaseError(f"{path}: unknown key {unknown[0]!r} (known: "
+                         f"{', '.join(EVAL_PROMPT_KEYS)})")
+    _want(body.strip(), f"{path}: the prompt body is empty")
+    tools = fm.get("allowed_tools")
+    tools = [] if tools is None else tools
+    _want(_is_names(tools) and not any("," in t for t in tools),
+          f"{path}: allowed_tools must be a list of tool names")
+    timeout = fm.get("timeout_seconds")
+    timeout = 300 if timeout is None else timeout
+    _want(_is_int(timeout, 1, 3600),
+          f"{path}: timeout_seconds must be an integer from 1 to 3600")
+    for key in ("runs", "max_turns"):
+        _want(fm.get(key) is None or _is_int(fm[key], 1),
+              f"{path}: {key} must be a positive integer")
+    if "model" in fm:
+        _want(fm["model"] == eval_model,
+              f"{path}: model {fm['model']!r} differs from eval_model "
+              f"{eval_model!r} (the model is pinned per batch in "
+              f"{SKILL_LOOP_FILE})")
+    asp = fm.get("append_system_prompt")
+    _want(asp is None or isinstance(asp, str),
+          f"{path}: append_system_prompt must be a string")
+    env = fm.get("env")
+    env = {} if env is None else env
+    _want(isinstance(env, dict), f"{path}: env must be a map")
+    for k, v in env.items():
+        _want(_EVAL_ENV_RE.match(k),
+              f"{path}: env key {k!r} must match EVAL_[A-Z0-9_]*")
+        _want(isinstance(v, str) or _is_int(v),
+              f"{path}: env value of {k} must be a string")
+    return {"prompt": body, "allowed_tools": list(tools), "timeout": timeout,
+            "runs": fm.get("runs"), "append_system_prompt": asp,
+            "env": {k: str(v) for k, v in env.items()}}
+
+
+def _tool_spec(value, where, key):
+    if isinstance(value, str) and value:
+        return {"tool": value, "input_match": None}
+    _want(isinstance(value, dict) and set(value) <= {"tool", "input_match"}
+          and isinstance(value.get("tool"), str) and value["tool"],
+          f"{where}: {key} must be a tool name or {{tool, input_match}}")
+    match = value.get("input_match")
+    _want(match is None or isinstance(match, str),
+          f"{where}: {key}.input_match must be a regex string")
+    if match is not None:
+        _compile_case_regex(match, 0, where)
+    return {"tool": value["tool"], "input_match": match}
+
+
+def _load_grader(path):
+    """One graders/<name>.md, with its options normalised and defaults
+    filled in."""
+    fm, _ = _parse_front_matter(_read_case_file(path), path)
+    gtype = fm.get("type")
+    _want(gtype in EVAL_GRADER_OPTIONS,
+          f"{path}: type must be one of {', '.join(EVAL_GRADER_OPTIONS)} "
+          f"(got {gtype!r})")
+    extra = sorted(set(fm) - set(EVAL_GRADER_COMMON)
+                   - set(EVAL_GRADER_OPTIONS[gtype]))
+    if extra:
+        raise _CaseError(f"{path}: a {gtype} grader has no option "
+                         f"{extra[0]!r}")
+    spec = {}
+    if gtype == "regex":
+        pattern, flags = fm.get("pattern"), fm.get("flags") or ""
+        _want(isinstance(pattern, str) and pattern,
+              f"{path}: regex needs a pattern")
+        _want(isinstance(flags, str) and set(flags) <= set("ims"),
+              f"{path}: flags may hold only the letters i, m and s")
+        _compile_case_regex(pattern, _regex_flags(flags), path)
+        match = fm.get("match")
+        _want(match is None or match == "not_contains"
+              or (isinstance(match, str) and _COUNT_RE.match(match)),
+              f"{path}: match must be unset, not_contains or count:N")
+        target = fm.get("target")
+        if isinstance(target, dict):
+            _want(set(target) == {"source", "path"}
+                  and target["source"] == "file"
+                  and isinstance(target["path"], str) and target["path"],
+                  f"{path}: a file target is {{ source: file, path: P }}")
+        else:
+            _want(target in (None, "last_message", "trace", "files"),
+                  f"{path}: target must be last_message, trace, files or "
+                  f"{{ source: file, path: P }}")
+        spec = {"pattern": pattern, "flags": flags, "match": match,
+                "target": target or "last_message"}
+    elif gtype == "tool_used":
+        tool, match = fm.get("tool"), fm.get("input_match")
+        _want(isinstance(tool, str) and tool, f"{path}: tool_used needs tool")
+        _want(match is None or isinstance(match, str),
+              f"{path}: input_match must be a regex string")
+        if match is not None:
+            _compile_case_regex(match, 0, path)
+        lo, hi = fm.get("min"), fm.get("max")
+        lo = 1 if lo is None else lo
+        _want(_is_int(lo, 0) and (hi is None or _is_int(hi, 0)),
+              f"{path}: min and max must be integers >= 0")
+        spec = {"tool": tool, "input_match": match, "min": lo, "max": hi}
+    elif gtype == "tool_order":
+        for key in ("before", "after"):
+            _want(key in fm, f"{path}: tool_order needs {key}")
+            spec[key] = _tool_spec(fm[key], path, key)
+    elif gtype == "file_exists":
+        glob, exists = fm.get("path"), fm.get("exists")
+        exists = True if exists is None else exists
+        _want(isinstance(glob, str) and glob,
+              f"{path}: file_exists needs path")
+        _want(isinstance(exists, bool),
+              f"{path}: exists must be true or false")
+        spec = {"path": glob, "exists": exists}
+    return {"name": path.name[:-len(".md")], "type": gtype, "spec": spec}
+
+
+def _judge_ref(text, where):
+    """(hash, relpath) of one {judge:<hash>/<relpath>} placeholder."""
+    digest, _, rel = text.partition("/")
+    _want(_HEX64_RE.match(digest),
+          f"{where}: {{judge:{text}}} must start with the judge directory's "
+          f"64-hex sha256")
+    parts = PurePosixPath(rel).parts
+    _want(rel and not rel.startswith(("/", "~")) and ".." not in parts,
+          f"{where}: {{judge:{text}}} must name a path inside the judge "
+          f"directory")
+    return digest, PurePosixPath(rel).as_posix()
+
+
+def _load_checks(checks, where):
+    _want(isinstance(checks, list), f"{where}: checks must be a list")
+    out = []
+    for n, check in enumerate(checks):
+        at = f"{where}: checks[{n}]"
+        _want(isinstance(check, dict), f"{at} must be an object")
+        extra = sorted(set(check) - set(EVAL_CHECK_KEYS))
+        if extra:
+            raise _CaseError(f"{at}: unknown key {extra[0]!r}")
+        name, argv = check.get("name"), check.get("argv")
+        _want(isinstance(name, str) and name.strip(), f"{at}: needs a name")
+        _want(_is_names(argv) and argv,
+              f"{at}: argv must be a non-empty list of strings")
+        expect = check.get("expect_exit", 0)
+        timeout = check.get("timeout_s", 60)
+        _want(_is_int(expect), f"{at}: expect_exit must be an integer")
+        _want(_is_int(timeout, 1), f"{at}: timeout_s must be a positive "
+                                   f"integer")
+        refs = []
+        for arg in argv:
+            refs += [_judge_ref(m.group(1), at)
+                     for m in _JUDGE_REF_RE.finditer(arg)]
+            _want("{judge:" not in _JUDGE_REF_RE.sub("", arg),
+                  f"{at}: malformed {{judge:...}} placeholder in {arg!r}")
+        out.append({"name": name, "argv": list(argv), "expect_exit": expect,
+                    "timeout_s": timeout, "refs": refs})
+    return out
+
+
+def _load_sidecar(path, grader_names):
+    """(sidecar, raw) of <evals_dir>/<skill>/_sidecars/<case>.json."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise _CaseError(f"{path}: missing; every case needs a sidecar with "
+                         f"at least fails_on")
+    except (OSError, ValueError) as exc:
+        raise _CaseError(f"{path}: {exc}")
+    _want(isinstance(raw, dict), f"{path}: must be a JSON object")
+    extra = sorted(set(raw) - set(EVAL_SIDECAR_KEYS))
+    if extra:
+        raise _CaseError(f"{path}: unknown key {extra[0]!r} (known: "
+                         f"{', '.join(EVAL_SIDECAR_KEYS)})")
+    fails_on = raw.get("fails_on")
+    _want(isinstance(fails_on, str) and fails_on.strip(),
+          f"{path}: fails_on is required: say what output makes this case "
+          f"fail (a case that cannot say this tests nothing)")
+    side = {"fails_on": fails_on,
+            "status": raw.get("status", "provisional"),
+            "approved_hash": raw.get("approved_hash"),
+            "targets": raw.get("targets", []),
+            "judge": raw.get("judge", "runner"),
+            "expect_skill": raw.get("expect_skill", True),
+            "read_roots": raw.get("read_roots", []),
+            "allow_rules": raw.get("allow_rules", []),
+            "flaky": raw.get("flaky", [])}
+    _want(side["status"] in ("provisional", "approved"),
+          f"{path}: status must be provisional or approved")
+    _want(side["approved_hash"] is None
+          or isinstance(side["approved_hash"], str),
+          f"{path}: approved_hash must be a string or null")
+    _want(isinstance(side["targets"], list) and all(
+        isinstance(t, str) and _ENTRY_ID_RE.match(t)
+        for t in side["targets"]),
+        f"{path}: targets must be feedback ids YYYY-MM-DD#N")
+    _want(side["judge"] in EVAL_JUDGES,
+          f"{path}: judge must be one of {', '.join(EVAL_JUDGES)}")
+    _want(isinstance(side["expect_skill"], bool),
+          f"{path}: expect_skill must be true or false")
+    roots = side["read_roots"]
+    _want(_is_names(roots), f"{path}: read_roots must be a list of paths")
+    for r in roots:
+        norm = PurePosixPath(r).as_posix()
+        _want(not r.startswith(("/", "~")) and ".." not in
+              PurePosixPath(r).parts and norm != ".",
+              f"{path}: read_roots entry {r!r} must be a path relative to "
+              f"mirror_home, without ~ or ..")
+    side["read_roots"] = list(dict.fromkeys(
+        PurePosixPath(r).as_posix() for r in roots))
+    _want(_is_names(side["allow_rules"]),
+          f"{path}: allow_rules must be a list of rule strings")
+    side["checks"] = _load_checks(raw.get("checks", []), path)
+    names = [c["name"] for c in side["checks"]]
+    clash = sorted((set(names) & set(grader_names))
+                   | {n for n in names if names.count(n) > 1})
+    if clash:
+        raise _CaseError(f"{path}: check name {clash[0]!r} is used twice or "
+                         f"by a grader")
+    _want(_is_names(side["flaky"]), f"{path}: flaky must be a list of names")
+    stray = sorted(set(side["flaky"]) - set(names) - set(grader_names))
+    if stray:
+        raise _CaseError(f"{path}: flaky names no grader or check: "
+                         f"{stray[0]!r}")
+    return side, raw
+
+
+def _digest_walk(path, follow):
+    """Sorted [(relpath, Path)] of the files under path, minus
+    DIGEST_EXCLUDED. follow=True reads through symlinks (with loop
+    protection); follow=False refuses any symlink."""
+    real = Path(os.path.realpath(path)) if follow else Path(path)
+    if real.is_file():
+        return [(real.name, real)]
+    _want(real.is_dir(), f"{path}: not a directory")
+    out, seen = [], set()
+
+    def fail(exc):
+        raise exc
+    for top, dirs, files in os.walk(real, onerror=fail, followlinks=follow):
+        here = Path(top)
+        if follow:
+            if os.path.realpath(top) in seen:
+                dirs[:] = []
+                continue
+            seen.add(os.path.realpath(top))
+        else:
+            for name in dirs + files:
+                _want(not os.path.islink(here / name),
+                      f"{path}: holds a symlink ({here / name}); a pinned "
+                      f"directory must hold regular files only")
+        dirs[:] = [d for d in dirs if d not in DIGEST_EXCLUDED]
+        out += [((here / f).relative_to(real).as_posix(), here / f)
+                for f in files if f not in DIGEST_EXCLUDED]
+    return sorted(out)
+
+
+def _judge_digest(path):
+    """The 64-hex content address of a judge directory."""
+    try:
+        return _files_digest(_digest_walk(path, follow=False))
+    except OSError as exc:
+        raise _CaseError(f"{path}: cannot read it ({exc})")
+
+
+def _tree_digest(path):
+    """A 12-hex hash of every file under path (a read root), following
+    symlinks; None when it cannot be read."""
+    try:
+        return _files_digest(_digest_walk(path, follow=True))[:12]
+    except (OSError, _CaseError):
+        return None
+
+
+def _verify_judge(cfg, digest, rel, cache):
+    """The pinned judge file; the directory must hash to its own name."""
+    d = cfg["evals_dir"] / JUDGES_DIRNAME / digest
+    if digest not in cache:
+        _want(d.is_dir() and not d.is_symlink(),
+              f"{d}: the judge directory does not exist")
+        got = _judge_digest(d)
+        _want(got == digest, f"{d}: the judge directory hashes to {got}, not "
+                             f"to its name; it changed after it was pinned")
+        cache[digest] = got
+    p = d / rel
+    _want(p.is_file(), f"{p}: no such file in the pinned judge directory")
+    return p
+
+
+def _case_hash(case_dir, raw_sidecar, judge_digests):
+    """12 hex over the case directory's files (sorted relpaths), the sidecar
+    re-serialised canonically without status and approved_hash, and the
+    hash of every judge directory its checks reference."""
+    try:
+        files = _digest_walk(case_dir, follow=True)
+        lines = sorted(f"{rel}\0{hashlib.sha256(p.read_bytes()).hexdigest()}"
+                       f"\n" for rel, p in files)
+    except OSError as exc:
+        raise _CaseError(f"{case_dir}: cannot read it ({exc})")
+    canon = {k: v for k, v in raw_sidecar.items()
+             if k not in ("status", "approved_hash")}
+    lines.append("sidecar\0" + json.dumps(canon, sort_keys=True,
+                                          ensure_ascii=False,
+                                          separators=(",", ":")) + "\n")
+    lines += [f"judge\0{d}\n" for d in sorted(judge_digests)]
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:12]
+
+
+def _eval_case_names(cfg, skill):
+    d = cfg["evals_dir"] / skill
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [e for e in entries
+            if not e.startswith("_") and (d / e / "prompt.md").is_file()]
+
+
+def _load_case(cfg, skill, name, eval_model, judge_cache):
+    d = cfg["evals_dir"] / skill / name
+    _want(not os.path.lexists(d / "case.yaml"),
+          f"{d / 'case.yaml'}: a case keeps its settings in prompt.md and its "
+          f"sidecar (one home per case); remove case.yaml")
+    case = _load_prompt(d / "prompt.md", eval_model)
+    graders = []
+    if (d / "graders").is_dir():
+        for g in sorted((d / "graders").iterdir()):
+            if g.name.endswith(".md") and g.is_file():
+                graders.append(_load_grader(g))
+    side_path = cfg["evals_dir"] / skill / SIDECARS_DIRNAME / f"{name}.json"
+    side, raw = _load_sidecar(side_path, [g["name"] for g in graders])
+    if side["expect_skill"]:
+        _want("Skill" in case["allowed_tools"],
+              f"{side_path}: expect_skill needs Skill in allowed_tools of "
+              f"{d / 'prompt.md'}")
+    digests = set()
+    for check in side["checks"]:
+        for digest, rel in check["refs"]:
+            _verify_judge(cfg, digest, rel, judge_cache)
+            digests.add(digest)
+    case.update(side)
+    case.update({"name": name, "dir": d, "graders": graders,
+                 "hash": _case_hash(d, raw, digests)})
+    case["approval_current"] = (side["status"] == "approved"
+                                and side["approved_hash"] == case["hash"])
+    return case
+
+
+def _eval_load(cfg, skill, eval_model, only=None):
+    """[(name, case or None, error or None)] for every case of the skill, or
+    for those named in only (an unknown name is an error)."""
+    known = _eval_case_names(cfg, skill)
+    names = list(dict.fromkeys(only)) if only else known
+    out, cache = [], {}
+    for name in names:
+        if name not in known:
+            out.append((name, None, f"no case named {name!r} under "
+                                    f"{cfg['evals_dir'] / skill}"))
+            continue
+        try:
+            out.append((name, _load_case(cfg, skill, name, eval_model, cache),
+                        None))
+        except _CaseError as exc:
+            out.append((name, None, str(exc)))
+    return out
+
+
+def _eval_list_cases(args, cfg, name):
+    """Print each case with its status, hash, approval, graders, checks and
+    load errors. Runs nothing; exits 1 when a case does not load."""
+    loaded = _eval_load(cfg, name, cfg["eval_model"], args.case)
+    rows = []
+    for case_name, case, error in loaded:
+        if case is None:
+            rows.append({"name": case_name, "error": error})
+            continue
+        rows.append({
+            "name": case_name, "status": case["status"], "hash": case["hash"],
+            "approval_current": case["approval_current"],
+            "approval": ("current" if case["approval_current"]
+                         else "stale" if case["status"] == "approved"
+                         else "none"),
+            "judge": case["judge"], "runs": case["runs"],
+            "targets": case["targets"],
+            "graders": [{"name": g["name"], "type": g["type"],
+                         "judged": g["type"] not in EVAL_UNJUDGED}
+                        for g in case["graders"]],
+            "checks": [c["name"] for c in case["checks"]],
+            "flaky": case["flaky"], "error": None})
+    if args.json:
+        print(json.dumps({"skill": name, "cases": rows}, ensure_ascii=False,
+                         indent=2))
+    else:
+        bad = sum(1 for r in rows if r["error"])
+        print(f"cases of {name} ({cfg['evals_dir'] / name}): {len(rows)}"
+              + (f", {bad} with a load error" if bad else ""))
+        for r in rows:
+            if r["error"]:
+                print(f"  {r['name']}: load error: {r['error']}")
+                continue
+            approval = {"current": "approval current",
+                        "stale": "approval stale (approved_hash differs)",
+                        "none": "not approved"}[r["approval"]]
+            print(f"  {r['name']}: {r['status']}, hash {r['hash']}, "
+                  f"{approval}, judge {r['judge']}")
+            graders = ", ".join(
+                f"{g['name']} ({g['type']}"
+                f"{'' if g['judged'] else ', unjudged'})"
+                for g in r["graders"]) or "(none)"
+            print(f"    graders: {graders}")
+            print(f"    checks: {', '.join(r['checks']) or '(none)'}")
+            if r["flaky"]:
+                print(f"    flaky: {', '.join(r['flaky'])}")
+            if r["targets"]:
+                print(f"    targets: {', '.join(r['targets'])}")
+        if not rows:
+            print("  (no cases)")
+    if any(r["error"] for r in rows):
+        sys.exit(1)
+
+
+# --- one run: mirror, environment, process ---
+
+def _eval_remove(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _eval_realize(mirror, live, parts, create=False):
+    """Make mirror/<parts> a real directory, step by step: a step that is a
+    symlink to its live counterpart becomes a real directory holding a
+    symlink to each live entry. Return it, or None when a step is an
+    overlay (a link into an arm) or is missing and create is False."""
+    here = Path(mirror)
+    for n, part in enumerate(parts):
+        nxt, src = here / part, Path(live).joinpath(*parts[:n + 1])
+        if os.path.islink(nxt):
+            if os.readlink(nxt) != str(src) or not os.path.isdir(src):
+                return None
+            os.unlink(nxt)
+            nxt.mkdir()
+            for entry in sorted(os.listdir(src)):
+                os.symlink(src / entry, nxt / entry)
+        elif not os.path.lexists(nxt):
+            if not create:
+                return None
+            nxt.mkdir()
+        elif not nxt.is_dir():
+            return None
+        here = nxt
+    return here
+
+
+def _eval_link_except(here, live, omit):
+    """Fill the empty directory here with a symlink to each entry of live,
+    leaving out entries whose real path is in omit; an entry that leads to
+    one of them becomes a real directory filled the same way."""
+    for entry in sorted(os.listdir(live)):
+        src = Path(live) / entry
+        real = os.path.realpath(src)
+        if real in omit:
+            continue
+        if os.path.isdir(src) and any(o.startswith(real.rstrip(os.sep)
+                                                   + os.sep) for o in omit):
+            (here / entry).mkdir()
+            _eval_link_except(here / entry, src, omit)
+        else:
+            os.symlink(src, here / entry)
+
+
+def _eval_memory_root(root, target, omit):
+    """The run's memory root, in the empty directory target: top-level
+    regular files copied, an empty sessions/, evals_dir and work_dir left
+    out, every other entry a symlink to live. A `remember --global` inside
+    a run therefore lands in the copy, never in the live day log."""
+    entries = sorted(os.listdir(root)) if os.path.isdir(root) else []
+    for entry in entries:
+        src = Path(root) / entry
+        real = os.path.realpath(src)
+        if entry == "sessions" or real in omit:
+            continue
+        if os.path.isfile(src) and not os.path.islink(src):
+            _copy_file(src, target / entry)
+        elif os.path.isdir(src) and any(o.startswith(real.rstrip(os.sep)
+                                                     + os.sep) for o in omit):
+            (target / entry).mkdir()
+            _eval_link_except(target / entry, src, omit)
+        else:
+            os.symlink(src, target / entry)
+    (target / "sessions").mkdir()
+
+
+def _eval_build_home(ctx, subject, home, run_dir):
+    """Build one run's mirror of mirror_home at home, every access path
+    leading to subject (an arm tree), and return the path of its memory
+    root (VURCTOS_HOME). `.claude` holds only skills, CLAUDE.md and the
+    generated settings; `.claude.json` is a copy (the login), and its
+    siblings are left out; evals_dir, work_dir and the workdir are left
+    out wherever they lie under mirror_home."""
+    cfg = ctx["cfg"]
+    mh = Path(cfg["mirror_home"])
+    _build_mirrors(mh, ctx["access"], [(home, subject)])
+    claude = _eval_realize(home, mh, (".claude",), create=True)
+    for entry in os.listdir(claude):
+        if entry not in ("skills", "CLAUDE.md"):
+            _eval_remove(claude / entry)
+    if os.path.islink(claude / "skills"):
+        _eval_realize(home, mh, (".claude", "skills"))
+    for entry in os.listdir(home):
+        if entry.startswith(".claude.json"):
+            _eval_remove(home / entry)
+    if (mh / ".claude.json").is_file():
+        _copy_file(mh / ".claude.json", home / ".claude.json")
+    homes = list(dict.fromkeys([os.path.abspath(mh), os.path.realpath(mh)]))
+
+    def under_home(p):
+        return (_home_relative(os.path.abspath(p), homes)
+                or _home_relative(os.path.realpath(p), homes))
+    omit = {os.path.realpath(cfg["evals_dir"]), os.path.realpath(
+        cfg["work_dir"])}
+    root, vroot = ctx["root"], None
+    rel = under_home(root)
+    if rel is not None:
+        parts = PurePosixPath(rel).parts
+        parent = _eval_realize(home, mh, parts[:-1], create=True)
+        if parent is not None:
+            vroot = parent / parts[-1]
+            if os.path.lexists(vroot):
+                _eval_remove(vroot)
+    if vroot is None:
+        vroot = run_dir / "vurctos"
+    vroot.mkdir()
+    _eval_memory_root(root, vroot, omit)
+    for p in (cfg["evals_dir"], cfg["work_dir"], ctx["w"]):
+        rel = under_home(p)
+        if rel is None:
+            continue
+        parts = PurePosixPath(rel).parts
+        parent = _eval_realize(home, mh, parts[:-1])
+        if parent is not None and os.path.islink(parent / parts[-1]):
+            os.unlink(parent / parts[-1])  # a real dir there holds overlays
+    return vroot
+
+
+def _eval_settings(ctx, case, home, subject):
+    """The generated .claude/settings.json: read rules for every spelling of
+    the subject and of each read root (a read outside the cwd is refused
+    unless both the mirror spelling and the resolved path are allowed),
+    then the case's own rules. No hooks."""
+    allow = [f"Read(/{home}/{a}/**)" for a in ctx["access"]]
+    allow.append(f"Read(/{os.path.realpath(subject)}/**)")
+    for r in case["read_roots"]:
+        m = home / r
+        tail = "/**" if os.path.isdir(m) else ""
+        for spelled in dict.fromkeys([str(m), os.path.realpath(m)]):
+            allow.append(f"Read(/{spelled}{tail})")
+    allow += case["allow_rules"]
+    return {"permissions": {"allow": allow}}
+
+
+def _eval_shims(shim_dir, log, bins):
+    """One executable per blocked binary: it logs its argv and exits 97."""
+    shim_dir.mkdir()
+    for name in bins:
+        p = shim_dir / name
+        p.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(name)}\" $*\" "
+                     f">> {shlex.quote(str(log))}\nexit {SHIM_EXIT}\n",
+                     encoding="utf-8")
+        os.chmod(p, 0o755)
+
+
+def _eval_env(home, vroot, shims, case):
+    """The child environment: an allowlist, never os.environ. The parent of
+    a real run is itself a Claude Code session whose environment carries
+    session ids, sockets, tokens and API keys."""
+    env = {"HOME": str(home), "VURCTOS_HOME": str(vroot)}
+    parent_path = os.environ.get("PATH")
+    env["PATH"] = str(shims) + (os.pathsep + parent_path if parent_path
+                                else "")
+    for key in EVAL_ENV_PASS:
+        if os.environ.get(key) is not None:
+            env[key] = os.environ[key]
+    env.update(case["env"])
+    return env
+
+
+def _eval_argv(ctx, case):
+    argv = [ctx["agent"], "-p", case["prompt"], "--output-format",
+            "stream-json", "--verbose", "--model", ctx["model"],
+            "--permission-mode", "acceptEdits", "--permission-prompts",
+            "none", "--no-session-persistence", "--strict-mcp-config",
+            "--mcp-config", '{"mcpServers":{}}', "--tools",
+            ",".join(case["allowed_tools"])]
+    if ctx["effort"]:
+        argv += ["--effort", ctx["effort"]]
+    if case["append_system_prompt"] is not None:
+        argv += ["--append-system-prompt", case["append_system_prompt"]]
+    return argv
+
+
+def _kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        pass
+
+
+def _eval_process(argv, cwd, env, timeout, out_path, err_path=None):
+    """(returncode, timed_out) of one process run in its own session, stdin
+    closed, stdout to out_path and stderr to err_path (or to out_path).
+    On timeout the whole process group is killed, and so are stragglers
+    after a normal exit. returncode is None when it could not start."""
+    with open(out_path, "wb") as out:
+        err = open(err_path, "wb") if err_path else None
+        try:
+            try:
+                proc = subprocess.Popen(
+                    argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                    stdout=out, stderr=err or subprocess.STDOUT,
+                    start_new_session=True)
+            except (OSError, ValueError) as exc:
+                (err or out).write(f"could not start: {exc}\n".encode(
+                    "utf-8", "replace"))
+                return None, False
+            timed_out = False
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:  # an interrupt too: the group never outlives the run
+                _kill_group(proc.pid)
+                proc.wait()
+            return proc.returncode, timed_out
+        finally:
+            if err:
+                err.close()
+
+
+def _eval_run_agent(argv, cwd, env, timeout, out_path, err_path):
+    """One headless agent run (monkeypatchable in tests)."""
+    return _eval_process(argv, cwd, env, timeout, out_path, err_path)
+
+
+def _eval_capture(argv, cwd, env, timeout=60):
+    """(returncode, stdout) of a short command, or (None, why). Like a run,
+    its whole process group is killed when it ends or times out."""
+    try:
+        proc = subprocess.Popen(argv, cwd=str(cwd), env=env,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                start_new_session=True)
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return None, str(exc)
+    finally:
+        _kill_group(proc.pid)
+        proc.wait()
+    return proc.returncode, out.decode("utf-8", errors="replace")
+
+
+# --- the transcript: audit and grades ---
+
+def _eval_events(path):
+    """(events, text, bad): the transcript's JSON objects in order, its text
+    as written, and the numbers of the lines that are not JSON objects."""
+    try:
+        text = path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return [], "", [0]
+    events, bad = [], []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            events.append(obj)
+        else:
+            bad.append(n)
+    return events, text, bad
+
+
+def _eval_contents(event):
+    msg = event.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [c for c in content if isinstance(c, dict)] \
+        if isinstance(content, list) else []
+
+
+def _eval_tool_uses(events):
+    """[(name, input)] of every tool_use, in order."""
+    return [(str(c.get("name")), c.get("input")) for e in events
+            if e.get("type") == "assistant" for c in _eval_contents(e)
+            if c.get("type") == "tool_use"]
+
+
+def _eval_skill_loads(events):
+    """The text of every synthetic user message that loads a skill."""
+    return [c["text"] for e in events
+            if e.get("type") == "user" and e.get("isSynthetic") is True
+            for c in _eval_contents(e)
+            if c.get("type") == "text" and isinstance(c.get("text"), str)
+            and c["text"].startswith(SKILL_LOAD_PREFIX)]
+
+
+def _eval_final_message(events):
+    results = [e for e in events if e.get("type") == "result"]
+    text = results[-1].get("result") if results else None
+    return text if isinstance(text, str) else ""
+
+
+def _skill_body(text):
+    """SKILL.md text with its front matter removed."""
+    lines = text.replace("\r\n", "\n").lstrip("\ufeff").split("\n")
+    if lines[0].strip() == "---":
+        for n in range(1, len(lines)):
+            if lines[n].strip() == "---":
+                return "\n".join(lines[n + 1:])
+    return "\n".join(lines)
+
+
+def _collapse(text):
+    return " ".join(text.split())
+
+
+def _inside(path, base):
+    return path == base or path.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def _eval_forbidden(ctx, arm):
+    """The paths whose appearance in a tool input is contamination."""
+    cfg, mh = ctx["cfg"], ctx["cfg"]["mirror_home"]
+    out = []
+    for a in ctx["access"]:
+        p = os.path.join(os.path.abspath(mh), a)
+        out += [p, os.path.join(os.path.realpath(mh), a),
+                os.path.realpath(p)]
+    out.append(os.path.realpath(ctx["live"]))
+    out += [os.path.abspath(cfg["evals_dir"]),
+            os.path.realpath(cfg["evals_dir"])]
+    if not ctx["probe"]:
+        other = "orig" if arm == "cand" else "cand"
+        out += [str(ctx["w"] / other), str(ctx["wr"] / other)]
+    return [(p, re.compile(re.escape(p) + r"(?![A-Za-z0-9._-])"))
+            for p in dict.fromkeys(out)]
+
+
+def _eval_audit(ctx, case, arm, home, cwd, run_dir, rc, timed_out):
+    """(reasons, events, text): every audit rule the run fails. Any reason
+    makes the run invalid; the audit judges validity, not quality."""
+    events, text, bad = _eval_events(run_dir / "transcript.jsonl")
+    reasons = []
+    # A0: the process ended normally and the stream is whole.
+    if timed_out:
+        reasons.append("A0 process: timeout")
+    elif rc != 0:
+        reasons.append(f"A0 process: exit code {rc}")
+    if bad:
+        reasons.append(f"A0 process: transcript line {bad[0]} is not a JSON "
+                       f"object")
+    inits = [e for e in events if e.get("type") == "system"
+             and e.get("subtype") == "init"]
+    results = [e for e in events if e.get("type") == "result"]
+    for label, found in (("init", inits), ("result", results)):
+        if len(found) != 1:
+            reasons.append(f"A0 process: {len(found)} {label} events, not 1")
+    # A1: the run rode the subscription, with nothing extra loaded.
+    if inits:
+        init = inits[0]
+        if init.get("apiKeySource") != "none":
+            reasons.append(f"A1 billing: apiKeySource is "
+                           f"{init.get('apiKeySource')!r}, not 'none'")
+        if init.get("mcp_servers") != []:
+            reasons.append("A1 init: mcp_servers is not empty")
+        if init.get("model") != ctx["model"]:
+            reasons.append(f"A1 init: model is {init.get('model')!r}, not "
+                           f"{ctx['model']!r}")
+        tools = init.get("tools")
+        if not isinstance(tools, list):
+            reasons.append("A1 init: no tools list")
+        elif set(map(str, tools)) - set(case["allowed_tools"]):
+            extra = sorted(set(map(str, tools)) - set(case["allowed_tools"]))
+            reasons.append(f"A1 init: tools outside allowed_tools: "
+                           f"{', '.join(extra)}")
+        plugins = init.get("plugins")
+        if not isinstance(plugins, list):
+            reasons.append("A1 init: no plugins list")
+        elif any(not isinstance(p, dict) or p.get("path") != "builtin"
+                 for p in plugins):
+            reasons.append("A1 init: a plugin that is not built in")
+    # A2: the subject was loaded from this run's mirror, with this arm's
+    # body. Where the loader looked is the one thing a mirror cannot fake.
+    # A Skill call with args makes the CLI append `ARGUMENTS: <args>`.
+    uses = _eval_tool_uses(events)
+    own = _collapse(ctx["bodies"][arm])
+    bodies = {own} | {_collapse(f"{ctx['bodies'][arm]}\n\nARGUMENTS: {a}")
+                      for n, inp in uses if n == "Skill"
+                      and isinstance(inp, dict)
+                      and isinstance(inp.get("args"), str)
+                      for a in [inp["args"]]}
+    spellings = [f"{home}/{a}" for a in ctx["access"]]
+    trees = [str(ctx["w"] / "orig"), str(ctx["w"] / "cand"),
+             str(ctx["wr"] / "orig"), str(ctx["wr"] / "cand"),
+             os.path.realpath(ctx["live"])]
+    loaded = 0
+    for load in _eval_skill_loads(events):
+        directory = load[len(SKILL_LOAD_PREFIX):].split("\n", 1)[0]
+        d = directory.rstrip("/") or directory
+        if not (PurePosixPath(d).name == ctx["name"]
+                or any(_inside(d, s) for s in spellings + trees)):
+            continue
+        loaded += 1
+        body = load.split("\n\n", 1)[1] if "\n\n" in load else ""
+        if d not in spellings:
+            reasons.append(f"A2 loader: loaded from {directory}")
+        elif _collapse(body) not in bodies:
+            reasons.append("A2 loader: loaded body differs from this arm")
+    if case["expect_skill"] and not loaded:
+        reasons.append("A2 loader: subject skill not loaded")
+    # A3: no tool input names the live skill, the cases or the other arm.
+    for name, inp in uses:
+        encoded = json.dumps(inp, ensure_ascii=False)
+        for path, rx in ctx["forbidden"][arm]:
+            if rx.search(encoded):
+                reasons.append(f"A3 contamination: a {name} input names "
+                               f"{path}")
+    # A4: no side effect outside the run's own cwd.
+    base = str(cwd)
+    for name, inp in uses:
+        if name not in EVAL_WRITE_TOOLS:
+            continue
+        target = inp.get("file_path", inp.get("notebook_path")) \
+            if isinstance(inp, dict) else None
+        if not isinstance(target, str) or not target:
+            reasons.append(f"A4 side effect: a {name} without a path")
+            continue
+        if target.startswith("~"):
+            target = str(home) + target[1:]
+        resolved = os.path.normpath(os.path.join(base, target))
+        if not _inside(resolved, base):
+            reasons.append(f"A4 side effect: {name} outside the cwd: "
+                           f"{target}")
+    try:
+        shimmed = (run_dir / "shim.log").read_text(encoding="utf-8",
+                                                   errors="replace")
+    except OSError:
+        shimmed = "(unreadable)"
+    if shimmed.strip():
+        reasons.append(f"A4 side effect: a blocked binary was called: "
+                       f"{shimmed.splitlines()[0][:120]}")
+    if results:
+        denials = results[0].get("permission_denials")
+        if not isinstance(denials, list):
+            reasons.append("A4 side effect: the result has no "
+                           "permission_denials list")
+        elif denials:
+            tools = sorted({str(d.get("tool_name")) if isinstance(d, dict)
+                            else "?" for d in denials})
+            reasons.append(f"A4 side effect: {len(denials)} permission "
+                           f"denial(s) ({', '.join(tools)}); the skill ran "
+                           f"without something it asked for")
+    # A5: the run itself reports success.
+    if results and (results[0].get("is_error") is not False
+                    or results[0].get("subtype") != "success"):
+        reasons.append(f"A5 result: subtype {results[0].get('subtype')!r}, "
+                       f"is_error {results[0].get('is_error')!r}")
+    return list(dict.fromkeys(reasons)), events, text
+
+
+def _eval_files(cwd):
+    """Sorted posix relpaths of the regular files under cwd."""
+    out = []
+    for top, dirs, files in os.walk(cwd):
+        here = Path(top)
+        out += [(here / f).relative_to(cwd).as_posix() for f in files
+                if os.path.isfile(here / f) and not os.path.islink(here / f)]
+    return sorted(out)
+
+
+def _eval_target(target, result, text, created, cwd):
+    """The text a grader reads, or None (the grader then fails)."""
+    if target == "last_message":
+        return result
+    if target == "trace":
+        return text
+    if target == "files":
+        return "\n".join(created)
+    base = str(cwd)
+    p = os.path.normpath(os.path.join(base, target["path"]))
+    if not _inside(p, base) or p == base or not os.path.isfile(p) \
+            or not _inside(os.path.realpath(p), os.path.realpath(base)):
+        return None
+    return Path(p).read_bytes().decode("utf-8", errors="replace")
+
+
+def _tool_hits(uses, spec):
+    """Indexes of the tool uses matching {tool, input_match}."""
+    out = []
+    for n, (name, inp) in enumerate(uses):
+        if name != spec["tool"]:
+            continue
+        encoded = json.dumps(inp, ensure_ascii=False, separators=(",", ":"))
+        if spec["input_match"] is None or re.search(spec["input_match"],
+                                                    encoded):
+            out.append(n)
+    return out
+
+
+def _eval_grade_one(grader, result, text, created, cwd, uses):
+    spec, gtype = grader["spec"], grader["type"]
+    if gtype == "regex":
+        target = _eval_target(spec["target"], result, text, created, cwd)
+        if target is None:
+            return False
+        n = sum(1 for _ in re.finditer(spec["pattern"], target,
+                                       _regex_flags(spec["flags"])))
+        if spec["match"] is None:
+            return n >= 1
+        if spec["match"] == "not_contains":
+            return n == 0
+        return n == int(_COUNT_RE.match(spec["match"]).group(1))
+    if gtype == "tool_used":
+        n = len(_tool_hits(uses, spec))
+        return spec["min"] <= n and (spec["max"] is None or n <= spec["max"])
+    if gtype == "tool_order":
+        before, after = _tool_hits(uses, spec["before"]), _tool_hits(
+            uses, spec["after"])
+        return bool(before and after) and before[0] < after[0]
+    if gtype == "file_exists":
+        hit = any(fnmatch.fnmatchcase(rel, spec["path"]) for rel in created)
+        return hit if spec["exists"] else not hit
+    raise ValueError(gtype)
+
+
+def _eval_run_check(ctx, check, cwd, run_dir, env, n):
+    """(passed, info) of one script check: the pinned judge from evals_dir,
+    never a file of the arm tree, run in the run's cwd with HOME set to a
+    fresh empty directory."""
+    judges = ctx["cfg"]["evals_dir"] / JUDGES_DIRNAME
+    argv = [_JUDGE_REF_RE.sub(lambda m: str(judges / m.group(1)), a)
+            .replace("{cwd}", str(cwd)) for a in check["argv"]]
+    home, out = run_dir / f"check-home-{n}", run_dir / f"check-{n}.out"
+    home.mkdir()
+    cenv = dict(env, HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
+    try:
+        rc, timed_out = _eval_process(argv, cwd, cenv, check["timeout_s"],
+                                      out)
+        output = out.read_bytes().decode("utf-8", errors="replace")
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+        if out.exists():
+            out.unlink()
+    ok = not timed_out and rc is not None and rc == check["expect_exit"]
+    return ok, {"exit": rc, "timed_out": timed_out,
+                "output": output[-EVAL_OUTPUT_TAIL:]}
+
+
+def _eval_grade(ctx, case, run_dir, cwd, events, text, created, env):
+    """({name: True | False | None}, check details) of a valid run."""
+    result, uses = _eval_final_message(events), _eval_tool_uses(events)
+    grades, checks = {}, {}
+    for g in case["graders"]:
+        grades[g["name"]] = None if g["type"] in EVAL_UNJUDGED else \
+            _eval_grade_one(g, result, text, created, cwd, uses)
+    for n, check in enumerate(case["checks"], 1):
+        grades[check["name"]], checks[check["name"]] = _eval_run_check(
+            ctx, check, cwd, run_dir, env, n)
+    return grades, checks
+
+
+def _eval_run(ctx, case, arm, i, retry):
+    """One run: build its mirror and cwd, run the agent, audit, grade (when
+    valid), remove the mirror, and write run.json. Returns the record."""
+    rel = f"runs/{case['name']}/{arm}-{i}" + ("-r" if retry else "")
+    run_dir = ctx["batch_dir"] / rel
+    run_dir.mkdir(parents=True)
+    cwd = run_dir / "cwd"
+    if (case["dir"] / "files").is_dir():
+        shutil.copytree(case["dir"] / "files", cwd,
+                        ignore=shutil.ignore_patterns(*DIGEST_EXCLUDED))
+    else:
+        cwd.mkdir()
+    placed = set(_eval_files(cwd))
+    shim_log, shims, home = run_dir / "shim.log", run_dir / "shims", \
+        run_dir / "home"
+    shim_log.touch()
+    subject = ctx["arms"][arm]
+    try:
+        _eval_shims(shims, shim_log, ctx["cfg"]["eval_blocked_bins"])
+        vroot = _eval_build_home(ctx, subject, home, run_dir)
+        (home / ".claude" / "settings.json").write_text(
+            json.dumps(_eval_settings(ctx, case, home, subject),
+                       ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        env = _eval_env(home, vroot, shims, case)
+        start = time.monotonic()
+        rc, timed_out = _eval_run_agent(
+            _eval_argv(ctx, case), cwd, env, case["timeout"],
+            run_dir / "transcript.jsonl", run_dir / "stderr.txt")
+        seconds = round(time.monotonic() - start, 3)
+        reasons, events, text = _eval_audit(ctx, case, arm, home, cwd,
+                                            run_dir, rc, timed_out)
+        created = [f for f in _eval_files(cwd) if f not in placed]
+        grades, checks = ({}, {}) if reasons else _eval_grade(
+            ctx, case, run_dir, cwd, events, text, created, env)
+    finally:
+        for p in (home, shims, run_dir / "vurctos"):
+            if os.path.lexists(p):
+                _eval_remove(p)
+    record = {"case": case["name"], "arm": arm, "run": i, "retry": retry,
+              "dir": rel, "valid": not reasons, "invalid": reasons,
+              "seconds": seconds, "returncode": rc, "timed_out": timed_out,
+              "created": created, "grades": grades, "checks": checks}
+    _eval_write_run(ctx, record)
+    return record
+
+
+def _eval_write_run(ctx, record):
+    _atomic_write(ctx["batch_dir"] / record["dir"] / "run.json",
+                  json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+
+
+# --- the batch ---
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _eval_preflight(ctx, login):
+    """(version, logged_in, detail): `<agent> --version` and, with login,
+    `<agent> auth status --json`, run with the first run's environment in
+    a mirror built like its, which is removed afterwards."""
+    d = ctx["batch_dir"] / ("preflight" if login else "postflight")
+    case = ctx["cases"][0]
+    d.mkdir()
+    (d / "cwd").mkdir()
+    (d / "shim.log").touch()
+    try:
+        _eval_shims(d / "shims", d / "shim.log",
+                    ctx["cfg"]["eval_blocked_bins"])
+        vroot = _eval_build_home(ctx, ctx["arms"]["base"], d / "home", d)
+        (d / "home" / ".claude" / "settings.json").write_text(
+            json.dumps(_eval_settings(ctx, case, d / "home",
+                                      ctx["arms"]["base"])) + "\n",
+            encoding="utf-8")
+        env = _eval_env(d / "home", vroot, d / "shims", case)
+        rc, out = _eval_capture([ctx["agent"], "--version"], d / "cwd", env)
+        version = (out.strip().splitlines() or [""])[0][:200] if rc == 0 \
+            else f"unknown (exit {rc})"
+        if not login:
+            return version, None, ""
+        rc, out = _eval_capture([ctx["agent"], "auth", "status", "--json"],
+                                d / "cwd", env)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        return version, None, "no JSON object"
+    flag = payload.get("loggedIn")
+    return version, flag, f"loggedIn: {json.dumps(flag)}"
+
+
+def _eval_attempt(ctx, case, arm, i, retry, state):
+    state["invocations"] += 1
+    record = _eval_run(ctx, case, arm, i, retry)
+    state["results"].append(record)
+    label = f"{case['name']}/{record['dir'].rsplit('/', 1)[1]}"
+    status = "valid" if record["valid"] else \
+        "invalid: " + "; ".join(record["invalid"])
+    print(f"run {label}: {status} ({record['seconds']}s)", file=sys.stderr)
+    return record
+
+
+def _eval_after_run(ctx, record):
+    """An abort reason after one run, or None."""
+    if any(r.startswith("A1 billing") for r in record["invalid"]):
+        return (f"billing: run {record['dir']} did not ride the subscription "
+                f"login (apiKeySource is not 'none')")
+    for arm, path in ctx["arms"].items():
+        try:
+            now = _arm_hash(path)
+        except OSError:
+            now = None
+        if now != ctx["arm_start"][arm]:
+            return (f"the {arm} arm tree ({path}) changed during the batch "
+                    f"(tree {ctx['arm_start'][arm]} -> {now})")
+    names = [c["name"] for c in ctx["cases"]]
+    now = {n: c and c["hash"] for n, c, _ in
+           _eval_load(ctx["cfg"], ctx["name"], ctx["model"], names)}
+    for c in ctx["cases"]:
+        if now[c["name"]] != c["hash"]:
+            return (f"case {c['name']} or a judge it uses changed during the "
+                    f"batch (hash {c['hash']} -> "
+                    f"{now[c['name']] or 'it no longer loads'})")
+    return None
+
+
+def _eval_slot(ctx, case, arm, i, state):
+    """Run one planned run, and once more when it is invalid; return an
+    abort reason or None. A retry is made only while the cap leaves room
+    for it after every planned run."""
+    record = _eval_attempt(ctx, case, arm, i, False, state)
+    abort = _eval_after_run(ctx, record)
+    if abort or record["valid"]:
+        return abort
+    if state["retries_left"] > 0:
+        state["retries_left"] -= 1
+        record = _eval_attempt(ctx, case, arm, i, True, state)
+        abort = _eval_after_run(ctx, record)
+        if abort:
+            return abort
+    else:
+        record["invalid"].append(f"not retried: the run cap "
+                                 f"({ctx['cap']}) leaves no room for a retry")
+        _eval_write_run(ctx, record)
+    if not record["valid"] and any(r.startswith(("A2", "A3"))
+                                   for r in record["invalid"]):
+        state["loader_cases"].add(case["name"])
+        if len(state["loader_cases"]) >= 2:
+            return (f"loader judged broken: A2 or A3 still failed after the "
+                    f"retry on {', '.join(sorted(state['loader_cases']))}")
+    return None
+
+
+def _eval_case_meta(case):
+    return {"name": case["name"], "hash": case["hash"],
+            "status": case["status"],
+            "approval_current": case["approval_current"],
+            "judge": case["judge"], "k": case["k"],
+            "graders": [[g["name"], g["type"]] for g in case["graders"]],
+            "checks": [c["name"] for c in case["checks"]],
+            "flaky": case["flaky"], "targets": case["targets"],
+            "read_roots": case["read_roots"], "prompt": case["prompt"]}
+
+
+def _eval_batch(ctx):
+    """Run every planned run in order (per case, for i in 1..k: base-i,
+    then cand-i), apply the batch aborts, and write results.json,
+    batch.json and verdict.json. Returns the verdict."""
+    cfg, bd, mh = ctx["cfg"], ctx["batch_dir"], Path(ctx["cfg"]["mirror_home"])
+    started = _utc_now()
+    roots = sorted({r for c in ctx["cases"] for r in c["read_roots"]})
+    root_paths = {r: os.path.realpath(mh / r) for r in roots}
+    root_start = {r: _tree_digest(p) for r, p in root_paths.items()}
+
+    def live_hash():
+        try:
+            return _skill_tree_hash(ctx["live"])
+        except (OSError, ValueError):
+            return None
+    live_start = live_hash()
+    try:
+        version, logged_in, detail = _eval_preflight(ctx, login=True)
+    except OSError as exc:
+        version, logged_in, detail = "unknown", None, f"could not run: {exc}"
+    aborted = None
+    if logged_in is not True:
+        aborted = (f"login preflight: `{ctx['agent']} auth status --json` "
+                   f"did not report \"loggedIn\": true ({detail})")
+    state = {"invocations": 0, "results": [], "loader_cases": set(),
+             "retries_left": ctx["cap"] - ctx["planned"]}
+    for case in ctx["cases"] if not aborted else []:
+        for i in range(1, case["k"] + 1):
+            for arm in EVAL_ARMS:
+                try:
+                    aborted = _eval_slot(ctx, case, arm, i, state)
+                except OSError as exc:
+                    aborted = (f"cannot prepare or run {case['name']} "
+                               f"{arm}-{i}: {exc}")
+                if aborted:
+                    break
+            if aborted:
+                break
+        if aborted:
+            break
+    results = state["results"]
+    root_end = {r: _tree_digest(p) for r, p in root_paths.items()}
+    changed = [r for r in roots if root_end[r] != root_start[r]
+               or root_end[r] is None]
+    by_name = {c["name"]: c for c in ctx["cases"]}
+    for record in results:
+        hit = [r for r in changed if r in by_name[record["case"]]
+               ["read_roots"]]
+        if hit:
+            record["valid"], record["grades"], record["checks"] = False, {}, {}
+            record["invalid"] += [f"read root changed during the batch: {r}"
+                                  for r in hit]
+            _eval_write_run(ctx, record)
+    try:
+        end_version = _eval_preflight(ctx, login=False)[0]
+    except OSError as exc:
+        end_version = f"unknown ({exc})"
+    if not aborted and end_version != version:
+        aborted = (f"the agent changed during the batch ({version} -> "
+                   f"{end_version}); the arms may have run different "
+                   f"versions")
+    arm_end = {}
+    for arm, path in ctx["arms"].items():
+        try:
+            arm_end[arm] = _arm_hash(path)
+        except OSError:
+            arm_end[arm] = None
+    batch = {
+        "schema_version": EVAL_SCHEMA, "skill": ctx["name"],
+        "batch": bd.name, "probe": ctx["probe"], "model": ctx["model"],
+        "effort": ctx["effort"], "agent": ctx["agent"],
+        "agent_version": {"start": version, "end": end_version},
+        "login": {"logged_in": logged_in, "detail": detail},
+        "workdir": str(ctx["w"]), "max_runs": ctx["cap"],
+        "planned_runs": ctx["planned"], "invocations": state["invocations"],
+        "aborted": aborted,
+        "arms": {arm: {"path": str(path), "start": ctx["arm_start"][arm],
+                       "end": arm_end[arm]}
+                 for arm, path in ctx["arms"].items()},
+        "live": {"path": os.path.realpath(ctx["live"]), "start": live_start,
+                 "end": live_hash()},
+        "read_roots": {r: {"path": root_paths[r], "start": root_start[r],
+                           "end": root_end[r]} for r in roots},
+        "cases": [_eval_case_meta(c) for c in ctx["cases"]],
+        "started_at": started, "finished_at": _utc_now(),
+        "pick_key_sha256": None}
+    _atomic_write(bd / "results.json",
+                  json.dumps(results, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write(bd / "batch.json",
+                  json.dumps(batch, ensure_ascii=False, indent=2) + "\n")
+    verdict = _eval_verdict(batch, results)
+    _atomic_write(bd / "verdict.json",
+                  json.dumps(verdict, ensure_ascii=False, indent=2) + "\n")
+    return verdict
+
+
+# --- the verdict ---
+
+def _eval_verdict(batch, results, picks=None):
+    """The comparison, per (case, grader or check), over valid runs only.
+    An improvement on one grader never offsets a regression on another."""
+    finals = {}
+    for record in results:  # in run order: a retry replaces its first try
+        finals[(record["case"], record["arm"], record["run"])] = record
+    probe = batch["probe"]
+    rows, cases_out, targeted, unstable, invalid = [], [], {}, [], []
+    short, judged_cases = [], 0
+    for c in batch["cases"]:
+        k = c["k"]
+        need = (k + 1) // 2
+        runs = {arm: [finals.get((c["name"], arm, i)) for i in range(1, k + 1)]
+                for arm in EVAL_ARMS}
+        valid = {arm: [r for r in runs[arm] if r and r["valid"]]
+                 for arm in EVAL_ARMS}
+        enough = all(len(valid[arm]) >= need for arm in EVAL_ARMS)
+        if not enough:
+            short.append(c["name"])
+        cases_out.append({
+            "name": c["name"], "hash": c["hash"], "status": c["status"],
+            "approval_current": c["approval_current"],
+            "runs": {arm: [{"run": i, "dir": r["dir"] if r else None,
+                            "valid": bool(r and r["valid"])}
+                           for i, r in enumerate(runs[arm], 1)]
+                     for arm in EVAL_ARMS}})
+        for arm in EVAL_ARMS:
+            for i, r in enumerate(runs[arm], 1):
+                if r and not r["valid"]:
+                    invalid.append({"case": c["name"], "arm": arm, "run": i,
+                                    "reasons": r["invalid"]})
+        judged = []
+        for name, gtype in c["graders"] + [[n, "check"] for n in c["checks"]]:
+            bp = sum(1 for r in valid["base"] if r["grades"].get(name) is True)
+            cp = sum(1 for r in valid["cand"] if r["grades"].get(name) is True)
+            bn, cn = len(valid["base"]), len(valid["cand"])
+            if not enough:
+                status = "insufficient"
+            elif gtype in EVAL_UNJUDGED:
+                status = "unjudged"
+            elif name in c["flaky"]:
+                status = "flaky"
+            elif cp * bn < bp * cn:
+                status = "regressed"
+            elif cp * bn > bp * cn:
+                status = "improved"
+            else:
+                status = "same"
+            rows.append({"case": c["name"], "grader": name, "base_pass": bp,
+                         "base_n": bn, "cand_pass": cp, "cand_n": cn,
+                         "status": status})
+            if gtype in EVAL_UNJUDGED:
+                continue
+            if name not in c["flaky"]:
+                judged.append(name)
+            seen = {r["grades"].get(name) for r in valid["base"]
+                    + valid["cand"]}
+            if probe and len(seen) > 1:
+                unstable.append({"case": c["name"], "grader": name})
+        if judged and c["approval_current"]:
+            judged_cases += 1
+
+        def passed(r):
+            return all(r["grades"].get(g) is True for g in judged)
+        for tid in c["targets"]:
+            if probe:
+                st = ("discriminating" if enough and not any(
+                    passed(r) for r in valid["base"] + valid["cand"])
+                    else "not-discriminating")
+            elif any(passed(r) for r in valid["base"]):
+                st = "not-discriminating"
+            elif enough and all(passed(r) for r in valid["cand"]):
+                st = "fixed"
+            else:
+                st = "not-fixed"
+            if _TARGET_RANK[st] > _TARGET_RANK.get(targeted.get(tid), 0):
+                targeted[tid] = st
+    picks = picks or {}
+    human_pending = [c["name"] for c in batch["cases"]
+                     if c["judge"] in ("human", "mixed")
+                     and c["name"] not in picks]
+    statuses = {r["status"] for r in rows}
+    insufficient = "insufficient" in statuses or bool(short)
+    not_worse = ("regressed" not in statuses and not insufficient
+                 and "baseline" not in picks.values())
+    if probe:
+        level = "fail" if batch["aborted"] or insufficient else "pass"
+    elif batch["aborted"] or not not_worse:
+        level = "fail"
+    else:
+        level = "hold" if human_pending else "pass"
+    verdict = {
+        "schema_version": EVAL_SCHEMA, "skill": batch["skill"],
+        "batch": batch["batch"], "probe": probe, "level": level,
+        "aborted": batch["aborted"], "model": batch["model"],
+        "agent_version": batch["agent_version"]["start"],
+        "arms": {arm: batch["arms"][arm]["start"] for arm in EVAL_ARMS},
+        "live": {"start": batch["live"]["start"],
+                 "end": batch["live"]["end"]},
+        "cases": cases_out, "graders": rows, "targeted": targeted,
+        "not_worse": not_worse, "suite_ok": judged_cases >= 3,
+        "invalid_runs": invalid, "human_pending": human_pending}
+    if probe:
+        verdict["unstable"] = unstable
+    return verdict
+
+
+def _print_eval(verdict, path, picks=None):
+    v = verdict
+    print(f"{v['level']}: skill-eval {v['skill']} ("
+          f"{'probe, ' if v['probe'] else ''}batch {v['batch']}, model "
+          f"{v['model']}, agent {v['agent_version']})")
+    if v["aborted"]:
+        print(f"aborted: {v['aborted']}")
+    print("graders:")
+    for r in v["graders"]:
+        print(f"  {r['case']} / {r['grader']}: base {r['base_pass']}/"
+              f"{r['base_n']}, cand {r['cand_pass']}/{r['cand_n']}: "
+              f"{r['status']}")
+    if not v["graders"]:
+        print("  (none)")
+    for tid, st in sorted(v["targeted"].items()):
+        print(f"targeted {tid}: {st}")
+    for r in v["invalid_runs"]:
+        print(f"invalid {r['case']} {r['arm']}-{r['run']}: "
+              f"{'; '.join(r['reasons'])}")
+    if v["probe"]:
+        print("unstable: " + (", ".join(f"{u['case']} / {u['grader']}"
+                                        for u in v["unstable"]) or "none"))
+    if v["human_pending"]:
+        print(f"human pick pending: {', '.join(v['human_pending'])}")
+    for case, answer in sorted((picks or {}).items()):
+        print(f"pick {case}: {answer}")
+    if v["probe"]:
+        print("probe: both arms ran W/orig, so only an abort or too few "
+              "valid runs fail it")
+    else:
+        print(f"not_worse: {str(v['not_worse']).lower()}; suite_ok: "
+              f"{str(v['suite_ok']).lower()} (needs 3 approved cases with a "
+              f"current approval and a judged grader)")
+    print(f"verdict: {path}")
+
+
+def _eval_agent(args):
+    """The agent executable, resolved once to an absolute path."""
+    if args.agent_cmd:
+        path = os.path.abspath(os.path.expanduser(args.agent_cmd))
+    else:
+        found = shutil.which("claude")
+        if not found:
+            sys.exit("error: no `claude` executable on PATH; install Claude "
+                     "Code or pass --agent-cmd PATH")
+        path = os.path.abspath(found)
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        sys.exit(f"error: the agent {path} is not an executable file")
+    return path
+
+
+def _eval_stop(signum, frame):
+    """A stop signal mid-batch takes the interrupt path, so each run's
+    mirror is removed and its process group killed."""
+    raise KeyboardInterrupt(f"stopped by signal {signum}")
+
+
+def cmd_skill_eval(args):
+    """Run a skill's eval cases on the base and the candidate copy and
+    compare them: exit 0 pass, 1 fail (or an error before the batch), 3
+    hold. --list-cases runs nothing."""
+    root, cfg, live = _check_target(args)
+    name = args.name
+    if args.list_cases:
+        return _eval_list_cases(args, cfg, name)
+    model = cfg["eval_model"]
+    if not model:
+        sys.exit(f"error: set eval_model in {cfg['file']} (the full model id "
+                 f"every run must report)")
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    _refuse_inside(name, live, [w])
+    if _inside(os.path.realpath(w), os.path.realpath(cfg["evals_dir"])):
+        sys.exit(f"error: --workdir {w} lies inside evals_dir; every run "
+                 f"would name the cases")
+    manifest = _read_manifest(w, name)
+    wr = Path(os.path.realpath(w))
+    arms = {"base": wr / "orig", "cand": wr / ("orig" if args.probe
+                                                else "cand")}
+    try:
+        arm_start = {arm: _arm_hash(p) for arm, p in arms.items()}
+        bodies = {arm: _skill_body((p / "SKILL.md").read_text(
+            encoding="utf-8", errors="replace")) for arm, p in arms.items()}
+    except OSError as exc:
+        sys.exit(f"error: cannot read the arms in {w}: {exc}")
+    if arm_start["base"] != manifest.get("tree"):
+        sys.exit(f"error: {w / 'orig'} no longer matches its manifest (tree "
+                 f"{arm_start['base']}, manifest {manifest.get('tree')}); "
+                 f"take a fresh snapshot")
+    access = manifest["access_paths"]
+    if f".claude/skills/{name}" not in access:
+        sys.exit(f"error: {name} is not reached through .claude/skills/{name} "
+                 f"under mirror_home, so a headless run could not load the "
+                 f"copy under test")
+    loaded = _eval_load(cfg, name, model, args.case)
+    errors = [(n, e) for n, _, e in loaded if e]
+    for n, e in errors:
+        print(f"load error ({n}): {e}", file=sys.stderr)
+    if errors:
+        sys.exit(f"error: {len(errors)} case(s) did not load; nothing was "
+                 f"run")
+    cases = [c for _, c, _ in loaded]
+    if not cases:
+        sys.exit(f"error: no cases for {name} under {cfg['evals_dir'] / name}")
+    for c in cases:
+        c["k"] = args.runs or c["runs"] or cfg["eval_runs"]
+    planned = sum(2 * c["k"] for c in cases)
+    cap = args.max_runs if args.max_runs is not None else cfg["eval_max_runs"]
+    if planned > cap:
+        sys.exit(f"error: {planned} planned runs exceed the cap of {cap} "
+                 f"(--max-runs or eval_max_runs); nothing was run")
+    mh = Path(cfg["mirror_home"])
+    missing = sorted({r for c in cases for r in c["read_roots"]
+                      if not os.path.exists(mh / r)})
+    if missing:
+        sys.exit(f"error: read root {missing[0]} does not exist under "
+                 f"{mh}")
+    agent = _eval_agent(args)
+    ctx = {"name": name, "cfg": cfg, "root": root, "live": live, "w": w,
+           "wr": wr, "arms": arms, "arm_start": arm_start, "bodies": bodies,
+           "probe": args.probe, "access": access, "cases": cases,
+           "agent": agent, "model": model, "effort": cfg["eval_effort"],
+           "cap": cap, "planned": planned,
+           "batch_dir": _new_check_dir(wr / "eval")}
+    ctx["forbidden"] = {arm: _eval_forbidden(ctx, arm) for arm in EVAL_ARMS}
+    stops = [getattr(signal, n) for n in ("SIGTERM", "SIGHUP")
+             if hasattr(signal, n)]
+    old = {sig: signal.signal(sig, _eval_stop) for sig in stops}
+    try:
+        verdict = _eval_batch(ctx)
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    else:
+        _print_eval(verdict, ctx["batch_dir"] / "verdict.json")
+    if CHECK_EXIT[verdict["level"]]:
+        sys.exit(CHECK_EXIT[verdict["level"]])
+
+
+# --- the blind pick ---
+
+def _pick_rng():
+    """The page's A/B draw (tests substitute a seeded random.Random)."""
+    return random.SystemRandom()
+
+
+def _pick_batch_dir(w, batch):
+    """W/eval/<batch>, or the latest batch there."""
+    root = w / "eval"
+    if batch:
+        if not _BATCH_NAME_RE.match(batch):
+            sys.exit(f"error: --batch takes the name of a batch in {root} "
+                     f"(such as 20261108T133120Z), not a path")
+        d = root / batch
+        if not (d / "batch.json").is_file():
+            sys.exit(f"error: no batch {batch} in {root}")
+        return d
+    found = []
+    for d in (root.iterdir() if root.is_dir() else []):
+        m = _BATCH_NAME_RE.match(d.name)
+        if m and (d / "batch.json").is_file():
+            found.append(((m.group(1), int(m.group(2) or 1)), d))
+    if not found:
+        sys.exit(f"error: no eval batch in {root}; run vurctos skill-eval "
+                 f"first")
+    return max(found)[1]
+
+
+def _pick_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: cannot read {path}: {exc}")
+
+
+def _pick_fence(text):
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def _pick_text(data):
+    """The file as text, or None when it is binary."""
+    if b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _pick_side(bd, record):
+    """The lines of one output: its final message and every created file."""
+    run_dir = bd / record["dir"]
+    events, _, _ = _eval_events(run_dir / "transcript.jsonl")
+    out = ["#### Final message", "", _pick_fence(_eval_final_message(events)),
+           ""]
+    if not record["created"]:
+        out += ["(no files created)", ""]
+    for rel in record["created"]:
+        try:
+            text = _pick_text((run_dir / "cwd" / rel).read_bytes())
+        except OSError:
+            text = None
+        if text is None:
+            out += [f"#### {rel}", "", "(binary file, listed by name only)",
+                    ""]
+            continue
+        out += [f"#### {rel}", "", _pick_fence(text[:PICK_TEXT_MAX]), ""]
+        if len(text) > PICK_TEXT_MAX:
+            out += [f"(truncated: the first {PICK_TEXT_MAX} of {len(text)} "
+                    f"characters are shown)", ""]
+    return out
+
+
+def _pick_spellings(path, homes=()):
+    """path as given, resolved, and as ~/<rel> under each home spelling."""
+    out = [str(path), os.path.realpath(path)]
+    out += ["~/" + os.path.relpath(p, h) for p in out[:2] for h in homes
+            if p != h and _inside(p, h)]
+    return list(dict.fromkeys(out))
+
+
+_PICK_ARM_RE = re.compile(r"/(?:cand|orig)(?![A-Za-z0-9_-])")
+_PICK_RUN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:base|cand)-[0-9]+(?:-r)?(?![A-Za-z0-9_])")
+
+
+def _pick_make(args, w, bd, batch, results, cfg):
+    if batch["probe"]:
+        sys.exit("error: a probe runs the same copy in both arms; there is "
+                 "nothing to pick")
+    if (bd / "picks.json").exists():
+        sys.exit(f"error: picks are already recorded in {bd / 'picks.json'}; "
+                 f"a new page would not match them")
+    if (bd / "sealed" / "key.json").exists():
+        sys.exit(f"error: a pick page was already made for this batch "
+                 f"({bd / 'pick.md'}); answer it with skill-pick record, or "
+                 f"move {bd / 'sealed'} and the page away to draw a new one")
+    homes = _pick_spellings(cfg["mirror_home"])
+    human = [c for c in batch["cases"] if c["judge"] in ("human", "mixed")]
+    if not human:
+        sys.exit("error: no case of this batch is judged by a person")
+    first = {}
+    for r in sorted(results, key=lambda r: (r["run"], r["retry"])):
+        if r["valid"]:
+            first.setdefault((r["case"], r["arm"]), r)
+    missing = [f"{c['name']} ({arm})" for c in human for arm in EVAL_ARMS
+               if (c["name"], arm) not in first]
+    if missing:
+        sys.exit(f"error: no valid run to show for {', '.join(missing)}; "
+                 f"nothing was written")
+    rng = _pick_rng()
+    items, lines, reps = [], [], []
+    lines += ["# Blind pick", "",
+              "Each numbered item shows one task and two outputs, A and B, "
+              "made from the same prompt. Read both, then answer A, B, same "
+              "(no real difference) or both-bad. Write each answer after its "
+              "number at the end of this page.", ""]
+    for number, c in enumerate(human, 1):
+        a_arm = rng.choice(EVAL_ARMS)
+        sides = {"A": a_arm, "B": "cand" if a_arm == "base" else "base"}
+        recs = {s: first[(c["name"], arm)] for s, arm in sides.items()}
+        items.append({"number": number, "case": c["name"], "A": sides["A"],
+                      "B": sides["B"],
+                      "runs": {s: recs[s]["dir"] for s in sides}})
+        lines += [f"## {number}", "", "### Task", "",
+                  _pick_fence(c["prompt"]), ""]
+        for s in ("A", "B"):
+            lines += [f"### {number} {s}", ""] + _pick_side(bd, recs[s])
+            run_dir = bd / recs[s]["dir"]
+            reps += [(p, "<cwd>") for p in _pick_spellings(run_dir / "cwd")]
+            reps += [(p, "<home>") for p in _pick_spellings(run_dir / "home")]
+            reps += [(p, "<run>") for p in _pick_spellings(run_dir, homes)]
+    lines += ["## Answers", "", "Write A, B, same or both-bad after each "
+              "number.", ""] + [f"{it['number']}: " for it in items]
+    spellings = _pick_spellings(w, homes) + _pick_spellings(
+        bd.parent.parent, homes) + [batch.get("workdir") or str(w)]
+    reps += [(p, "<skill>") for top in (w, bd.parent.parent)
+             for arm in ("orig", "cand")
+             for p in _pick_spellings(top / arm, homes)]
+    reps += [(p, "<dir>") for p in spellings]
+    reps += [(p, "<home>") for p in homes]
+    page = "\n".join(lines) + "\n"
+    for old, new in sorted(set(reps), key=lambda r: -len(r[0])):
+        page = page.replace(old, new)
+    hashes = [h for a in batch["arms"].values() for h in (a["start"], a["end"])
+              if h] + [c["hash"] for c in batch["cases"]] + [
+        h for h in (batch["live"]["start"], batch["live"]["end"]) if h]
+    leaks = [f"the workdir path {p}" for p in dict.fromkeys(spellings)
+             if p in page]
+    leaks += [f"an arm directory name ({m})" for m in dict.fromkeys(
+        _PICK_ARM_RE.findall(page))]
+    leaks += [f"a run label ({m})" for m in dict.fromkeys(
+        _PICK_RUN_RE.findall(page))]
+    leaks += [f"the hash {h}" for h in dict.fromkeys(hashes) if h in page]
+    if batch["batch"] in page:
+        leaks.append("the batch id")
+    if leaks:
+        sys.exit(f"error: the page would reveal {'; '.join(leaks)}; nothing "
+                 f"was written")
+    key = {"schema_version": EVAL_SCHEMA, "batch": batch["batch"],
+           "items": items}
+    data = (json.dumps(key, ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8")
+    (bd / "sealed").mkdir(exist_ok=True)
+    tmp = bd / "sealed" / ".key.json.tmp"
+    tmp.write_bytes(data)
+    os.replace(tmp, bd / "sealed" / "key.json")
+    _atomic_write(bd / "pick.md", page)
+    batch["pick_key_sha256"] = hashlib.sha256(data).hexdigest()
+    _atomic_write(bd / "batch.json",
+                  json.dumps(batch, ensure_ascii=False, indent=2) + "\n")
+    print(f"pick page: {bd / 'pick.md'} ({len(items)} case(s))")
+    print(f"next: vurctos skill-pick record {args.name} "
+          f"{_scope_flag(args)} --workdir {shlex.quote(str(w))} --batch "
+          f"{bd.name} --answers \"1:A,2:same,...\"")
+
+
+def _pick_answers(text, numbers):
+    """{number: answer} from "1:A,2:same,3:B"; every page number exactly
+    once, every value one of PICK_ANSWERS."""
+    canon = {a.lower(): a for a in PICK_ANSWERS}
+    out = {}
+    for part in text.split(","):
+        num, sep, value = part.partition(":")
+        num, value = num.strip(), value.strip().lower()
+        if not sep or not num.isdigit() or value not in canon:
+            sys.exit(f"error: --answers item {part.strip()!r} is not "
+                     f"N:{'|'.join(PICK_ANSWERS)}")
+        if int(num) in out:
+            sys.exit(f"error: --answers gives item {num} twice")
+        out[int(num)] = canon[value]
+    if set(out) != set(numbers):
+        sys.exit(f"error: --answers must answer every item of the page "
+                 f"exactly once ({', '.join(map(str, sorted(numbers)))})")
+    return out
+
+
+def _pick_record(args, w, bd, batch, results):
+    if (bd / "picks.json").exists():
+        sys.exit(f"error: picks are already recorded in {bd / 'picks.json'}")
+    key_path = bd / "sealed" / "key.json"
+    want = batch.get("pick_key_sha256")
+    if not want or not key_path.is_file():
+        sys.exit("error: no pick page was made for this batch; run "
+                 "vurctos skill-pick make first")
+    data = key_path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != want:
+        sys.exit(f"error: {key_path} no longer matches the sha256 recorded "
+                 f"when the page was made; nothing was recorded")
+    key = json.loads(data.decode("utf-8"))
+    answers = _pick_answers(args.answers,
+                            [it["number"] for it in key["items"]])
+    picks = {}
+    for it in key["items"]:
+        answer = answers[it["number"]]
+        if answer in ("A", "B"):
+            picks[it["case"]] = ("candidate" if it[answer] == "cand"
+                                 else "baseline")
+        else:
+            picks[it["case"]] = answer
+    record = {"schema_version": EVAL_SCHEMA, "batch": batch["batch"],
+              "answers": {str(n): a for n, a in sorted(answers.items())},
+              "picks": picks, "recorded_at": _utc_now()}
+    _atomic_write(bd / "picks.json",
+                  json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+    verdict = _eval_verdict(batch, results, picks)
+    _atomic_write(bd / "verdict.json",
+                  json.dumps(verdict, ensure_ascii=False, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    else:
+        _print_eval(verdict, bd / "verdict.json", picks)
+    if CHECK_EXIT[verdict["level"]]:
+        sys.exit(CHECK_EXIT[verdict["level"]])
+
+
+def cmd_skill_pick(args):
+    """make: a blind page for the cases a person judges; record: map the
+    answers through the sealed key and recompute the verdict."""
+    _, cfg, _ = _check_target(args)
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    bd = _pick_batch_dir(Path(os.path.realpath(w)), args.batch)
+    batch = _pick_json(bd / "batch.json")
+    results = _pick_json(bd / "results.json")
+    if batch.get("skill") != args.name:
+        sys.exit(f"error: batch {bd.name} evaluated {batch.get('skill')!r}, "
+                 f"not {args.name}")
+    if args.pick_action == "make":
+        _pick_make(args, w, bd, batch, results, cfg)
+    else:
+        _pick_record(args, w, bd, batch, results)
 
 
 # --- Dispatch: run one board card via headless Claude (Milestone: agent) ---
@@ -3944,6 +5981,74 @@ def build_parser():
     p_chk.add_argument("--json", action="store_true",
                        help="print the result as JSON")
     p_chk.set_defaults(func=cmd_skill_check, usage_error=p_chk.error)
+
+    def positive(text):
+        try:
+            value = int(text)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a positive "
+                                             f"integer")
+        return value
+
+    p_ev = sub.add_parser("skill-eval",
+                          help="run a skill's eval cases on the base and the "
+                               "candidate copy headlessly and compare them: "
+                               "pass (0), fail (1) or hold (3)")
+    p_ev.add_argument("name", help="skill folder name or configured target")
+    p_ev.add_argument("--project", default=None,
+                      help="project folder (default: cwd)")
+    p_ev.add_argument("--global", dest="global_", action="store_true",
+                      help="use the user-level memory at ~/.vurctos")
+    p_ev.add_argument("--workdir", metavar="W", required=True,
+                      help="the work pair from skill-snapshot --workdir; "
+                           "results go to W/eval/<batch>/")
+    p_ev.add_argument("--case", action="append", metavar="C",
+                      help="run only this case (repeatable; default: all)")
+    p_ev.add_argument("--runs", type=positive, metavar="K",
+                      help="runs per arm per case (default: the case's "
+                           "runs, else eval_runs)")
+    p_ev.add_argument("--probe", action="store_true",
+                      help="an A/A run: both arms are W/orig (finds "
+                           "unstable graders, shows a targeted case fails)")
+    p_ev.add_argument("--max-runs", type=positive, metavar="N",
+                      help="refuse a batch planning more runs (default: "
+                           "eval_max_runs)")
+    p_ev.add_argument("--agent-cmd", metavar="PATH",
+                      help="the executable to run instead of claude")
+    p_ev.add_argument("--json", action="store_true",
+                      help="print the verdict (or the case list) as JSON")
+    p_ev.add_argument("--list-cases", action="store_true",
+                      help="list the cases with status, hash, approval, "
+                           "graders and load errors; runs nothing")
+    p_ev.set_defaults(func=cmd_skill_eval)
+
+    p_pk = sub.add_parser("skill-pick",
+                          help="a blind A/B page for the cases a person "
+                               "judges, and recording the answers")
+    pk_sub = p_pk.add_subparsers(dest="pick_action", required=True)
+    for action, text in (("make", "write W/eval/<batch>/pick.md and its "
+                                  "sealed key"),
+                         ("record", "map the answers through the key and "
+                                    "recompute the verdict")):
+        q = pk_sub.add_parser(action, help=text)
+        q.add_argument("name", help="skill folder name or configured target")
+        q.add_argument("--project", default=None,
+                       help="project folder (default: cwd)")
+        q.add_argument("--global", dest="global_", action="store_true",
+                       help="use the user-level memory at ~/.vurctos")
+        q.add_argument("--workdir", metavar="W", required=True,
+                       help="the work pair the batch ran in")
+        q.add_argument("--batch", metavar="B",
+                       help="the batch id (default: the latest in W/eval/)")
+        if action == "record":
+            q.add_argument("--answers", required=True,
+                           help='one answer per page item, e.g. '
+                                '"1:A,2:same,3:B" (A, B, same or both-bad)')
+            q.add_argument("--json", action="store_true",
+                           help="print the recomputed verdict as JSON")
+        q.set_defaults(func=cmd_skill_pick)
 
     return p
 

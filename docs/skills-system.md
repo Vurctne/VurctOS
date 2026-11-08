@@ -100,6 +100,39 @@ Skills are edited on the spot by whichever session finds a problem, so a check h
 
 See `cli/README.md` for the command lines and the configuration keys.
 
+## Eval Runner
+
+An edit can pass the static check and still make the skill worse at its job. `vurctos skill-eval NAME --workdir W` runs the base copy (`W/orig`) and the candidate (`W/cand`) on the same test cases, headlessly on the subscription login, and compares them grader by grader. It never lets a model grade a model: the runner judges only what it can compute (regexes, tool calls, created files, owner-pinned judge scripts), and anything else is reported as unjudged. Cases where only a person can judge quality get a blind pick page instead.
+
+**Cases** live in the private `evals_dir`, never inside a skill, so a candidate cannot edit what judges it. The layout follows Claude Code's plugin-eval format, so a case stays readable by `claude plugin eval`:
+
+```text
+<evals_dir>/<skill>/<case>/prompt.md            front matter + the prompt
+<evals_dir>/<skill>/<case>/graders/<name>.md    one grader per file
+<evals_dir>/<skill>/<case>/files/               copied into the run's cwd
+<evals_dir>/<skill>/_sidecars/<case>.json       runner-only fields
+<evals_dir>/_judges/<sha256>/...                pinned judge directories
+```
+
+`prompt.md` takes the plugin-eval keys (`allowed_tools` is the run's tool set, `timeout_seconds` its wall clock, `runs` the runs per arm, `env` only `EVAL_*` variables; `model` must equal the pinned `eval_model`). Grader types are `regex`, `tool_used`, `tool_order`, `file_exists`, and `llm` / `baseline`, which load but are never judged. The front matter is read by a small parser that accepts `key: value` lines, quoted and bare scalars, flow lists and maps, and block lists, and refuses anything YAML would read differently. The sidecar holds `fails_on` (required: a case that cannot say what output makes it fail tests nothing), `status` and `approved_hash`, `targets` (feedback ids), `judge` (`runner`, `human` or `mixed`), `expect_skill`, `read_roots`, `allow_rules`, script `checks` and `flaky`. An approval counts only while `approved_hash` equals the case hash, which covers every file of the case, the sidecar (without `status` and `approved_hash`) and each referenced judge directory, so editing an input, grader, check or judge makes the approval stale. A judge directory is named by the sha256 of all its files; one whose contents no longer hash to its name stops the command before any run. A check runs only the pinned judge, never a script from the skill under test.
+
+**Isolation.** Each run gets its own mirror of the home, built like the static check's, in which every hop to the skill leads to the arm under test. `.claude` holds only `skills`, `CLAUDE.md` and generated read permissions for both spellings (mirror and real path) of the skill and of each read root; `.claude.json` is a copy (the login); the memory root is a copy of its top-level files with an empty `sessions/` and without the cases or the work directory, so a `remember` inside a run never reaches the real day logs. The child environment is an allowlist (the parent of a real run is itself a Claude Code session, whose environment carries session ids, tokens and API keys), blocked binaries such as `codex` or `gh` are shims that log and refuse, MCP servers are disabled, writes are confined to the run's cwd, and a timeout kills the whole process group. A stop signal (SIGTERM, SIGHUP) takes the same path as an interrupt, so the mirror with its copy of the login is removed and the agent does not run on alone.
+
+**The per-run audit** decides validity, not quality. Any failed rule makes the run invalid, never passed; an invalid run is retried once.
+
+- A0 process: exit 0, no timeout, a whole stream with one init and one result event. Anything less is not a complete run.
+- A1 init: `apiKeySource` is `none`, no MCP servers, the pinned model, only the allowed tools, only built-in plugins. A run billed elsewhere, or with extra capabilities, is not the run being compared.
+- A2 the subject's load: the skill was loaded from this run's mirror and its body is this arm's `SKILL.md` (followed by `ARGUMENTS: <args>` when the run's Skill call passed args, as the CLI appends them). This is the one rule that proves which copy ran; without it, both arms could silently run the live skill and every change would look "not worse".
+- A3 contamination: no tool input names the live skill, the cases or (outside a probe) the other arm. A run that read any of them was not working from its own copy alone.
+- A4 side effects: no write outside the cwd, no blocked binary, no permission denial (a denied read means the skill ran without its own files).
+- A5 result: the run reports success. A run that ended in an error produced no output worth comparing.
+
+A billing failure, a failed login preflight, loader failures (A2 or A3 after the retry) on two different cases, or an arm tree, a case or a judge changing mid-batch abort the batch, and so does an agent whose version differs at the end (it updated itself, so the arms may have run different versions). A read root that changes during the batch invalidates the runs of the cases that list it.
+
+**The verdict** compares each grader and check over valid runs only: `insufficient` when an arm has fewer than half its runs valid, `unjudged` for `llm` and `baseline`, `flaky` when the sidecar lists it, otherwise `regressed`, `improved` or `same` by pass rate. `not_worse` means no regression and no insufficient result anywhere: an improvement on one grader never offsets a regression on another. `targeted` reports, per feedback id, `fixed` (every base run fails the case, every candidate run passes), `not-discriminating` (the base already passes) or `not-fixed`. Levels: `fail` (exit 1) on an abort, a regression, an insufficient result or a blind pick for the base; `hold` (exit 3) while a person still has to pick; `pass` (exit 0). `--probe` runs `W/orig` in both arms to find unstable graders (which the owner copies into `flaky`) and to show that a targeted case fails on the base. Everything a batch writes goes to `W/eval/<batch>/`.
+
+**The blind pick.** `vurctos skill-pick make` writes a page for the cases a person judges: per case the prompt, then outputs A and B (final message and created files), drawn at random per case. Paths (as given, resolved, or written `~/...`) are replaced with neutral placeholders, an arm's directory with `<skill>` on both sides, and the page is refused if it would still reveal the workdir, an arm directory name, a run label such as `cand-1`, a hash or the batch id; its own text never names the arms. A page is made once per batch, so answers written on it always map through its own key. The key that maps A and B back is sealed beside it with its sha256 recorded. `vurctos skill-pick record --answers "1:A,2:same"` maps the answers through the key (refusing a key that changed) and recomputes the verdict.
+
 ## Skill Storage
 
 Repository-level skills live in the top-level `skills/` directory, each as its own SKILL.md directory. Project-specific skill notes can also live inside a project folder under `skills/` when the skill is still experimental.

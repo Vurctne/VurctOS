@@ -15,9 +15,11 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -4569,6 +4571,2212 @@ class VurctosSkillCheckTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 vurctos._skill_loop_config(self.root, True)
             self.assertIn("skill-loop.json", str(cm.exception.code), data)
+
+
+
+EVAL_STUB = Path(__file__).resolve().parent / "eval_stub.py"
+EVAL_SKILL_MD = (
+    "---\nname: caption-kit\ndescription: Writes a caption file for a "
+    "clip.\n---\n# Caption kit\n\n"
+    "1. Keep the source title.\n"
+    "2. Write the caption to out.md.\n\n"
+    "STUB-BEHAVIOR: write out.md TITLE: the source title\\nA short caption.\n"
+    "STUB-BEHAVIOR: result Wrote out.md with the title.\n")
+GRADER_TITLE = ('---\ntype: regex\npattern: "TITLE:"\n'
+                'target: { source: file, path: out.md }\n---\n')
+EVAL_LLM_GRADER = "---\ntype: llm\n---\nReads well.\n"
+JUDGE_FILES = {
+    "judge.py": (
+        "import json, os, sys\n"
+        "here = os.path.dirname(os.path.abspath(__file__))\n"
+        "sys.path.insert(0, here)\n"
+        "import judge_rules\n"
+        "with open(os.path.join(here, 'words.json'),\n"
+        "          encoding='utf-8') as fh:\n"
+        "    words = json.load(fh)\n"
+        "path = sys.argv[1]\n"
+        "text = open(path, encoding='utf-8').read() "
+        "if os.path.exists(path) else ''\n"
+        "sys.exit(0 if judge_rules.has_all(text, words) else 1)\n"),
+    "judge_rules.py": ("def has_all(text, words):\n"
+                       "    return all(w in text for w in words)\n"),
+    "words.json": '["TITLE:"]\n',
+}
+
+
+class VurctosSkillEvalTest(unittest.TestCase):
+    """The eval runner (skill-eval, skill-pick) against a fixture home in a
+    temp dir. mirror_home, the memory root (VURCTOS_HOME), the skill, the
+    cases and the judges are temp paths; the agent is cli/eval_stub.py
+    behind a small wrapper, so no model CLI ever runs. The skill is reached
+    through `.claude/skills/caption-kit -> ../../.agents/skills/caption-kit
+    -> <home>/work/caption-kit`, as in the static-check tests."""
+
+    NAME = "caption-kit"
+    MODEL = "stub-model-1"
+    ACCESS = [".claude/skills/caption-kit", ".agents/skills/caption-kit",
+              "work/caption-kit"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.r = Path(self.tmp.name)
+        self.h = self.r / "home"
+        self.root = self.h / ".vurctos"
+        self.live = self.h / "work" / self.NAME
+        self.evals = self.root / "skill-evals"
+        os.environ["VURCTOS_HOME"] = str(self.root)
+        w = self._write
+        w(self.live / "SKILL.md", EVAL_SKILL_MD)
+        w(self.live / "references" / "rules.md", "# Rules\n- Be short.\n")
+        w(self.h / ".agents" / "skills" / "other-skill" / "SKILL.md",
+          "# Other\n")
+        os.symlink(self.live, self.h / ".agents" / "skills" / self.NAME)
+        (self.h / ".claude" / "skills").mkdir(parents=True)
+        os.symlink(f"../../.agents/skills/{self.NAME}",
+                   self.h / ".claude" / "skills" / self.NAME)
+        os.symlink("../../.agents/skills/other-skill",
+                   self.h / ".claude" / "skills" / "other-skill")
+        w(self.h / ".claude" / "CLAUDE.md", "# Global rules\n")
+        w(self.h / ".claude" / "settings.json", '{"hooks": {}}\n')
+        w(self.h / ".claude" / "projects" / "p.jsonl", "{}\n")
+        w(self.h / ".claude.json", '{"login": "stub-login"}\n')
+        w(self.h / ".claude.json.backup", "{}\n")
+        w(self.h / "specs" / "style.md", "# Style\n")
+        w(self.root / "USER.md", "# User\n")
+        w(self.root / "MEMORY.md", "# Memory\n")
+        w(self.root / "sessions" / "2026-11-01.md",
+          "# 2026-11-01\n\n- [note] an old entry\n")
+        (self.root / "reflections").mkdir()
+        (self.root / "skill-work").mkdir()
+        self.ctl, self.log = self.r / "stub.json", self.r / "stub-log.jsonl"
+        self._control()
+        self.agent = w(self.r / "bin" / "claude", (
+            f"#!{sys.executable} -B\nimport runpy, sys\n"
+            f"sys.argv[1:1] = ['--stub-control', {str(self.ctl)!r}]\n"
+            f"runpy.run_path({str(EVAL_STUB)!r}, run_name='__main__')\n"))
+        os.chmod(self.agent, 0o755)
+        self._config()
+        self.w, self.wn = None, 0
+
+    def tearDown(self):
+        del os.environ["VURCTOS_HOME"]
+        self.tmp.cleanup()
+
+    # --- helpers ---
+
+    def _write(self, path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _config(self, **over):
+        cfg = {"skills_dirs": [str(self.h / ".claude" / "skills")],
+               "mirror_home": str(self.h), "eval_model": self.MODEL}
+        cfg.update(over)
+        self._write(self.root / "skill-loop.json", json.dumps(cfg))
+
+    def _control(self, **over):
+        ctl = {"log": str(self.log), "subject": self.NAME}
+        ctl.update(over)
+        self._write(self.ctl, json.dumps(ctl))
+
+    def _run(self, *argv):
+        """(exit code, stdout, error message plus stderr) of one call."""
+        out, err, code, msg = io.StringIO(), io.StringIO(), 0, ""
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                vurctos.main(list(argv))
+            except SystemExit as exc:
+                if isinstance(exc.code, str):
+                    code, msg = 1, exc.code
+                else:
+                    code = exc.code or 0
+        return code, out.getvalue(), msg + err.getvalue()
+
+    def _snapshot(self):
+        self.wn += 1
+        self.w = self.r / "wk" / f"w{self.wn}"
+        code, _, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                 "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        return self.w
+
+    def _cand(self, line):
+        """Append a line to W/cand/SKILL.md."""
+        with open(self.w / "cand" / "SKILL.md", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def _cand_edit(self, old, new):
+        p = self.w / "cand" / "SKILL.md"
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, new), encoding="utf-8")
+
+    def _live_edit(self, old, new):
+        p = self.live / "SKILL.md"
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, new), encoding="utf-8")
+
+    def _case(self, name, body="Write the caption for clip one.", fm=None,
+              graders=None, side=None, files=None):
+        fm = "allowed_tools: [Read, Write, Skill]\ntimeout_seconds: 30" \
+            if fm is None else fm
+        d = self.evals / self.NAME / name
+        self._write(d / "prompt.md", f"---\nname: {name}\n{fm}\n---\n{body}\n")
+        for g, text in ({"has-title": GRADER_TITLE} if graders is None
+                        else graders).items():
+            self._write(d / "graders" / f"{g}.md", text)
+        for rel, text in (files or {}).items():
+            self._write(d / "files" / rel, text)
+        sidecar = {"fails_on": "out.md has no TITLE line"}
+        sidecar.update(side or {})
+        self._write(self._sidecar(name), json.dumps(sidecar))
+        return d
+
+    def _sidecar(self, name):
+        return self.evals / self.NAME / "_sidecars" / f"{name}.json"
+
+    def _side_update(self, name, **over):
+        data = json.loads(self._sidecar(name).read_text(encoding="utf-8"))
+        data.update(over)
+        self._write(self._sidecar(name), json.dumps(data))
+
+    def _list(self):
+        code, out, msg = self._run("skill-eval", self.NAME, "--global",
+                                   "--workdir", str(self.r / "unused"),
+                                   "--list-cases", "--json")
+        return code, json.loads(out) if out.strip() else None, msg
+
+    def _hashes(self):
+        code, listing, msg = self._list()
+        return {c["name"]: c for c in listing["cases"]}
+
+    def _approve(self, *names):
+        rows = self._hashes()
+        for name in names:
+            self._side_update(name, status="approved",
+                              approved_hash=rows[name]["hash"])
+
+    def _judge(self, files=None):
+        """A judge directory under its content address, computed here
+        independently of the code under test."""
+        files = JUDGE_FILES if files is None else files
+        lines = sorted(f"{rel}\0{hashlib.sha256(t.encode()).hexdigest()}\n"
+                       for rel, t in files.items())
+        digest = hashlib.sha256("".join(lines).encode()).hexdigest()
+        for rel, text in files.items():
+            self._write(self.evals / "_judges" / digest / rel, text)
+        return digest
+
+    def _eval(self, *extra):
+        """(exit code, verdict or None, message) of skill-eval --json."""
+        code, out, msg = self._run(
+            "skill-eval", self.NAME, "--global", "--workdir", str(self.w),
+            "--agent-cmd", str(self.agent), "--json", *extra)
+        return code, json.loads(out) if out.strip() else None, msg
+
+    def _calls(self, kind="-p"):
+        if not self.log.exists():
+            return []
+        recs = [json.loads(ln) for ln in
+                self.log.read_text(encoding="utf-8").splitlines() if ln]
+        return [r for r in recs if kind in r.get("argv", [])
+                or (kind == "remember" and "remember" in r)]
+
+    def _batch_dir(self):
+        def key(d):
+            stamp, _, n = d.name.partition("-")
+            return stamp, int(n or 1)
+        root = Path(os.path.realpath(self.w)) / "eval"
+        return max((d for d in root.iterdir()
+                    if (d / "batch.json").is_file()), key=key)
+
+    def _results(self):
+        return json.loads((self._batch_dir() / "results.json").read_text(
+            encoding="utf-8"))
+
+    def _record(self, case, slot):
+        """The record of run dir <slot> (e.g. base-1, cand-1-r)."""
+        want = f"runs/{case}/{slot}"
+        found = [r for r in self._results() if r["dir"] == want]
+        self.assertEqual(len(found), 1, want)
+        return found[0]
+
+    def _rows(self, verdict):
+        return {(r["case"], r["grader"]): r for r in verdict["graders"]}
+
+    # --- config ---
+
+    def test_eval_config_keys_are_validated(self):
+        """The eval keys of skill-loop.json get the decided defaults, and a
+        malformed value is an error naming the file.
+        Fails if: a default differs from the decided one, or a malformed eval_model, eval_effort, eval_runs, eval_max_runs or eval_blocked_bins value is accepted."""
+        self._write(self.root / "skill-loop.json", "{}")
+        cfg = vurctos._skill_loop_config(self.root, True)
+        self.assertEqual(
+            (cfg["eval_model"], cfg["eval_effort"], cfg["eval_runs"],
+             cfg["eval_max_runs"], cfg["eval_blocked_bins"]),
+            (None, None, 2, 24, ["codex", "gh", "curl", "wget", "ssh", "scp",
+                                 "osascript", "open"]))
+        self._config(eval_effort="xhigh", eval_runs=3, eval_max_runs=9,
+                     eval_blocked_bins=[])
+        cfg = vurctos._skill_loop_config(self.root, True)
+        self.assertEqual((cfg["eval_effort"], cfg["eval_runs"],
+                          cfg["eval_max_runs"], cfg["eval_blocked_bins"]),
+                         ("xhigh", 3, 9, []))
+        bad = [{"eval_model": ""}, {"eval_model": 5}, {"eval_effort": "huge"},
+               {"eval_runs": 0}, {"eval_runs": True}, {"eval_runs": "2"},
+               {"eval_max_runs": -1}, {"eval_blocked_bins": "codex"},
+               {"eval_blocked_bins": ["a/b"]}, {"eval_blocked_bins": [""]},
+               {"eval_judges": 1}]
+        for data in bad:
+            self._write(self.root / "skill-loop.json", json.dumps(data))
+            with self.assertRaises(SystemExit) as cm:
+                vurctos._skill_loop_config(self.root, True)
+            self.assertIn("skill-loop.json", str(cm.exception.code), data)
+
+    def test_eval_needs_eval_model(self):
+        """Without eval_model, skill-eval stops before invoking anything and
+        names the config file.
+        Fails if: skill-eval runs (or invokes the agent) without eval_model, or the error does not name skill-loop.json."""
+        self._case("basic")
+        self._snapshot()
+        self._config(eval_model=None)
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("set eval_model in", msg)
+        self.assertIn("skill-loop.json", msg)
+        self.assertEqual(self.log.exists(), False)
+
+    # --- cases ---
+
+    def test_case_load_errors_name_the_file(self):
+        """Each malformed case is a load error naming its file; --list-cases
+        shows it and skill-eval stops before any run.
+        Fails if: any of these inputs loads without an error naming its file, or skill-eval invokes the agent although a selected case did not load."""
+        prompt = lambda d: d / "prompt.md"  # noqa: E731
+        side = lambda d: self._sidecar(d.name)  # noqa: E731
+        bad = {
+            "unknown prompt key": (
+                lambda: self._case("c", fm="allowed_tools: [Skill]\n"
+                                         "temperature: 1"), prompt),
+            "case.yaml": (lambda: self._write(
+                self._case("c") / "case.yaml", "name: c\n").parent,
+                lambda d: d / "case.yaml"),
+            "missing sidecar": (lambda: (self._case("c"), self._sidecar(
+                "c").unlink())[0], side),
+            "missing fails_on": (lambda: self._case("c", side={
+                "fails_on": ""}), side),
+            "expect_skill without Skill": (lambda: self._case(
+                "c", fm="allowed_tools: [Read, Write]"), side),
+            "unknown grader type": (lambda: self._case("c", graders={
+                "g": "---\ntype: judge_by_vibes\n---\n"}),
+                lambda d: d / "graders" / "g.md"),
+            "unparsable front matter": (lambda: self._case(
+                "c", fm="allowed_tools: [Read, Skill]\n  nested: 1"), prompt),
+            "read_roots with ..": (lambda: self._case("c", side={
+                "read_roots": ["specs/../.."]}), side),
+            "grader option of another type": (lambda: self._case(
+                "c", graders={"g": "---\ntype: regex\npattern: x\n"
+                                   "tool: Read\n---\n"}),
+                lambda d: d / "graders" / "g.md"),
+            "check named like a grader": (lambda: self._case("c", side={
+                "checks": [{"name": "has-title", "argv": ["true"]}]}), side),
+            "env key outside EVAL_": (lambda: self._case(
+                "c", fm="allowed_tools: [Skill]\nenv: { HOME: x }"), prompt),
+            "model differs": (lambda: self._case(
+                "c", fm="allowed_tools: [Skill]\nmodel: another-model"),
+                prompt),
+            "regex Python cannot compile": (lambda: self._case(
+                "c", graders={"g": '---\ntype: regex\npattern: "(x"\n---\n'}),
+                lambda d: d / "graders" / "g.md"),
+            "unknown sidecar key": (lambda: self._case("c", side={
+                "weight": 2}), side),
+        }
+        self._case("good")
+        self._snapshot()
+        for label, (make, where) in bad.items():
+            with self.subTest(label):
+                shutil.rmtree(self.evals / self.NAME / "c",
+                              ignore_errors=True)
+                d = Path(make())
+                code, listing, _ = self._list()
+                self.assertEqual(code, 1)
+                row = {c["name"]: c for c in listing["cases"]}["c"]
+                self.assertIn(str(where(d)), row["error"] or "")
+                self.assertIsNone({c["name"]: c for c in listing["cases"]}
+                                  ["good"]["error"])
+                code, verdict, msg = self._eval("--runs", "1")
+                self.assertEqual((code, verdict), (1, None))
+                self.assertIn(str(where(d)), msg)
+                self.assertEqual(self._calls(), [])
+
+    def test_front_matter_subset_parses(self):
+        """The front-matter reader takes the decided subset and nothing it
+        would read differently from YAML.
+        Fails if: a value of the subset (quoted strings, flow list, flow map, block list, integer, true/false/null) parses to anything else, or a trailing comment or a block map is accepted."""
+        text = ("---\n"
+                "a: plain words here\n"
+                "b: \"tab\\there \\\"q\\\"\"\n"
+                "c: 'it''s: fine'\n"
+                "d: [Read, \"Bash(git *)\", 'x, y']\n"
+                "e: { source: file, path: out/a.md }\n"
+                "f:\n  - one\n  - \"two words\"\n"
+                "g: -12\nh: true\ni: false\nj: null\nk: count:3\n"
+                "# a comment line\n"
+                "---\nThe body.\n\n")
+        data, body = vurctos._parse_front_matter(text, "p.md")
+        self.assertEqual(data, {
+            "a": "plain words here", "b": "tab\there \"q\"",
+            "c": "it's: fine", "d": ["Read", "Bash(git *)", "x, y"],
+            "e": {"source": "file", "path": "out/a.md"},
+            "f": ["one", "two words"], "g": -12, "h": True, "i": False,
+            "j": None, "k": "count:3"})
+        self.assertEqual(body, "The body.")
+        for bad in ("a: value # a comment", "target:\n  source: file",
+                    "a: b: c", "d: [a, [b]]", "a: |", "a: 'open",
+                    "  a: indented", "a: [x, y] tail", "a: 1\na: 2",
+                    "list:\n- [x]"):
+            with self.subTest(bad):
+                with self.assertRaises(vurctos._CaseError) as cm:
+                    vurctos._parse_front_matter(f"---\n{bad}\n---\nx\n",
+                                                "p.md")
+                self.assertIn("p.md:", str(cm.exception))
+        with self.assertRaises(vurctos._CaseError):
+            vurctos._parse_front_matter("---\na: 1\n", "p.md")
+
+    def test_case_hash_and_approval_staleness(self):
+        """An approval counts only while its hash equals the case hash, and
+        the hash covers inputs, graders, the sidecar and the judge.
+        Fails if: editing a file under files/, a grader, the sidecar's fails_on or a file of a referenced judge directory leaves the approval current, or changing status changes the hash."""
+        digest = self._judge()
+        d = self._case("basic", files={"input.txt": "clip one\n"}, side={
+            "checks": [{"name": "judge-title", "argv": [
+                sys.executable, "-B", "{judge:%s/judge.py}" % digest,
+                "{cwd}/out.md"]}]})
+        self._approve("basic")
+        first = self._hashes()["basic"]
+        self.assertTrue(first["approval_current"])
+        self._side_update("basic", status="provisional")
+        self.assertEqual(self._hashes()["basic"]["hash"], first["hash"])
+        self._side_update("basic", status="approved")
+        judge_words = self.evals / "_judges" / digest / "words.json"
+        edits = [(d / "files" / "input.txt", "clip two\n"),
+                 (d / "graders" / "has-title.md",
+                  GRADER_TITLE.replace("TITLE:", "TITLE")),
+                 (self._sidecar("basic"), None)]
+        for path, text in edits:
+            with self.subTest(str(path)):
+                before = path.read_text(encoding="utf-8")
+                if text is None:
+                    self._side_update("basic", fails_on="something else")
+                else:
+                    self._write(path, text)
+                row = self._hashes()["basic"]
+                self.assertNotEqual(row["hash"], first["hash"])
+                self.assertFalse(row["approval_current"])
+                self.assertEqual(row["approval"], "stale")
+                self._write(path, before)
+                self.assertTrue(self._hashes()["basic"]["approval_current"])
+        # A judge edit after pinning: the case no longer loads at all, and
+        # once re-pinned under its new address the old approval is stale.
+        files = dict(JUDGE_FILES, **{"words.json": '["TITLE"]\n'})
+        self._write(judge_words, files["words.json"])
+        code, listing, _ = self._list()
+        self.assertEqual(code, 1)
+        new = self._judge(files)
+        self._side_update("basic", checks=[{"name": "judge-title", "argv": [
+            sys.executable, "-B", "{judge:%s/judge.py}" % new,
+            "{cwd}/out.md"]}])
+        self._side_update("basic", approved_hash=first["hash"])
+        row = self._hashes()["basic"]
+        self.assertNotEqual(row["hash"], first["hash"])
+        self.assertFalse(row["approval_current"])
+
+    def test_list_cases_reports_and_runs_nothing(self):
+        """--list-cases prints every case with its status, hash, approval,
+        graders, checks and load errors, and runs nothing.
+        Fails if: --list-cases invokes the agent, needs eval_model, or omits a case's status, hash, approval state, graders, checks or load error."""
+        digest = self._judge()
+        self._case("alpha", graders={
+            "has-title": GRADER_TITLE,
+            "tone": "---\ntype: llm\n---\nReads naturally.\n"}, side={
+            "checks": [{"name": "judge-title", "argv": [
+                "python3", "{judge:%s/judge.py}" % digest, "{cwd}/out.md"]}],
+            "targets": ["2026-11-01#1"]})
+        self._case("beta")
+        self._approve("alpha", "beta")
+        self._side_update("beta", fails_on="changed after approval")
+        self._case("gamma", side={"fails_on": ""})
+        self._config(eval_model=None)
+        code, out, msg = self._run("skill-eval", self.NAME, "--global",
+                                   "--workdir", str(self.r / "none"),
+                                   "--list-cases")
+        self.assertEqual(code, 1, msg)
+        rows = self._hashes()
+        self.assertIn(f"  alpha: approved, hash {rows['alpha']['hash']}, "
+                      f"approval current, judge runner", out)
+        self.assertIn("    graders: has-title (regex), tone (llm, unjudged)",
+                      out)
+        self.assertIn("    checks: judge-title", out)
+        self.assertIn("    targets: 2026-11-01#1", out)
+        self.assertIn(f"  beta: approved, hash {rows['beta']['hash']}, "
+                      f"approval stale", out)
+        self.assertIn(f"  gamma: load error: {self._sidecar('gamma')}", out)
+        self.assertEqual(self.log.exists(), False)
+
+    def test_unknown_case_name_is_an_error(self):
+        """--case with a name that is no case stops before any run.
+        Fails if: an unknown --case name is skipped silently, or the agent is invoked."""
+        self._case("basic")
+        self._snapshot()
+        code, verdict, msg = self._eval("--case", "basic", "--case", "nope")
+        self.assertEqual((code, verdict), (1, None))
+        self.assertIn("no case named 'nope'", msg)
+        self.assertEqual(self._calls(), [])
+
+    # --- judges ---
+
+    def test_judge_directory_edit_stops_the_batch(self):
+        """A judge directory is pinned by the hash of all its files: editing
+        a sibling of the referenced script stops the batch.
+        Fails if: a judge directory whose recomputed hash differs from its name (a sibling file edited) lets the batch start, or the error does not name the directory."""
+        digest = self._judge()
+        self._case("basic", side={"checks": [{"name": "judge-title", "argv": [
+            sys.executable, "-B", "{judge:%s/judge.py}" % digest,
+            "{cwd}/out.md"]}]})
+        self._snapshot()
+        self.assertEqual(self._list()[0], 0)
+        jdir = self.evals / "_judges" / digest
+        self._write(jdir / "judge_rules.py",
+                    JUDGE_FILES["judge_rules.py"] + "# edited\n")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual((code, verdict), (1, None))
+        self.assertIn(str(jdir), msg)
+        self.assertEqual(self._calls(), [])
+        self.assertEqual(self._calls("auth"), [])
+
+    def test_pinned_judge_is_used_never_the_arm_copy(self):
+        """A check runs the pinned judge from evals_dir; a judge.py in the
+        arm tree or the cwd that always passes is never used.
+        Fails if: a check runs a judge file from the arm tree or the cwd (or anything but `<evals_dir>/_judges/<hash>/<relpath>`), or a pinned judge exiting 1 is graded as passed."""
+        digest = self._judge()
+        always = "import sys\nsys.exit(0)\n"
+        self._write(self.live / "judge.py", always)
+        self._write(self.live / "scripts" / "judge.py", always)
+        self._live_edit("write out.md TITLE: the source title",
+                        "write out.md the source title")
+        self._case("basic", graders={}, files={"judge.py": always}, side={
+            "checks": [{"name": "judge-title", "argv": [
+                sys.executable, "-B", "{judge:%s/judge.py}" % digest,
+                "{cwd}/out.md"]}]})
+        self._snapshot()
+        self._cand_edit("write out.md the source title",
+                        "write out.md TITLE: the source title")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(self._record("basic", "base-1")["grades"],
+                         {"judge-title": False})
+        self.assertEqual(self._record("basic", "base-1")["checks"]
+                         ["judge-title"]["exit"], 1)
+        self.assertEqual(self._record("basic", "cand-1")["grades"],
+                         {"judge-title": True})
+        self.assertEqual(self._rows(verdict)[("basic", "judge-title")]
+                         ["status"], "improved")
+        self.assertFalse((self.evals / "_judges" / digest /
+                          "__pycache__").exists())
+
+    # --- run cap, argv, environment ---
+
+    def test_run_cap_refuses_before_any_invocation(self):
+        """Planned runs over the cap are refused before the agent is
+        invoked, and the count is printed.
+        Fails if: a batch planning more runs than --max-runs (or eval_max_runs) invokes the agent at all, or the refusal does not print the planned count."""
+        self._case("one")
+        self._case("two")
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "3", "--max-runs", "10")
+        self.assertEqual((code, verdict), (1, None))
+        self.assertIn("12 planned runs exceed the cap of 10", msg)
+        self._config(eval_max_runs=7)
+        code, verdict, msg = self._eval()
+        self.assertIn("8 planned runs exceed the cap of 7", msg)
+        self.assertEqual(self.log.exists(), False)
+        self.assertFalse((self.w / "eval").exists())
+
+    def test_argv_is_exactly_the_decided_one(self):
+        """The agent gets exactly the decided flags, in order, plus --effort
+        and --append-system-prompt when set.
+        Fails if: the argv differs from the decided flags and order, a forbidden flag (--bare, --dangerously-skip-permissions, --add-dir) appears, or --effort / --append-system-prompt are missing when set."""
+        self._case("basic", fm="allowed_tools: [Read, Write, Skill]\n"
+                               "append_system_prompt: Be brief.")
+        self._case("bare", fm="allowed_tools: []\ntimeout_seconds: 20",
+                   graders={}, side={"expect_skill": False})
+        self._config(eval_effort="high")
+        self._snapshot()
+        self.assertEqual(self._eval("--runs", "1")[0], 0)
+        calls = self._calls()
+        self.assertEqual(len(calls), 4)
+        common = ["--output-format", "stream-json", "--verbose", "--model",
+                  self.MODEL, "--permission-mode", "acceptEdits",
+                  "--permission-prompts", "none", "--no-session-persistence",
+                  "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        self.assertEqual(calls[0]["argv"], [
+            "-p", "Write the caption for clip one.", *common, "--tools", "",
+            "--effort", "high"])
+        self.assertEqual(calls[2]["argv"], [
+            "-p", "Write the caption for clip one.", *common, "--tools",
+            "Read,Write,Skill", "--effort", "high",
+            "--append-system-prompt", "Be brief."])
+        for call in calls:
+            for flag in ("--bare", "--dangerously-skip-permissions",
+                         "--add-dir"):
+                self.assertNotIn(flag, call["argv"])
+        batch = json.loads((self._batch_dir() / "batch.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(batch["agent"], str(self.agent))
+
+    def test_child_env_is_an_allowlist(self):
+        """The agent's environment is an allowlist: HOME is the mirror,
+        PATH starts with the shims, plus the case's EVAL_ variables;
+        nothing else from the parent leaks.
+        Fails if: any parent variable outside the allowlist (CLAUDE_CODE_SESSION_ID, OPENAI_API_KEY, ANTHROPIC_API_KEY) reaches the agent, or HOME, VURCTOS_HOME, PATH (shims first) or the case's EVAL_ env is not set as decided."""
+        self._case("basic", fm="allowed_tools: [Read, Write, Skill]\n"
+                               "env: { EVAL_CLIP: one, EVAL_N: 2 }")
+        self._snapshot()
+        leak = {"CLAUDE_CODE_SESSION_ID": "s-1", "OPENAI_API_KEY": "k-1",
+                "ANTHROPIC_API_KEY": "k-2", "LANG": "C.UTF-8"}
+        with unittest.mock.patch.dict(os.environ, leak):
+            self.assertEqual(self._eval("--runs", "1")[0], 0)
+        allowed = {"HOME", "VURCTOS_HOME", "PATH", "USER", "LOGNAME", "SHELL",
+                   "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "TZ",
+                   "EVAL_CLIP", "EVAL_N"}
+        added_by_the_os = {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_"}
+        for call in self._calls() + self._calls("auth"):
+            env = call["env"]
+            self.assertEqual(set(env) - allowed - added_by_the_os, set())
+            for name in ("CLAUDE_CODE_SESSION_ID", "OPENAI_API_KEY",
+                         "ANTHROPIC_API_KEY"):
+                self.assertNotIn(name, env)
+            self.assertEqual(env["LANG"], "C.UTF-8")
+            self.assertTrue(env["HOME"].endswith("/home"))
+            self.assertTrue(env["VURCTOS_HOME"].startswith(env["HOME"]))
+            self.assertEqual(env["PATH"].split(os.pathsep)[0],
+                             str(Path(env["HOME"]).parent / "shims"))
+        run_env = self._calls()[0]["env"]
+        self.assertEqual((run_env["EVAL_CLIP"], run_env["EVAL_N"]),
+                         ("one", "2"))
+        self.assertTrue(run_env["HOME"].startswith(
+            str(self._batch_dir() / "runs" / "basic" / "base-1")))
+
+    # --- the mirror ---
+
+    def test_mirror_layout(self):
+        """Each run's mirror: .claude holds only skills, CLAUDE.md and the
+        generated settings; .claude.json is a copy and its siblings are
+        gone; the memory root has copied files, an empty sessions/ and no
+        evals_dir or work_dir; the settings allow both spellings of the
+        subject and of a read root; the mirror is removed after the run.
+        Fails if: the mirror's .claude holds anything but skills, CLAUDE.md and settings.json, .claude.json is a link or missing, a .claude.json sibling is present, the memory root lacks copied files or an empty sessions/ or still reaches evals_dir or work_dir, the settings miss the mirror or real spelling of the subject or of a read root, or the mirror survives the run."""
+        self._case("basic", side={"read_roots": ["specs"],
+                                  "allow_rules": ["Bash(ls *)"]})
+        self._snapshot()
+        seen = []
+        real_run = vurctos._eval_run_agent
+
+        def inspect(argv, cwd, env, timeout, out, err):
+            home = Path(env["HOME"])
+            claude = home / ".claude"
+            settings = json.loads((claude / "settings.json").read_text(
+                encoding="utf-8"))
+            vroot = Path(env["VURCTOS_HOME"])
+            seen.append({
+                "home": home, "claude": sorted(os.listdir(claude)),
+                "claude_md": os.readlink(claude / "CLAUDE.md"),
+                "skill": os.path.realpath(claude / "skills" / self.NAME),
+                "other": os.readlink(claude / "skills" / "other-skill"),
+                "cj_link": os.path.islink(home / ".claude.json"),
+                "cj": (home / ".claude.json").read_text(encoding="utf-8"),
+                "cj_siblings": sorted(e for e in os.listdir(home)
+                                      if e.startswith(".claude.json")),
+                "vroot": vroot,
+                "vroot_entries": sorted(os.listdir(vroot)),
+                "user_md_link": os.path.islink(vroot / "USER.md"),
+                "sessions": os.listdir(vroot / "sessions"),
+                "reflections": os.path.islink(vroot / "reflections"),
+                "allow": settings["permissions"]["allow"],
+                "hooks": "hooks" in settings})
+            return real_run(argv, cwd, env, timeout, out, err)
+        with unittest.mock.patch.object(vurctos, "_eval_run_agent",
+                                        side_effect=inspect):
+            code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(len(seen), 2)
+        wr = Path(os.path.realpath(self.w))
+        for s, arm in zip(seen, ("orig", "cand")):
+            home = s["home"]
+            self.assertEqual(s["claude"], ["CLAUDE.md", "settings.json",
+                                           "skills"])
+            self.assertEqual(s["claude_md"], str(self.h / ".claude" /
+                                                 "CLAUDE.md"))
+            self.assertEqual(s["skill"], str(wr / arm))
+            self.assertEqual(s["other"], str(self.h / ".claude" / "skills" /
+                                             "other-skill"))
+            self.assertEqual((s["cj_link"], s["cj"], s["cj_siblings"]),
+                             (False, '{"login": "stub-login"}\n',
+                              [".claude.json"]))
+            self.assertEqual(s["vroot"], home / ".vurctos")
+            self.assertEqual(s["vroot_entries"],
+                             ["MEMORY.md", "USER.md", "reflections",
+                              "sessions", "skill-loop.json"])
+            self.assertEqual((s["user_md_link"], s["sessions"],
+                              s["reflections"], s["hooks"]),
+                             (False, [], True, False))
+            self.assertEqual(s["allow"], [
+                f"Read(/{home}/{a}/**)" for a in self.ACCESS] + [
+                f"Read(/{wr / arm}/**)", f"Read(/{home}/specs/**)",
+                f"Read(/{os.path.realpath(self.h / 'specs')}/**)",
+                "Bash(ls *)"])
+            self.assertFalse(os.path.lexists(home))
+        self.assertEqual(sorted(os.listdir(seen[0]["home"].parent)),
+                         ["cwd", "run.json", "shim.log", "stderr.txt",
+                          "transcript.jsonl"])
+
+    def test_memory_root_outside_mirror_home(self):
+        """A memory root that does not lie under mirror_home is built at
+        <run>/vurctos with the same rules, and removed after the run.
+        Fails if: a memory root outside mirror_home is not built at <run dir>/vurctos (copied files, an empty sessions/, no evals_dir), VURCTOS_HOME does not point at it, or it survives the run."""
+        self.root = self.r / "vroot"
+        self.evals = self.root / "skill-evals"
+        os.environ["VURCTOS_HOME"] = str(self.root)
+        self._write(self.root / "USER.md", "# User elsewhere\n")
+        self._write(self.root / "sessions" / "2026-11-02.md", "# day\n")
+        self._config()
+        self._case("basic")
+        self._snapshot()
+        seen = []
+        real_run = vurctos._eval_run_agent
+
+        def inspect(argv, cwd, env, timeout, out, err):
+            vroot = Path(env["VURCTOS_HOME"])
+            seen.append((vroot, sorted(os.listdir(vroot)),
+                         os.listdir(vroot / "sessions"),
+                         os.path.islink(vroot / "USER.md")))
+            return real_run(argv, cwd, env, timeout, out, err)
+        with unittest.mock.patch.object(vurctos, "_eval_run_agent",
+                                        side_effect=inspect):
+            code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 0, msg)
+        run_dir = self._batch_dir() / "runs" / "basic" / "base-1"
+        self.assertEqual(seen[0], (run_dir / "vurctos", [
+            "USER.md", "sessions", "skill-loop.json"], [], False))
+        self.assertFalse(os.path.lexists(run_dir / "vurctos"))
+
+    def test_day_log_isolation(self):
+        """A `vurctos remember --global` inside a run lands in the run's
+        copy of the memory root, never in the live day logs.
+        Fails if: a `vurctos remember --global` run inside an eval reaches the live memory root's day logs or index."""
+        self._case("basic", body="Note it.\nSTUB-BEHAVIOR: remember "
+                                 "a lesson from inside an eval")
+        self._snapshot()
+        before = sorted(os.listdir(self.root / "sessions"))
+        log = (self.root / "sessions" / "2026-11-01.md").read_bytes()
+        self.assertEqual(self._eval("--runs", "1")[0], 0)
+        self.assertEqual(sorted(os.listdir(self.root / "sessions")), before)
+        self.assertEqual((self.root / "sessions" / "2026-11-01.md")
+                         .read_bytes(), log)
+        notes = self._calls("remember")
+        self.assertEqual(len(notes), 2)
+        for n in notes:
+            self.assertEqual(n["remember"]["rc"], 0, n["remember"]["out"])
+            self.assertIn(str(self._batch_dir() / "runs" / "basic"),
+                          n["remember"]["out"])
+            self.assertNotIn(str(self.root / "sessions"),
+                             n["remember"]["out"])
+
+    # --- the per-run audit ---
+
+    def _one_run(self, behavior=None, case_side=None, fm=None, slot="base-1",
+                 extra=()):
+        """Snapshot, add behavior lines to both arms' prompt, run 1 run per
+        arm, return the record of slot."""
+        body = "Write the caption for clip one." + (
+            "".join(f"\nSTUB-BEHAVIOR: {b}" for b in behavior or []))
+        self._case("basic", body=body, side=case_side, fm=fm)
+        self._snapshot()
+        self._eval("--runs", "1", *extra)
+        return self._record("basic", slot)
+
+    def test_a0_process_failures_invalidate(self):
+        """A0: a nonzero exit, a line that is not JSON, or a timeout makes
+        the run invalid.
+        Fails if: a nonzero exit, a line that is not JSON, or a timeout leaves the run valid."""
+        cases = {"exit 3": ("A0 process: exit code 3", None),
+                 "garbage": ("A0 process: transcript line", None),
+                 "sleep 5": ("A0 process: timeout",
+                             "allowed_tools: [Read, Write, Skill]\n"
+                             "timeout_seconds: 1")}
+        for directive, (reason, fm) in cases.items():
+            with self.subTest(directive):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                start = time.monotonic()
+                rec = self._one_run([directive], fm=fm,
+                                    extra=("--max-runs", "2"))
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith(reason)
+                                    for r in rec["invalid"]), rec["invalid"])
+                self.assertEqual(rec["grades"], {})
+                self.assertLess(time.monotonic() - start, 30)
+
+    def test_timeout_kills_the_process_group(self):
+        """On timeout the whole process group dies, including a process the
+        agent started.
+        Fails if: on timeout only the agent process is killed and a process it started survives, or the run is not invalid with a timeout reason."""
+        script = self._write(self.r / "spawn.py", (
+            "import json, subprocess, sys\n"
+            "p = subprocess.Popen(['sleep', '60'])\n"
+            "with open(sys.argv[1], 'a') as fh:\n"
+            "    fh.write(json.dumps({'spawned': p.pid}) + '\\n')\n"))
+        self._case("kids", fm="allowed_tools: [Read, Write, Skill]\n"
+                              "timeout_seconds: 2")
+        self._snapshot()
+        self._cand(f"STUB-BEHAVIOR: run {sys.executable} -B {script} "
+                   f"{self.log}\nSTUB-BEHAVIOR: sleep 30")
+        self._eval("--runs", "1", "--max-runs", "2")
+        rec = self._record("kids", "cand-1")
+        self.assertIn("A0 process: timeout", rec["invalid"])
+        self.assertTrue(rec["timed_out"])
+        pids = [json.loads(ln)["spawned"] for ln in self.log.read_text(
+            encoding="utf-8").splitlines() if "spawned" in ln]
+        self.assertTrue(pids)
+        deadline = time.monotonic() + 5
+        alive = list(pids)
+        while alive and time.monotonic() < deadline:
+            alive = []
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    alive.append(pid)
+            if alive:
+                time.sleep(0.1)
+        self.assertEqual(alive, [])
+
+    def test_a1_init_rules(self):
+        """A1: MCP servers, another model, a tool outside allowed_tools or a
+        plugin that is not built in make the run invalid.
+        Fails if: an init event with MCP servers, another model, a tool outside allowed_tools or a plugin that is not built in leaves the run valid."""
+        cases = {
+            'init {"mcp_servers": [{"name": "x", "status": "connected"}]}':
+                "A1 init: mcp_servers is not empty",
+            'init {"model": "another-model"}': "A1 init: model is",
+            'init {"tools": ["Read", "Write", "Skill", "Bash"]}':
+                "A1 init: tools outside allowed_tools: Bash",
+            'init {"plugins": [{"name": "p", "path": "/x/p"}]}':
+                "A1 init: a plugin that is not built in",
+        }
+        for directive, reason in cases.items():
+            with self.subTest(directive):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                rec = self._one_run([directive])
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith(reason)
+                                    for r in rec["invalid"]), rec["invalid"])
+
+    def test_a2_wrong_directory_is_invalid(self):
+        """A2: a subject load reported from anywhere but this run's mirror
+        spelling of an access path is invalid.
+        Fails if: a load of the subject from the live directory (or any directory other than `<mirror>/<access path>`) leaves the run valid."""
+        rec = self._one_run([f"load-dir {self.live}"])
+        self.assertIn(f"A2 loader: loaded from {self.live}", rec["invalid"])
+        shutil.rmtree(self.evals)
+        rec = self._one_run(["load-dir {home}/.agents/skills/caption-kit"])
+        self.assertTrue(rec["valid"], rec["invalid"])
+
+    def test_a2_body_from_the_other_arm_is_invalid(self):
+        """A2: a load whose body is not this arm's SKILL.md body (here the
+        base body reported in a cand run) is invalid.
+        Fails if: a skill load whose body differs from the arm's SKILL.md (front matter removed, whitespace collapsed) leaves the run valid."""
+        self._case("basic")
+        self._snapshot()
+        orig = Path(os.path.realpath(self.w)) / "orig" / "SKILL.md"
+        self._cand(f"STUB-BEHAVIOR: load-body-file {orig}")
+        self._eval("--runs", "1")
+        self.assertTrue(self._record("basic", "base-1")["valid"])
+        cand = self._record("basic", "cand-1")
+        self.assertIn("A2 loader: loaded body differs from this arm",
+                      cand["invalid"])
+
+    def test_a2_skill_args_suffix_is_this_arms_load(self):
+        """A2: when the Skill call passes args, the real CLI appends
+        `ARGUMENTS: <args>` to the loaded body; that is still this arm's
+        load. Any other appended text is not.
+        Fails if: a load of this arm's body followed by `ARGUMENTS: <the args of this run's Skill call>` is invalid, or a load followed by ARGUMENTS text that no Skill call of the run passed is valid."""
+        rec = self._one_run(["skill-args translate clip one"])
+        self.assertTrue(rec["valid"], rec["invalid"])
+        shutil.rmtree(self.evals)
+        rec = self._one_run(["skill-args translate clip one",
+                             "load-args something else"])
+        self.assertIn("A2 loader: loaded body differs from this arm",
+                      rec["invalid"])
+
+    def test_a2_no_load_with_expect_skill_is_invalid(self):
+        """A2: with expect_skill (the default), a run that never loads the
+        subject is invalid; with expect_skill false it may stay valid.
+        Fails if: a run without a subject load is valid while expect_skill is true, or is invalid only for that reason while expect_skill is false."""
+        rec = self._one_run(["no-skill"])
+        self.assertIn("A2 loader: subject skill not loaded", rec["invalid"])
+        shutil.rmtree(self.evals)
+        rec = self._one_run(["no-skill"], {"expect_skill": False})
+        self.assertTrue(rec["valid"], rec["invalid"])
+
+    def test_a3_live_and_other_arm_paths_are_contamination(self):
+        """A3: a tool input naming the live subject, an access path under
+        mirror_home, evals_dir or the other arm makes the run invalid.
+        Fails if: a Read of the live SKILL.md, of `<mirror_home>/<access path>`, of evals_dir or of the other arm's tree leaves the run valid."""
+        # The live tree's real path lies outside mirror_home here, so only
+        # the real-path rule can catch a read through it.
+        store = self.r / "store" / self.NAME
+        store.parent.mkdir()
+        shutil.move(str(self.live), str(store))
+        os.symlink(store, self.live)
+        wr = lambda: Path(os.path.realpath(self.w))  # noqa: E731
+        paths = {
+            "live realpath": lambda: f"{os.path.realpath(self.live)}/SKILL.md",
+            "access path": lambda: f"{self.h}/.claude/skills/{self.NAME}",
+            "evals_dir": lambda: f"{self.evals}/{self.NAME}/basic/prompt.md",
+            "other arm": lambda: f"{wr() / 'cand'}/SKILL.md",
+        }
+        for label, path in paths.items():
+            with self.subTest(label):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                self._case("basic")
+                self._snapshot()
+                body = (self.evals / self.NAME / "basic" / "prompt.md")
+                text = body.read_text(encoding="utf-8")
+                self._write(body, text + f"STUB-BEHAVIOR: read {path()}\n")
+                self._eval("--runs", "1", "--case", "basic")
+                rec = self._record("basic", "base-1")
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith("A3 contamination")
+                                    for r in rec["invalid"]), rec["invalid"])
+
+    def test_a3_shared_name_prefix_is_not_contamination(self):
+        """A3 matches a forbidden path only when it ends there: a path that
+        merely shares the subject's name as a prefix is fine.
+        Fails if: a path such as `<subject>-extra` next to the live subject counts as contamination."""
+        rec = self._one_run([
+            f"read {self.h}/.agents/skills/{self.NAME}-extra/SKILL.md",
+            f"read {os.path.realpath(self.live)}-extra/notes.md"])
+        self.assertTrue(rec["valid"], rec["invalid"])
+
+    def test_a4_side_effects_invalidate(self):
+        """A4: a Write outside the cwd, a blocked binary, or a permission
+        denial makes the run invalid.
+        Fails if: a Write outside the run's cwd, a call to a blocked binary (non-empty shim.log), or a permission denial in the result leaves the run valid."""
+        cases = {
+            "write ../escape.md x": "A4 side effect: Write outside the cwd",
+            "run codex exec do-it": "A4 side effect: a blocked binary",
+            'result-event {"permission_denials": [{"tool_name": "Read", '
+            '"tool_use_id": "t", "tool_input": {}}]}':
+                "A4 side effect: 1 permission denial(s) (Read)",
+        }
+        for directive, reason in cases.items():
+            with self.subTest(directive):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                rec = self._one_run([directive])
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith(reason)
+                                    for r in rec["invalid"]), rec["invalid"])
+        log = self._batch_dir() / "runs" / "basic" / "base-1" / "shim.log"
+        self.assertEqual(log.read_text(encoding="utf-8"), "")
+        shutil.rmtree(self.evals)
+        self._one_run(["run codex exec do-it"])
+        log = self._batch_dir() / "runs" / "basic" / "base-1" / "shim.log"
+        self.assertEqual(log.read_text(encoding="utf-8"), "codex exec do-it\n")
+
+    def test_a5_result_error_is_invalid(self):
+        """A5: a result event with is_error true or a subtype other than
+        success makes the run invalid.
+        Fails if: a result event with is_error true, or with a subtype other than success, leaves the run valid."""
+        for directive in ('result-event {"is_error": true}',
+                          'result-event {"subtype": "error_max_turns"}'):
+            with self.subTest(directive):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                rec = self._one_run([directive])
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith("A5 result")
+                                    for r in rec["invalid"]), rec["invalid"])
+
+    def test_invalid_run_is_retried_exactly_once(self):
+        """An invalid run is retried once; the retry's result replaces the
+        first attempt's; a run still invalid stays invalid.
+        Fails if: an invalid run is not retried, or is retried more than once, or the retry's result does not replace the first attempt's."""
+        self._one_run(['init {"mcp_servers": [{"name": "x"}]}'])
+        self.assertEqual(len(self._calls()), 4)
+        self.assertEqual([r["dir"].rsplit("/", 1)[1] for r in
+                          self._results()],
+                         ["base-1", "base-1-r", "cand-1", "cand-1-r"])
+        verdict = json.loads((self._batch_dir() / "verdict.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual([(r["arm"], r["run"]) for r in
+                          verdict["invalid_runs"]], [("base", 1),
+                                                     ("cand", 1)])
+        os.remove(self.log)
+        shutil.rmtree(self.evals)
+        self._one_run(['odd init {"mcp_servers": [{"name": "x"}]}'])
+        self.assertEqual(len(self._calls()), 4)
+        self.assertFalse(self._record("basic", "base-1")["valid"])
+        self.assertTrue(self._record("basic", "base-1-r")["valid"])
+        verdict = json.loads((self._batch_dir() / "verdict.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(verdict["invalid_runs"], [])
+        self.assertEqual(verdict["cases"][0]["runs"]["base"],
+                         [{"run": 1, "dir": "runs/basic/base-1-r",
+                           "valid": True}])
+        self.assertEqual(verdict["level"], "pass")
+
+    def test_retry_beyond_the_cap_stays_invalid(self):
+        """Retries never take the -p invocations past the cap: a run that
+        would need one stays invalid, and its reasons say why.
+        Fails if: a retry pushes the number of agent runs over the cap, or the run left unretried does not say the cap stopped the retry."""
+        rec = self._one_run(['init {"mcp_servers": [{"name": "x"}]}'],
+                            extra=("--max-runs", "2"))
+        self.assertEqual(len(self._calls()), 2)
+        self.assertIn("not retried: the run cap (2) leaves no room for a "
+                      "retry", rec["invalid"])
+
+    def test_billing_abort_after_one_invocation(self):
+        """A run that does not ride the subscription aborts the batch at
+        once: no retry, no further run.
+        Fails if: a run whose init reports an apiKeySource other than none is retried or followed by any other agent run, or the verdict is not fail with the reason."""
+        self._case("one")
+        self._case("two")
+        self._snapshot()
+        self._cand('STUB-BEHAVIOR: init {"apiKeySource": "ANTHROPIC_API_KEY"}')
+        code, verdict, msg = self._eval("--runs", "2")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self._calls()), 2)
+        self.assertEqual(verdict["level"], "fail")
+        self.assertTrue(verdict["aborted"].startswith("billing:"))
+        self.assertFalse(verdict["not_worse"])
+        self.assertIn("A1 billing: apiKeySource is 'ANTHROPIC_API_KEY', not "
+                      "'none'", self._record("one", "cand-1")["invalid"])
+
+    def test_login_preflight_abort(self):
+        """A login preflight that does not report loggedIn true aborts the
+        batch before any run; it runs with a run's mirror as HOME.
+        Fails if: the batch invokes `-p` after `auth status --json` did not report loggedIn true, or the preflight does not run with the eval mirror and allowlist environment."""
+        self._case("basic")
+        self._snapshot()
+        self._control(auth={"loggedIn": False})
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 1)
+        self.assertEqual(self._calls(), [])
+        self.assertTrue(verdict["aborted"].startswith("login preflight"))
+        self.assertIn("loggedIn: false", verdict["aborted"])
+        auth = self._calls("auth")
+        self.assertEqual(len(auth), 1)
+        self.assertTrue(auth[0]["env"]["HOME"].startswith(
+            str(self._batch_dir() / "preflight")))
+        self.assertFalse((self._batch_dir() / "preflight").exists())
+        self.assertEqual(verdict["level"], "fail")
+
+    def test_loader_failures_on_two_cases_abort(self):
+        """A2 or A3 still failing after the retry on two different cases
+        judges the loader broken: no further run.
+        Fails if: the batch keeps running after loader failures (A2 or A3 after the retry) on two different cases."""
+        bad = f"\nSTUB-BEHAVIOR: read {os.path.realpath(self.live)}/SKILL.md"
+        for name in ("a1", "a2", "a3"):
+            self._case(name, body="Write it." + bad)
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 1)
+        self.assertTrue(verdict["aborted"].startswith("loader judged broken"),
+                        verdict["aborted"])
+        self.assertEqual(len(self._calls()), 6)
+        self.assertEqual({r["case"] for r in self._results()}, {"a1", "a2"})
+
+    def test_arm_tree_change_aborts(self):
+        """A change to an arm tree during the batch aborts it.
+        Fails if: the batch continues after an arm tree's hash changed, or the verdict is not fail with the reason."""
+        self._case("one")
+        self._case("two")
+        self._snapshot()
+        target = Path(os.path.realpath(self.w)) / "cand" / "references" / \
+            "rules.md"
+        self._cand(f"STUB-BEHAVIOR: poke {target} - edited mid-batch\\n")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("cand arm tree", verdict["aborted"])
+        self.assertEqual(len(self._calls()), 2)
+
+    def test_read_root_drift_invalidates_the_runs_listing_it(self):
+        """A read root that changes during the batch invalidates every run
+        of every case that lists it, and only those.
+        Fails if: a run of a case listing a read root that changed during the batch stays valid, or a run of a case not listing it is invalidated."""
+        self._case("reads-specs", side={"read_roots": ["specs"]})
+        self._case("writes-specs", body=(
+            "Write it.\nSTUB-BEHAVIOR: poke "
+            f"{os.path.realpath(self.h / 'specs' / 'style.md')} - more\\n"))
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 1)
+        for slot in ("base-1", "cand-1"):
+            rec = self._record("reads-specs", slot)
+            self.assertFalse(rec["valid"])
+            self.assertIn("read root changed during the batch: specs",
+                          rec["invalid"])
+            self.assertEqual(rec["grades"], {})
+            self.assertTrue(self._record("writes-specs", slot)["valid"])
+        self.assertEqual(self._rows(verdict)[("reads-specs", "has-title")]
+                         ["status"], "insufficient")
+
+    # --- grading ---
+
+    def test_regex_grader_modes_and_targets(self):
+        """regex: contains, not_contains and count:N, over the final
+        message, the trace, the created file list and a file.
+        Fails if: not_contains or count:N is graded wrongly, or a target reads the wrong text."""
+        g = lambda body: "---\ntype: regex\n" + body + "\n---\n"  # noqa
+        graders = {
+            "msg-has": g('pattern: "with the title"'),
+            "msg-not": g('pattern: "(?i)error"\nmatch: not_contains'),
+            "msg-not-fails": g('pattern: "title"\nmatch: not_contains'),
+            "count-2": g('pattern: "o"\nmatch: count:2\nflags: i\n'
+                         'target: { source: file, path: notes/n.md }'),
+            "count-wrong": g('pattern: "o"\nmatch: count:3\n'
+                             'target: { source: file, path: notes/n.md }'),
+            "count-1": g('pattern: "o"\nmatch: count:1\nflags: i\n'
+                         'target: { source: file, path: notes/n.md }'),
+            "trace": g('pattern: "Base directory for this skill"\n'
+                       'target: trace'),
+            "files": g('pattern: "^notes/n\\\\.md$"\nflags: m\ntarget: files'),
+        }
+        self._case("basic", body="Write.\nSTUB-BEHAVIOR: write notes/n.md "
+                                 "fOo", graders=graders)
+        self._snapshot()
+        self._eval("--runs", "1")
+        rec = self._record("basic", "base-1")
+        self.assertTrue(rec["valid"], rec["invalid"])
+        self.assertEqual(rec["grades"], {
+            "count-1": False, "count-2": True, "count-wrong": False,
+            "files": True,
+            "msg-has": True, "msg-not": True, "msg-not-fails": False,
+            "trace": True})
+
+    def test_file_target_on_a_missing_or_escaping_file_fails(self):
+        """A {source: file} target on a file that is missing, or outside
+        the cwd, makes its grader fail.
+        Fails if: a file target on a missing file, or on a path escaping the cwd, passes (for example a not_contains grader)."""
+        g = ("---\ntype: regex\npattern: ZZZ-ABSENT\nmatch: not_contains\n"
+             "target: { source: file, path: %s }\n---\n")
+        self._case("basic", graders={"missing": g % "nope.md",
+                                     "escaping": g % "../transcript.jsonl",
+                                     "present": g % "out.md"})
+        self._snapshot()
+        self._eval("--runs", "1")
+        self.assertEqual(self._record("basic", "base-1")["grades"],
+                         {"escaping": False, "missing": False,
+                          "present": True})
+
+    def test_tool_graders(self):
+        """tool_used counts matching tool uses (min 0 and max 0 means never)
+        and tool_order compares first matches.
+        Fails if: tool_used with min 0 and max 0 passes when the tool was used or fails when it was not, min is not applied, input_match is not applied to the compact JSON input, or tool_order does not compare the first before-match with the first after-match."""
+        g = lambda body: "---\n" + body + "\n---\n"  # noqa: E731
+        graders = {
+            "no-bash": g("type: tool_used\ntool: Bash\nmin: 0\nmax: 0"),
+            "no-write": g("type: tool_used\ntool: Write\nmin: 0\nmax: 0"),
+            "write-out": g('type: tool_used\ntool: Write\ninput_match: '
+                           '"\\"file_path\\":\\"[^\\"]*/out\\\\.md\\""'),
+            "two-reads": g("type: tool_used\ntool: Read\nmin: 2\nmax: 2"),
+            "three-reads": g("type: tool_used\ntool: Read\nmin: 3"),
+            "read-before-b": g("type: tool_order\nbefore: Read\n"
+                               "after: { tool: Read, input_match: b.md }"),
+            "skill-first": g("type: tool_order\nbefore: Skill\n"
+                             "after: { tool: Write, input_match: out }"),
+            "write-first": g("type: tool_order\nbefore: Write\nafter: Skill"),
+            "never-used": g("type: tool_order\nbefore: Skill\nafter: Grep"),
+        }
+        self._case("basic", graders=graders, body=(
+            "Write.\nSTUB-BEHAVIOR: read {cwd}/a.md\n"
+            "STUB-BEHAVIOR: read {cwd}/b.md"))
+        self._snapshot()
+        self._eval("--runs", "1")
+        self.assertEqual(self._record("basic", "base-1")["grades"], {
+            "never-used": False, "no-bash": True, "no-write": False,
+            "read-before-b": True, "skill-first": True,
+            "three-reads": False, "two-reads": True, "write-first": False,
+            "write-out": True})
+
+    def test_file_exists_and_placed_inputs(self):
+        """files/ is copied into the cwd; a placed file is not "created";
+        file_exists globs over created files, exists: false inverts it.
+        Fails if: a placed input file counts as created, file_exists matches it, or exists: false passes when a created file matches."""
+        g = lambda body: "---\ntype: file_exists\n" + body + "\n---\n"  # noqa
+        self._case("basic", files={"input.txt": "clip one\n",
+                                   "refs/a.md": "a\n"}, graders={
+            "made-out": g("path: out.md"),
+            "made-input": g("path: input.txt"),
+            "no-tmp": g("path: '*.tmp'\nexists: false"),
+            "no-md": g("path: '*.md'\nexists: false")})
+        self._snapshot()
+        self._eval("--runs", "1")
+        rec = self._record("basic", "base-1")
+        self.assertEqual(rec["created"], ["out.md"])
+        self.assertEqual(rec["grades"], {"made-input": False,
+                                         "made-out": True, "no-md": False,
+                                         "no-tmp": True})
+        cwd = self._batch_dir() / "runs" / "basic" / "base-1" / "cwd"
+        self.assertEqual(sorted(vurctos._eval_files(cwd)),
+                         ["input.txt", "out.md", "refs/a.md"])
+
+    def test_llm_grader_is_never_judged(self):
+        """llm and baseline graders load, get no grade, are reported as
+        unjudged, and cost no extra agent run.
+        Fails if: an llm or baseline grader gets a grade other than null, a status other than unjudged, or causes any agent invocation beyond the planned runs."""
+        self._case("basic", graders={
+            "has-title": GRADER_TITLE,
+            "tone": ("---\ntype: llm\nweight: 2\n---\n"
+                     "The caption reads well.\n"),
+            "base": "---\ntype: baseline\n---\n"})
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 0, msg)
+        rows = self._rows(verdict)
+        self.assertEqual((rows[("basic", "tone")]["status"],
+                          rows[("basic", "base")]["status"]),
+                         ("unjudged", "unjudged"))
+        for slot in ("base-1", "cand-1"):
+            grades = self._record("basic", slot)["grades"]
+            self.assertEqual((grades["tone"], grades["base"]), (None, None))
+        self.assertEqual(len(self._calls()), 2)
+        self.assertEqual(verdict["level"], "pass")
+
+    # --- the verdict ---
+
+    def test_identical_arms_are_same(self):
+        """A/A: with cand identical to orig every grader is same, and the
+        verdict passes.
+        Fails if: identical arms give any status other than same (or unjudged), or the verdict is not pass with not_worse true."""
+        self._case("basic", graders={
+            "has-title": GRADER_TITLE,
+            "used-skill": "---\ntype: tool_used\ntool: Skill\n---\n"})
+        self._snapshot()
+        code, verdict, msg = self._eval()
+        self.assertEqual(code, 0, msg)
+        self.assertEqual({r["status"] for r in verdict["graders"]}, {"same"})
+        self.assertEqual([(r["base_pass"], r["base_n"], r["cand_pass"],
+                           r["cand_n"]) for r in verdict["graders"]],
+                         [(2, 2, 2, 2), (2, 2, 2, 2)])
+        self.assertTrue(verdict["not_worse"])
+        self.assertEqual(verdict["level"], "pass")
+
+    def test_gain_does_not_offset_a_regression(self):
+        """Per-grader comparison: cand gains one grader and loses another;
+        the gain does not offset the regression.
+        Fails if: a cand pass-rate gain on one grader offsets a regression on another (not_worse true or level not fail)."""
+        short = ('---\ntype: regex\npattern: "SHORT"\n'
+                 'target: { source: file, path: out.md }\n---\n')
+        self._case("basic", graders={"has-title": GRADER_TITLE,
+                                     "is-short": short})
+        self._snapshot()
+        self._cand_edit("write out.md TITLE: the source title\\nA short",
+                        "write out.md SHORT")
+        code, verdict, msg = self._eval("--runs", "1")
+        rows = self._rows(verdict)
+        self.assertEqual((rows[("basic", "has-title")]["status"],
+                          rows[("basic", "is-short")]["status"]),
+                         ("regressed", "improved"))
+        self.assertFalse(verdict["not_worse"])
+        self.assertEqual((code, verdict["level"]), (1, "fail"))
+
+    def test_insufficient_when_too_few_valid_runs(self):
+        """Fewer than ceil(k/2) valid runs in an arm makes every grader of
+        the case insufficient, and the verdict fails.
+        Fails if: a case whose cand runs are all invalid gets a status other than insufficient, or the verdict passes."""
+        self._case("basic")
+        self._snapshot()
+        self._cand('STUB-BEHAVIOR: init {"mcp_servers": [{"name": "x"}]}')
+        code, verdict, msg = self._eval("--runs", "2")
+        self.assertEqual(self._rows(verdict)[("basic", "has-title")]
+                         ["status"], "insufficient")
+        self.assertFalse(verdict["not_worse"])
+        self.assertEqual((code, verdict["level"]), (1, "fail"))
+        self.assertEqual(len(verdict["invalid_runs"]), 2)
+
+    def test_flaky_grader_is_excluded(self):
+        """A grader listed in the sidecar's flaky list is reported as flaky
+        and cannot fail the verdict.
+        Fails if: a grader listed as flaky is reported as regressed or blocks not_worse."""
+        self._case("basic", side={"flaky": ["has-title"]}, graders={
+            "has-title": GRADER_TITLE,
+            "used-skill": "---\ntype: tool_used\ntool: Skill\n---\n"})
+        self._snapshot()
+        self._cand_edit("write out.md TITLE:", "write out.md title")
+        code, verdict, msg = self._eval("--runs", "1")
+        rows = self._rows(verdict)
+        self.assertEqual(rows[("basic", "has-title")]["status"], "flaky")
+        self.assertEqual(rows[("basic", "has-title")]["cand_pass"], 0)
+        self.assertTrue(verdict["not_worse"])
+        self.assertEqual((code, verdict["level"]), (0, "pass"))
+
+    def test_targeted_fixed_and_not_discriminating(self):
+        """targeted: fixed when every base run fails and every cand run
+        passes; not-discriminating when a base run passes.
+        Fails if: a targeted case the base already passes is reported fixed (or anything but not-discriminating), or a case base fails and cand passes is not fixed."""
+        self._live_edit("write out.md TITLE: the source title",
+                        "write out.md the source title")
+        self._case("fix-me", side={"targets": ["2026-11-01#1"]})
+        self._case("always", side={"targets": ["2026-11-01#2"]}, graders={
+            "used-skill": "---\ntype: tool_used\ntool: Skill\n---\n"})
+        self._snapshot()
+        self._cand_edit("write out.md the source title",
+                        "write out.md TITLE: the source title")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(verdict["targeted"], {
+            "2026-11-01#1": "fixed", "2026-11-01#2": "not-discriminating"})
+        self.assertEqual(code, 0, msg)
+        self._cand_edit("write out.md TITLE: the source title",
+                        "write out.md still not")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(verdict["targeted"]["2026-11-01#1"], "not-fixed")
+
+    def test_suite_ok_needs_three_current_approvals(self):
+        """suite_ok needs 3 cases approved with a current hash, each with a
+        runner-judged, non-flaky grader or check.
+        Fails if: suite_ok is true with a stale approval among three, or false with three current approvals."""
+        for name in ("one", "two", "three"):
+            self._case(name)
+        self._approve("one", "two", "three")
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertTrue(verdict["suite_ok"])
+        self.assertEqual([c["approval_current"] for c in verdict["cases"]],
+                         [True, True, True])
+        self._side_update("three", fails_on="edited after approval")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertFalse(verdict["suite_ok"])
+        self.assertEqual({c["name"]: c["approval_current"]
+                          for c in verdict["cases"]},
+                         {"one": True, "three": False, "two": True})
+        self._side_update("three", flaky=["has-title"])
+        self._approve("three")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertFalse(verdict["suite_ok"])
+
+    def test_levels_and_exit_codes(self):
+        """Exit 0 for pass, 3 for hold (a person must still pick), 1 for
+        fail, from the real CLI process.
+        Fails if: the exit code for pass, hold or fail is not 0, 3 or 1."""
+        def cli():
+            return subprocess.run(
+                [sys.executable, "-B", str(Path(vurctos.__file__)),
+                 "skill-eval", self.NAME, "--global", "--workdir",
+                 str(self.w), "--agent-cmd", str(self.agent), "--runs", "1"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=dict(os.environ)).returncode
+        self._case("basic")
+        self._snapshot()
+        self.assertEqual(cli(), 0)
+        self._case("by-eye", side={"judge": "human"})
+        self.assertEqual(cli(), 3)
+        self._cand_edit("write out.md TITLE:", "write out.md title")
+        self.assertEqual(cli(), 1)
+
+    def test_probe_lists_unstable_graders(self):
+        """--probe runs W/orig in both arms; a grader that changes between
+        runs is listed as unstable, and targeted reports discriminating.
+        Fails if: a probe runs W/cand, a grader whose grade differs across the valid runs is not listed in unstable, or a targeted case every run fails is not discriminating."""
+        self._case("wobbly", side={"targets": ["2026-11-01#3"]},
+                   body="Write it.\nSTUB-BEHAVIOR: odd write out.md TITLE: x")
+        self._case("steady", side={"targets": ["2026-11-01#4"]}, graders={
+            "missing": ('---\ntype: regex\npattern: "NEVER"\n'
+                        'target: { source: file, path: out.md }\n---\n')})
+        self._live_edit("STUB-BEHAVIOR: write out.md TITLE: the source "
+                        "title\\nA short caption.\n", "")
+        self._snapshot()
+        self._cand("STUB-BEHAVIOR: exit 9")
+        code, verdict, msg = self._eval("--probe", "--runs", "2")
+        self.assertEqual(code, 0, msg)
+        self.assertTrue(verdict["probe"])
+        self.assertEqual(verdict["unstable"], [{"case": "wobbly",
+                                                "grader": "has-title"}])
+        self.assertEqual(verdict["targeted"], {
+            "2026-11-01#3": "not-discriminating",
+            "2026-11-01#4": "discriminating"})
+        self.assertEqual(verdict["arms"]["base"], verdict["arms"]["cand"])
+        self.assertEqual(verdict["invalid_runs"], [])
+
+    def test_verdict_batch_and_results_shape(self):
+        """verdict.json, batch.json and results.json have the decided keys;
+        the printed verdict equals verdict.json; results.json holds every
+        run.json.
+        Fails if: a verdict key is missing, renamed or extra, the printed verdict differs from verdict.json, or results.json misses a run's run.json."""
+        self._case("basic", side={"read_roots": ["specs"]})
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        bd = self._batch_dir()
+        self.assertEqual(json.loads((bd / "verdict.json").read_text(
+            encoding="utf-8")), verdict)
+        self.assertEqual(list(verdict), [
+            "schema_version", "skill", "batch", "probe", "level", "aborted",
+            "model", "agent_version", "arms", "live", "cases", "graders",
+            "targeted", "not_worse", "suite_ok", "invalid_runs",
+            "human_pending"])
+        self.assertEqual((verdict["schema_version"], verdict["skill"],
+                          verdict["batch"], verdict["model"]),
+                         (1, self.NAME, bd.name, self.MODEL))
+        self.assertEqual(verdict["agent_version"],
+                         "0.0.0-stub (Claude Code stand-in)")
+        tree = vurctos._skill_tree_hash(self.live)
+        self.assertEqual(verdict["arms"], {"base": tree,
+                                           "cand": vurctos._arm_hash(
+                                               self.w / "cand")})
+        self.assertEqual(verdict["live"], {"start": tree, "end": tree})
+        self.assertEqual(list(verdict["cases"][0]), [
+            "name", "hash", "status", "approval_current", "runs"])
+        self.assertEqual(list(verdict["graders"][0]), [
+            "case", "grader", "base_pass", "base_n", "cand_pass", "cand_n",
+            "status"])
+        results = self._results()
+        self.assertEqual(len(results), 2)
+        for rec in results:
+            self.assertEqual(json.loads((bd / rec["dir"] / "run.json")
+                                        .read_text(encoding="utf-8")), rec)
+            self.assertTrue({"valid", "invalid", "seconds", "returncode",
+                             "created", "grades"} <= set(rec))
+        batch = json.loads((bd / "batch.json").read_text(encoding="utf-8"))
+        self.assertEqual(batch["cases"][0]["hash"],
+                         verdict["cases"][0]["hash"])
+        self.assertEqual(batch["read_roots"]["specs"]["start"],
+                         batch["read_roots"]["specs"]["end"])
+        self.assertEqual((batch["planned_runs"], batch["invocations"],
+                          batch["max_runs"]), (2, 2, 24))
+
+    # --- the blind pick ---
+
+    def _human_batch(self, n, seed=7, **side):
+        names = [f"case-{i:02d}" for i in range(1, n + 1)]
+        for name in names:
+            self._case(name, body=f"Write the caption for {name}.",
+                       side=dict({"judge": "human"}, **side))
+        self._snapshot()
+        self._cand_edit("A short caption.", "A shorter caption.")
+        code, verdict, msg = self._eval("--runs", "1", "--max-runs", "99")
+        self.assertEqual(code, 3, msg)
+        with unittest.mock.patch.object(vurctos, "_pick_rng",
+                                        lambda: random.Random(seed)):
+            code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                       "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        bd = self._batch_dir()
+        return bd, json.loads((bd / "sealed" / "key.json").read_text(
+            encoding="utf-8")), (bd / "pick.md").read_text(encoding="utf-8")
+
+    def test_pick_page_is_blind(self):
+        """The pick page names no arm and holds no path, tree hash, case
+        hash or batch id; A and B are drawn per case.
+        Fails if: the page contains "cand", "orig", "candidate", "baseline", "old", "new", a workdir path, a hash or the batch id, or with a fixed seed over 20 cases A is always the candidate."""
+        self._live_edit("STUB-BEHAVIOR: result Wrote out.md with the title.",
+                        "STUB-BEHAVIOR: result Wrote {cwd}/out.md for {home}"
+                        "\nSTUB-BEHAVIOR: write data.bin \x00\x01")
+        bd, key, page = self._human_batch(20)
+        self.assertEqual(len(key["items"]), 20)
+        a_arms = {it["A"] for it in key["items"]}
+        self.assertEqual(a_arms, {"base", "cand"})
+        lowered = page.lower()
+        for word in ("cand", "orig", "candidate", "baseline"):
+            self.assertNotIn(word, lowered)
+        batch = json.loads((bd / "batch.json").read_text(encoding="utf-8"))
+        for secret in [str(self.w), os.path.realpath(self.w), bd.name,
+                       str(self.r), os.path.realpath(self.r)] + [
+                c["hash"] for c in batch["cases"]] + [
+                a["start"] for a in batch["arms"].values()]:
+            self.assertNotIn(secret, page)
+        fixed = page.replace("A shorter caption.", "").replace(
+            "A short caption.", "")
+        for word in ("new", "old"):
+            self.assertNotIn(word, fixed.lower())
+        self.assertIn("Wrote <cwd>/out.md for <home>", page)
+        self.assertIn("#### data.bin\n\n(binary file, listed by name only)",
+                      page)
+        self.assertIn("### Task\n\n```\nWrite the caption for case-01.\n```",
+                      page)
+        self.assertEqual(page.count("\n#### out.md\n"), 40)
+        self.assertTrue(page.endswith("19: \n20: \n"))
+        self.assertEqual(batch["pick_key_sha256"], hashlib.sha256(
+            (bd / "sealed" / "key.json").read_bytes()).hexdigest())
+
+    def test_pick_page_refuses_to_reveal_a_workdir_path(self):
+        """An output naming an arm directory the placeholders cannot hide
+        (a copy outside the workdir) stops the page from being written.
+        Fails if: a page whose content still names an arm directory (`/cand` or `/orig` as a path segment) or the workdir is written."""
+        self._case("by-eye", side={"judge": "human"})
+        self._snapshot()
+        self._cand("STUB-BEHAVIOR: result see /elsewhere/cand/SKILL.md")
+        self.assertEqual(self._eval("--runs", "1")[0], 3)
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 1)
+        self.assertIn("an arm directory name (/cand)", msg)
+        self.assertFalse((self._batch_dir() / "pick.md").exists())
+
+    def test_pick_record_maps_through_the_key(self):
+        """record maps A and B through the sealed key to candidate or
+        baseline and recomputes the verdict: a baseline answer fails it,
+        both-bad does not block not_worse.
+        Fails if: a recorded A or B is attributed to the wrong arm, the verdict is not recomputed with the picks, or both-bad blocks not_worse."""
+        bd, key, page = self._human_batch(4, seed=4)
+        a_arm = {it["number"]: it["A"] for it in key["items"]}
+        self.assertEqual((a_arm[1], a_arm[2]), ("base", "cand"))
+
+        def record(answers):
+            code, out, msg = self._run("skill-pick", "record", self.NAME,
+                                       "--global", "--workdir", str(self.w),
+                                       "--answers", answers, "--json")
+            picks = json.loads((bd / "picks.json").read_text(
+                encoding="utf-8"))
+            self.assertEqual(json.loads(out), json.loads(
+                (bd / "verdict.json").read_text(encoding="utf-8")))
+            return code, json.loads(out), picks["picks"]
+        code, verdict, picks = record("1:A,2:A,3:both-bad,4:same")
+        self.assertEqual(picks, {"case-01": "baseline",
+                                 "case-02": "candidate",
+                                 "case-03": "both-bad", "case-04": "same"})
+        self.assertEqual(verdict["human_pending"], [])
+        self.assertEqual((code, verdict["level"], verdict["not_worse"]),
+                         (1, "fail", False))
+        os.remove(bd / "picks.json")
+        better = {n: "A" if arm == "cand" else "B" for n, arm in a_arm.items()}
+        code, verdict, picks = record(f"1:{better[1]},2:{better[2]},"
+                                      f"3:both-bad,4:{better[4]}")
+        self.assertEqual(picks, {"case-01": "candidate",
+                                 "case-02": "candidate",
+                                 "case-03": "both-bad",
+                                 "case-04": "candidate"})
+        self.assertEqual((code, verdict["level"], verdict["not_worse"]),
+                         (0, "pass", True))
+
+    def test_pick_refuses_tampered_key_bad_answers_and_late_make(self):
+        """record refuses a key that no longer matches its recorded sha256
+        and answers that do not cover the page; make is refused once picks
+        are recorded, and for a probe.
+        Fails if: a tampered key is accepted, an answer list missing or repeating an item is accepted, make runs after record, or make runs on a probe batch."""
+        bd, key, page = self._human_batch(2)
+        for answers in ("1:A", "1:A,1:B,2:A", "1:A,2:C", "1:A,2:B,3:A"):
+            code, out, msg = self._run("skill-pick", "record", self.NAME,
+                                       "--global", "--workdir", str(self.w),
+                                       "--answers", answers)
+            self.assertEqual(code, 1, answers)
+            self.assertFalse((bd / "picks.json").exists())
+        sealed = bd / "sealed" / "key.json"
+        original = sealed.read_bytes()
+        sealed.write_bytes(original.replace(b'"A": "', b'"A":  "', 1))
+        code, out, msg = self._run("skill-pick", "record", self.NAME,
+                                   "--global", "--workdir", str(self.w),
+                                   "--answers", "1:A,2:B")
+        self.assertEqual(code, 1)
+        self.assertIn("no longer matches", msg)
+        sealed.write_bytes(original)
+        code, out, msg = self._run("skill-pick", "record", self.NAME,
+                                   "--global", "--workdir", str(self.w),
+                                   "--answers", "1:a,2:B")
+        self.assertIn(code, (0, 1, 3))
+        self.assertTrue((bd / "picks.json").exists())
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 1)
+        self.assertIn("already recorded", msg)
+        self._eval("--probe", "--runs", "1")
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 1)
+        self.assertIn("probe", msg)
+
+    # --- what a batch leaves alone ---
+
+    def _fs_state(self, skip):
+        state = {}
+        for top, dirs, files in os.walk(self.r):
+            here = Path(top)
+            dirs[:] = [d for d in dirs if here / d not in skip]
+            for name in dirs + files:
+                p = here / name
+                if p in skip:
+                    continue
+                rel = p.relative_to(self.r).as_posix()
+                if p.is_symlink():
+                    state[rel] = ("link", os.readlink(p))
+                elif p.is_dir():
+                    state[rel] = ("dir",)
+                else:
+                    state[rel] = ("file", p.stat().st_mtime_ns,
+                                  hashlib.sha256(p.read_bytes()).hexdigest())
+        return state
+
+    def test_batch_leaves_live_cases_and_judges_unchanged(self):
+        """A batch changes nothing outside W/eval/: not the live subject,
+        the cases, the judges, the memory root or its day logs.
+        Fails if: a batch changes the live subject tree, a case, a judge, the memory root (day logs included), or writes anything outside W/eval/."""
+        digest = self._judge()
+        self._case("basic", files={"input.txt": "clip\n"}, side={
+            "read_roots": ["specs"], "checks": [{"name": "judge-title",
+                                                 "argv": [
+                sys.executable, "{judge:%s/judge.py}" % digest,
+                "{cwd}/out.md"]}]})
+        self._case("by-eye", side={"judge": "human"})
+        self._snapshot()
+        self._cand_edit("A short caption.", "A shorter caption.")
+        wr = Path(os.path.realpath(self.w))
+        skip = {wr / "eval", self.w / "eval", self.log}
+        live = vurctos._skill_tree_hash(self.live)
+        before = self._fs_state(skip)
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(code, 3, msg)
+        with unittest.mock.patch.object(vurctos, "_pick_rng",
+                                        lambda: random.Random(1)):
+            self.assertEqual(self._run("skill-pick", "make", self.NAME,
+                                       "--global", "--workdir",
+                                       str(self.w))[0], 0)
+        self._run("skill-pick", "record", self.NAME, "--global",
+                  "--workdir", str(self.w), "--answers", "1:same")
+        self.assertEqual(vurctos._skill_tree_hash(self.live), live)
+        self.assertEqual(self._fs_state(skip), before)
+        self.assertTrue(self._record("basic", "base-1")["grades"]
+                        ["judge-title"])
+
+    # --- review fixes ---
+
+    def _wait_dead(self, pids, seconds=5):
+        deadline = time.monotonic() + seconds
+        alive = list(pids)
+        while alive and time.monotonic() < deadline:
+            alive = []
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    alive.append(pid)
+            if alive:
+                time.sleep(0.1)
+        return alive
+
+    def test_sigterm_and_sighup_clean_up(self):
+        """A batch stopped by SIGTERM or SIGHUP (a closed terminal, a
+        scheduler stop) still removes the run's mirror and kills the agent's
+        process group, as an interrupt does.
+        Fails if: after SIGTERM or SIGHUP to the CLI mid-run, a run's home/ (with its copy of the login file) is left behind or a process the agent started survives."""
+        script = self._write(self.r / "spawn.py", (
+            "import json, subprocess, sys\n"
+            "p = subprocess.Popen(['sleep', '60'])\n"
+            "with open(sys.argv[1], 'a') as fh:\n"
+            "    fh.write(json.dumps({'spawned': p.pid}) + '\\n')\n"))
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig.name):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                if self.log.exists():
+                    self.log.unlink()
+                self._case("slow", body=(
+                    f"Write it.\nSTUB-BEHAVIOR: run {sys.executable} -B "
+                    f"{script} {self.log}\nSTUB-BEHAVIOR: sleep 30"))
+                self._snapshot()
+                proc = subprocess.Popen(
+                    [sys.executable, "-B", str(Path(vurctos.__file__)),
+                     "skill-eval", self.NAME, "--global", "--workdir",
+                     str(self.w), "--agent-cmd", str(self.agent),
+                     "--runs", "1"], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=dict(os.environ))
+                pids, deadline = [], time.monotonic() + 15
+                while not pids and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                    if self.log.exists():
+                        pids = [json.loads(ln)["spawned"] for ln in
+                                self.log.read_text(encoding="utf-8")
+                                .splitlines() if "spawned" in ln]
+                self.assertTrue(pids, "the run never started")
+                proc.send_signal(sig)
+                proc.wait(timeout=15)
+                self.assertNotEqual(proc.returncode, 0)
+                runs = Path(os.path.realpath(self.w)) / "eval"
+                left = [str(p) for p in runs.rglob("home")]
+                left += [str(p) for p in runs.rglob(".claude.json")]
+                self.assertEqual(left, [])
+                self.assertEqual(self._wait_dead(pids), [])
+
+    def test_short_command_timeout_kills_its_group(self):
+        """The login preflight and the --version calls kill the whole
+        process group when they hang, as a run does.
+        Fails if: after a short command times out, a process it started survives."""
+        log = self.r / "spawned.jsonl"
+        script = self._write(self.r / "hang.py", (
+            "import json, subprocess, sys, time\n"
+            "p = subprocess.Popen(['sleep', '60'])\n"
+            "with open(sys.argv[1], 'a') as fh:\n"
+            "    fh.write(json.dumps({'spawned': p.pid}) + '\\n')\n"
+            "time.sleep(60)\n"))
+        rc, why = vurctos._eval_capture(
+            [sys.executable, "-B", str(script), str(log)], self.r,
+            {"PATH": os.environ.get("PATH", "")}, timeout=2)
+        self.assertIsNone(rc)
+        pids = [json.loads(ln)["spawned"] for ln in
+                log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(pids)
+        self.assertEqual(self._wait_dead(pids), [])
+
+    def test_case_or_judge_change_mid_batch_aborts(self):
+        """A run that changes a pinned judge or a case input mid-batch (a
+        case that allows a writing Bash rule could) aborts the batch, so no
+        verdict rests on a judge or input that changed under it.
+        Fails if: the batch continues, or ends without a fail and the reason, after a file of a referenced judge directory or of a case's files/ changed during it."""
+        digest = self._judge()
+        targets = {
+            "judge": self.evals / "_judges" / digest / "judge_rules.py",
+            "input": self.evals / self.NAME / "one" / "files" / "in.txt"}
+        for label, target in targets.items():
+            with self.subTest(label):
+                shutil.rmtree(self.evals / self.NAME, ignore_errors=True)
+                if self.log.exists():
+                    self.log.unlink()
+                self._case("one", files={"in.txt": "clip\n"}, side={
+                    "checks": [{"name": "judge-title", "argv": [
+                        sys.executable, "{judge:%s/judge.py}" % digest,
+                        "{cwd}/out.md"]}]})
+                self._case("two")
+                self._snapshot()
+                self._cand(f"STUB-BEHAVIOR: poke {target} # edited\\n")
+                code, verdict, msg = self._eval("--runs", "1")
+                self.assertEqual(code, 1, msg)
+                self.assertIn("changed during the batch", verdict["aborted"])
+                self.assertEqual(len(self._calls()), 2)
+                if label == "judge":
+                    shutil.rmtree(self.evals / "_judges")
+                    digest = self._judge()
+
+    def test_pick_page_hides_arm_paths_and_refuses_run_labels(self):
+        """Paths that name an arm, the home or the workdir in any spelling
+        (end of a path, a trailing dot, `~/...`) become placeholders on the
+        pick page; a run label such as cand-1 left in an output stops it.
+        Fails if: the page shows `/cand` or `/orig` at the end of a path, the home path, or the workdir in `~/` form, or a page naming a run label (base-1, cand-1) is written."""
+        home = Path(os.path.realpath(self.h))
+
+        def batch(lines):
+            self.wn += 1
+            self.w = self.root / "skill-work" / f"wp{self.wn}"
+            wr = Path(os.path.realpath(self.w))
+            text = lines.format(w=wr, tw="~/" + os.path.relpath(wr, home),
+                                h=home).replace("\n", "\\n")
+            self._live_edit("STUB-BEHAVIOR: result Wrote",
+                            f"STUB-BEHAVIOR: write where.txt {text}\n"
+                            f"STUB-BEHAVIOR: result Wrote")
+            self._case("by-eye", side={"judge": "human"})
+            code, _, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                     "--workdir", str(self.w))
+            self.assertEqual(code, 0, msg)
+            self._live_edit(f"STUB-BEHAVIOR: write where.txt {text}\n", "")
+            p = self.w / "cand" / "SKILL.md"
+            p.write_text(p.read_text(encoding="utf-8")
+                         .replace("orig", "cand").replace("base-1", "cand-1"),
+                         encoding="utf-8")
+            self.assertEqual(self._eval("--runs", "1")[0], 3)
+            return self._run("skill-pick", "make", self.NAME, "--global",
+                             "--workdir", str(self.w))
+        code, out, msg = batch("skill: {w}/orig\nwith a dot: {w}/orig.\n"
+                               "tilde: {tw}/orig/SKILL.md\n"
+                               "rules: {h}/.claude/CLAUDE.md")
+        self.assertEqual(code, 0, msg)
+        page = (self._batch_dir() / "pick.md").read_text(encoding="utf-8")
+        for leak in ("/cand", "/orig", str(home), "~/"):
+            self.assertNotIn(leak, page)
+        self.assertEqual(page.count("skill: <skill>\n"), 2)
+        self.assertEqual(page.count("rules: <home>/.claude/CLAUDE.md"), 2)
+        code, out, msg = batch("my run: base-1")
+        self.assertEqual(code, 1)
+        self.assertIn("run label", msg)
+        self.assertFalse((self._batch_dir() / "pick.md").exists())
+
+    def test_pick_batch_must_be_a_batch_name(self):
+        """--batch takes a batch name under W/eval/, never a path.
+        Fails if: skill-pick make or record accepts an absolute path or a path with .. as --batch, or writes outside W/eval/."""
+        bd, key, page = self._human_batch(1)
+        outside = self.r / "outside"
+        shutil.copytree(bd, outside)
+        shutil.rmtree(outside / "sealed")
+        (outside / "pick.md").unlink()
+        rel = os.path.relpath(outside, Path(os.path.realpath(self.w)) /
+                              "eval")
+        for batch in (str(outside), rel):
+            for argv in (["make"], ["record", "--answers", "1:A"]):
+                with self.subTest(batch=batch, action=argv[0]):
+                    code, out, msg = self._run(
+                        "skill-pick", argv[0], self.NAME, "--global",
+                        "--workdir", str(self.w), "--batch", batch,
+                        *argv[1:])
+                    self.assertEqual(code, 1)
+                    self.assertIn("--batch", msg)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()),
+                         ["batch.json", "results.json", "runs",
+                          "verdict.json"])
+
+    def test_pick_make_twice_is_refused(self):
+        """A second make before record would redraw A and B, and answers
+        written on the first page would be mapped through the new key.
+        Fails if: skill-pick make runs again on a batch that already has a pick page, or changes its sealed key."""
+        bd, key, page = self._human_batch(4)
+        sealed = (bd / "sealed" / "key.json").read_bytes()
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 1)
+        self.assertIn("already made", msg)
+        self.assertEqual((bd / "sealed" / "key.json").read_bytes(), sealed)
+
+    def test_agent_version_change_fails_the_batch(self):
+        """An agent whose version differs at the end of the batch (it
+        updated itself mid-batch) fails the verdict: the arms may have run
+        different versions.
+        Fails if: a batch whose agent reports a different --version at the end than at the start passes, or the reason is missing."""
+        counter = self.r / "version-count"
+        agent = self._write(self.r / "bin" / "claude-updating", (
+            f"#!{sys.executable} -B\nimport os, runpy, sys\n"
+            f"if sys.argv[1:] == ['--version']:\n"
+            f"    p = {str(counter)!r}\n"
+            f"    n = int(open(p).read()) if os.path.exists(p) else 0\n"
+            f"    open(p, 'w').write(str(n + 1))\n"
+            f"    print('1.0.%d (stub)' % n)\n"
+            f"    sys.exit(0)\n"
+            f"sys.argv[1:1] = ['--stub-control', {str(self.ctl)!r}]\n"
+            f"runpy.run_path({str(EVAL_STUB)!r}, run_name='__main__')\n"))
+        os.chmod(agent, 0o755)
+        self._case("basic")
+        self._snapshot()
+        code, out, msg = self._run(
+            "skill-eval", self.NAME, "--global", "--workdir", str(self.w),
+            "--agent-cmd", str(agent), "--json", "--runs", "1")
+        verdict = json.loads(out)
+        self.assertEqual((code, verdict["level"]), (1, "fail"))
+        self.assertIn("agent changed during the batch", verdict["aborted"])
+        self.assertEqual(verdict["agent_version"], "1.0.0 (stub)")
+
+    def test_finder_litter_is_not_copied_into_the_run(self):
+        """Files the case hash ignores (__pycache__, .DS_Store) are not
+        copied into the run either, so an approval covers every input.
+        Fails if: a file under files/ that the case hash skips reaches the run's cwd."""
+        self._case("basic", files={"in.txt": "clip\n", ".DS_Store": "x",
+                                   "__pycache__/m.pyc": "x"})
+        self._snapshot()
+        self._eval("--runs", "1")
+        cwd = self._batch_dir() / "runs" / "basic" / "base-1" / "cwd"
+        names = sorted(p.relative_to(cwd).as_posix()
+                       for p in cwd.rglob("*") if p.is_file())
+        self.assertEqual(names, ["in.txt", "out.md"])
+
+
+    # --- coverage added from the mutation review ---
+
+    def _wrap_agent(self, after):
+        """Patch _eval_run_agent: run the stub, then after(out_path)."""
+        real = vurctos._eval_run_agent
+
+        def run(argv, cwd, env, timeout, out, err):
+            rc, to = real(argv, cwd, env, timeout, out, err)
+            return after(Path(out), Path(cwd), rc, to)
+        return unittest.mock.patch.object(vurctos, "_eval_run_agent",
+                                          side_effect=run)
+
+    def test_list_cases_never_invokes_the_given_agent(self):
+        """--list-cases never starts the agent, even when one is given.
+        Fails if: --list-cases invokes the agent passed with --agent-cmd (any call shows in the stub log)."""
+        self._case("basic")
+        code, out, msg = self._run("skill-eval", self.NAME, "--global",
+                                   "--workdir", str(self.r / "none"),
+                                   "--list-cases", "--agent-cmd",
+                                   str(self.agent))
+        self.assertEqual(code, 0, msg)
+        self.assertFalse(self.log.exists())
+
+    def test_a2_failures_on_two_cases_abort(self):
+        """A2 failures alone (no A3) on two different cases judge the loader
+        broken.
+        Fails if: the batch keeps running after A2 failures that survive the retry on two different cases."""
+        bad = f"\nSTUB-BEHAVIOR: load-dir {self.live}"
+        for name in ("a1", "a2", "a3"):
+            self._case(name, body="Write it." + bad)
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertTrue((verdict["aborted"] or "").startswith(
+            "loader judged broken"), verdict["aborted"])
+        self.assertEqual({r["case"] for r in self._results()}, {"a1", "a2"})
+
+    def test_pick_page_hides_a_workdir_path(self):
+        """An output naming a workdir file outside the run's cwd and home
+        shows a placeholder, not the path.
+        Fails if: the page holds the workdir path in either spelling."""
+        self._case("by-eye", side={"judge": "human"})
+        self._snapshot()
+        wr = os.path.realpath(self.w)
+        self._cand(f"STUB-BEHAVIOR: result see {wr}/manifest.json")
+        self.assertEqual(self._eval("--runs", "1")[0], 3)
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        text = (self._batch_dir() / "pick.md").read_text(encoding="utf-8")
+        self.assertNotIn(wr, text)
+        self.assertNotIn(str(self.w), text)
+
+    def test_every_access_hop_leads_to_the_arm(self):
+        """Inside each run's mirror every hop of the access chain resolves to
+        the arm under test.
+        Fails if: any access path (.claude/skills/X, .agents/skills/X, the real dir) resolves to the live tree or the other arm inside a run's mirror."""
+        self._case("basic")
+        self._snapshot()
+        seen = []
+        real = vurctos._eval_run_agent
+
+        def inspect(argv, cwd, env, timeout, out, err):
+            home = Path(env["HOME"])
+            seen.append([os.path.realpath(home / a) for a in self.ACCESS])
+            return real(argv, cwd, env, timeout, out, err)
+        with unittest.mock.patch.object(vurctos, "_eval_run_agent",
+                                        side_effect=inspect):
+            self.assertEqual(self._eval("--runs", "1")[0], 0)
+        wr = Path(os.path.realpath(self.w))
+        self.assertEqual(seen, [[str(wr / "orig")] * 3,
+                                [str(wr / "cand")] * 3])
+
+    def test_base_arm_change_aborts(self):
+        """A change to the base arm tree during the batch aborts it too.
+        Fails if: only the cand arm is re-hashed after each run."""
+        self._case("one")
+        self._snapshot()
+        target = Path(os.path.realpath(self.w)) / "orig" / "references" / \
+            "rules.md"
+        self._cand(f"STUB-BEHAVIOR: poke {target} - edited mid-batch\\n")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertIn("base arm tree", verdict["aborted"] or "")
+
+    def test_run_order_interleaves_arms(self):
+        """Runs go base-1, cand-1, base-2, cand-2.
+        Fails if: the arms run in another order (all base runs first, or cand first)."""
+        self._case("basic")
+        self._snapshot()
+        self._eval("--runs", "2")
+        slots = [Path(c["env"]["HOME"]).parent.name for c in self._calls()]
+        self.assertEqual(slots, ["base-1", "cand-1", "base-2", "cand-2"])
+
+    def test_llm_only_cases_do_not_make_a_suite(self):
+        """Approved cases whose only grader is llm do not make suite_ok.
+        Fails if: suite_ok is true for three approved cases with no runner-judged grader or check."""
+        for name in ("one", "two", "three"):
+            self._case(name, graders={"tone": EVAL_LLM_GRADER})
+        self._approve("one", "two", "three")
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertFalse(verdict["suite_ok"])
+
+    def test_regression_with_unequal_valid_counts(self):
+        """Statuses compare pass rates, not counts: base 1/1 against cand 1/2
+        is a regression.
+        Fails if: pass counts are compared instead of rates, so cand 1/2 against base 1/1 is not regressed."""
+        self._case("basic")
+        self._snapshot()
+
+        def after(out, cwd, rc, to):
+            slot = out.parent.name
+            if slot.startswith("base-2"):
+                return 1, to
+            if slot == "cand-2":
+                (cwd / "out.md").unlink()
+            return rc, to
+        with self._wrap_agent(after):
+            code, verdict, msg = self._eval("--runs", "2")
+        row = self._rows(verdict)[("basic", "has-title")]
+        self.assertEqual((row["base_pass"], row["base_n"], row["cand_pass"],
+                          row["cand_n"]), (1, 1, 1, 2))
+        self.assertEqual(row["status"], "regressed")
+        self.assertEqual(verdict["level"], "fail")
+
+    def test_k1_invalid_arm_is_insufficient(self):
+        """With one run per arm, an invalid cand run makes the grader
+        insufficient.
+        Fails if: a grader whose only cand run is invalid gets a status other than insufficient."""
+        self._case("basic")
+        self._snapshot()
+        self._cand('STUB-BEHAVIOR: init {"mcp_servers": [{"name": "x"}]}')
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual(self._rows(verdict)[("basic", "has-title")]
+                         ["status"], "insufficient")
+
+    def test_abort_on_the_last_run_fails(self):
+        """An abort after the last run fails the verdict although every
+        grader has its runs.
+        Fails if: an aborted batch whose graders all have enough valid runs passes."""
+        self._case("one")
+        self._snapshot()
+        target = Path(os.path.realpath(self.w)) / "cand" / "references" / \
+            "rules.md"
+        self._cand(f"STUB-BEHAVIOR: poke {target} - edited mid-batch\\n")
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertTrue(verdict["aborted"])
+        self.assertEqual((code, verdict["level"]), (1, "fail"))
+
+    def test_probe_with_invalid_runs_fails(self):
+        """A probe whose runs are all invalid fails.
+        Fails if: a probe with insufficient valid runs passes."""
+        self._live_edit("STUB-BEHAVIOR: result Wrote out.md with the title.",
+                        "STUB-BEHAVIOR: result Wrote out.md with the title."
+                        "\nSTUB-BEHAVIOR: exit 9")
+        self._case("basic")
+        self._snapshot()
+        code, verdict, msg = self._eval("--probe", "--runs", "1",
+                                        "--max-runs", "2")
+        self.assertEqual((code, verdict["level"]), (1, "fail"))
+
+    def test_mixed_case_holds_and_is_picked(self):
+        """A case judged mixed waits for a person and gets an item on the
+        pick page.
+        Fails if: a mixed case is left out of human_pending (the level is pass, not hold) or of the pick page."""
+        self._case("both", side={"judge": "mixed"})
+        self._snapshot()
+        code, verdict, msg = self._eval("--runs", "1")
+        self.assertEqual((code, verdict["level"], verdict["human_pending"]),
+                         (3, "hold", ["both"]))
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        key = json.loads((self._batch_dir() / "sealed" / "key.json")
+                         .read_text(encoding="utf-8"))
+        self.assertEqual([it["case"] for it in key["items"]], ["both"])
+
+    def test_pick_page_refuses_the_batch_id(self):
+        """An output that carries the batch id stops the page.
+        Fails if: a page holding the batch id is written."""
+        self._case("by-eye", side={"judge": "human"})
+        self._snapshot()
+
+        def after(out, cwd, rc, to):
+            batch = out.parents[3].name
+            lines = out.read_text(encoding="utf-8").splitlines()
+            ev = json.loads(lines[-1])
+            ev["result"] = f"ref {batch}"
+            lines[-1] = json.dumps(ev)
+            out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return rc, to
+        with self._wrap_agent(after):
+            self.assertEqual(self._eval("--runs", "1")[0], 3)
+        code, out, msg = self._run("skill-pick", "make", self.NAME,
+                                   "--global", "--workdir", str(self.w))
+        self.assertEqual(code, 1)
+        self.assertIn("the batch id", msg)
+
+    def test_pick_rng_is_system_random(self):
+        """The A/B draw uses the system's random source (the tests substitute
+        a seeded one).
+        Fails if: _pick_rng returns anything but a random.SystemRandom."""
+        self.assertIsInstance(vurctos._pick_rng(), random.SystemRandom)
+
+    def test_sidecar_edits_make_the_approval_stale(self):
+        """Editing any hashed sidecar field (flaky, targets, expect_skill,
+        read_roots, allow_rules, judge, checks) makes an approval stale.
+        Fails if: an edit to one of these sidecar fields leaves the approval current."""
+        digest = self._judge()
+        self._case("basic", graders={"has-title": GRADER_TITLE,
+                                     "used": "---\ntype: tool_used\n"
+                                             "tool: Skill\n---\n"}, side={
+            "checks": [{"name": "judge-title", "argv": [
+                sys.executable, "-B", "{judge:%s/judge.py}" % digest,
+                "{cwd}/out.md"]}]})
+        self._approve("basic")
+        base = json.loads(self._sidecar("basic").read_text(encoding="utf-8"))
+        edits = {"flaky": ["has-title"], "targets": ["2026-11-01#9"],
+                 "expect_skill": False, "read_roots": ["specs"],
+                 "allow_rules": ["Bash(ls *)"], "judge": "human",
+                 "checks": [dict(base["checks"][0], expect_exit=1)]}
+        for key, value in edits.items():
+            with self.subTest(key):
+                self._write(self._sidecar("basic"), json.dumps(base))
+                self.assertTrue(self._hashes()["basic"]["approval_current"])
+                self._side_update("basic", **{key: value})
+                self.assertFalse(self._hashes()["basic"]["approval_current"])
+
+    def test_provisional_with_matching_hash_is_not_approved(self):
+        """A provisional case is never approved, whatever its approved_hash.
+        Fails if: a provisional case whose approved_hash equals its hash counts as approved."""
+        self._case("basic")
+        h = self._hashes()["basic"]["hash"]
+        self._side_update("basic", approved_hash=h)
+        self.assertFalse(self._hashes()["basic"]["approval_current"])
+
+    def test_nested_input_edit_makes_the_approval_stale(self):
+        """An input file two levels down is hashed too.
+        Fails if: editing files/sub/deep/x.txt leaves the approval current."""
+        d = self._case("basic", files={"sub/deep/x.txt": "one\n"})
+        self._approve("basic")
+        self._write(d / "files" / "sub" / "deep" / "x.txt", "two\n")
+        self.assertFalse(self._hashes()["basic"]["approval_current"])
+
+    def test_other_skill_load_is_not_the_subject(self):
+        """Loading another skill does not satisfy expect_skill.
+        Fails if: a run that loads only some other skill counts as having loaded the subject."""
+        rec = self._one_run(["load-dir {home}/.claude/skills/other-skill",
+                             "load-body # Other"])
+        self.assertIn("A2 loader: subject skill not loaded", rec["invalid"])
+
+    def test_load_from_an_arm_path_is_invalid(self):
+        """A load reported from an arm tree's own path is the subject's, and
+        invalid.
+        Fails if: a load from W/cand (not the mirror spelling) is ignored, so the run stays valid."""
+        self._snapshot()
+        wr = Path(os.path.realpath(self.w))
+        self._case("basic", side={"expect_skill": False},
+                   body=f"Write it.\nSTUB-BEHAVIOR: load-dir {wr / 'cand'}")
+        self._eval("--runs", "1")
+        rec = self._record("basic", "base-1")
+        self.assertTrue(any(r.startswith("A2 loader: loaded from")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_bash_naming_live_is_contamination(self):
+        """A3 scans every tool's input, not only Read: a Bash command naming
+        the live skill is contamination.
+        Fails if: a Bash input naming the live SKILL.md leaves the run valid."""
+        cmd = json.dumps({"command": "cat " + os.path.realpath(self.live)
+                          + "/SKILL.md"})
+        rec = self._one_run([f"tool Bash {cmd}"])
+        self.assertTrue(any(r.startswith("A3 contamination")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_non_ascii_other_arm_path_is_contamination(self):
+        """A3 matches a workdir path with non-ASCII characters (inputs are
+        encoded with ensure_ascii=False).
+        Fails if: a Read of the other arm under a non-ASCII workdir path leaves the run valid."""
+        self._case("basic")
+        self.w = self.r / "wk\u00e9" / "w1"
+        code, _, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                 "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        wr = Path(os.path.realpath(self.w))
+        body = self.evals / self.NAME / "basic" / "prompt.md"
+        self._write(body, body.read_text(encoding="utf-8")
+                    + f"STUB-BEHAVIOR: read {wr / 'cand'}/SKILL.md\n")
+        self._eval("--runs", "1")
+        rec = self._record("basic", "base-1")
+        self.assertTrue(any(r.startswith("A3 contamination")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_two_init_events_are_invalid(self):
+        """A0 needs exactly one init event.
+        Fails if: a transcript with two init events leaves the run valid."""
+        self._case("basic")
+        self._snapshot()
+
+        def after(out, cwd, rc, to):
+            lines = out.read_text(encoding="utf-8").splitlines()
+            out.write_text("\n".join([lines[0]] + lines) + "\n",
+                           encoding="utf-8")
+            return rc, to
+        with self._wrap_agent(after):
+            self._eval("--runs", "1", "--max-runs", "2")
+        rec = self._record("basic", "base-1")
+        self.assertIn("A0 process: 2 init events, not 1", rec["invalid"])
+
+    def test_edit_outside_cwd_is_invalid(self):
+        """A4 covers Edit as well as Write.
+        Fails if: an Edit of ../x.md leaves the run valid."""
+        inp = json.dumps({"file_path": "../x.md", "old_string": "a",
+                          "new_string": "b"})
+        rec = self._one_run([f"tool Edit {inp}"])
+        self.assertTrue(any(r.startswith("A4 side effect: Edit outside")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_write_to_tilde_is_invalid(self):
+        """A4 expands a leading ~ to the run's home: a Write to ~/x.md is
+        outside the cwd.
+        Fails if: a Write to ~/x.md leaves the run valid."""
+        inp = json.dumps({"file_path": "~/x.md", "content": "x"})
+        rec = self._one_run([f"tool Write {inp}"])
+        self.assertTrue(any(r.startswith("A4 side effect: Write outside")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_other_arm_absolute_spelling(self):
+        """A3 forbids the other arm in its absolute spelling as well as its
+        real path.
+        Fails if: a Read of <W as given>/cand leaves a base run valid."""
+        self._case("basic")
+        self._snapshot()
+        self.assertNotEqual(str(self.w), os.path.realpath(self.w))
+        body = self.evals / self.NAME / "basic" / "prompt.md"
+        self._write(body, body.read_text(encoding="utf-8")
+                    + f"STUB-BEHAVIOR: read {self.w}/cand/SKILL.md\n")
+        self._eval("--runs", "1")
+        rec = self._record("basic", "base-1")
+        self.assertTrue(any(r.startswith("A3 contamination")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_load_from_a_subdirectory_is_invalid(self):
+        """A load from a subdirectory of the mirror spelling is not a load of
+        the subject from its access path.
+        Fails if: a load reported from <mirror>/.claude/skills/X/references is accepted."""
+        rec = self._one_run(
+            ["load-dir {home}/.claude/skills/caption-kit/references"])
+        self.assertTrue(any(r.startswith("A2 loader: loaded from")
+                            for r in rec["invalid"]), rec["invalid"])
+
+    def test_model_text_is_not_a_load(self):
+        """Only synthetic user messages are loads: the model writing the load
+        text itself proves nothing.
+        Fails if: an assistant text starting with the load prefix counts as the subject's load."""
+        self._case("basic")
+        self._snapshot()
+        wr = Path(os.path.realpath(self.w))
+
+        def after(out, cwd, rc, to):
+            lines = out.read_text(encoding="utf-8").splitlines()
+            keep = []
+            arm = "orig" if out.parent.name.startswith("base") else "cand"
+            body = vurctos._skill_body((wr / arm / "SKILL.md").read_text(
+                encoding="utf-8"))
+            home = out.parent / "home"
+            for ln in lines:
+                ev = json.loads(ln)
+                if ev.get("isSynthetic"):
+                    ev = {"type": "assistant", "message": {
+                        "role": "assistant", "content": [{
+                            "type": "text", "text":
+                            f"Base directory for this skill: {home}/"
+                            f".claude/skills/{self.NAME}\n\n{body}"}]}}
+                keep.append(json.dumps(ev))
+            out.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            return rc, to
+        with self._wrap_agent(after):
+            self._eval("--runs", "1", "--max-runs", "2")
+        rec = self._record("basic", "base-1")
+        self.assertIn("A2 loader: subject skill not loaded", rec["invalid"])
+
+    def test_timeout_returns_promptly(self):
+        """A timed-out run returns promptly: the run is in its own session,
+        so the group kill reaches it.
+        Fails if: a run with a 2 s timeout keeps the batch waiting for the agent to exit on its own (the run is not its own session leader)."""
+        script = self._write(self.r / "spawn.py", (
+            "import subprocess\n"
+            "subprocess.Popen(['sleep', '60'])\n"))
+        self._case("kids", fm="allowed_tools: [Read, Write, Skill]\n"
+                              "timeout_seconds: 2")
+        self._snapshot()
+        self._cand(f"STUB-BEHAVIOR: run {sys.executable} -B {script}\n"
+                   f"STUB-BEHAVIOR: sleep 30")
+        start = time.monotonic()
+        self._eval("--runs", "1", "--max-runs", "2")
+        elapsed = time.monotonic() - start
+        self.assertIn("A0 process: timeout",
+                      self._record("kids", "cand-1")["invalid"])
+        self.assertLess(elapsed, 20, f"batch took {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

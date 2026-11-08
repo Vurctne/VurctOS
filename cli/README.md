@@ -126,6 +126,24 @@ With `--since-accepted`, a pass advances `accepted` to the candidate, a hold adv
 
 Configured in the private `skill-loop.json`: `evals_dir` (default `<memory root>/skill-evals`), `work_dir` (default `<memory root>/skill-work`), `mirror_home` (default `~`), `protected_line_patterns` and `protected_category_words` (lists), `protected_files` (name to relpaths), `lint_cmds` (argv lists, run with `HOME` set to a mirror of `mirror_home`), `lint_timeout_s` (default 300) and `budget_file` (JSON: path relative to `mirror_home` to a character budget). Curated anchors (the words other files point at, such as a heading) go in `<evals_dir>/<name>/_protected.txt`, one per line (`//` lines are comments; a leading `#` is part of the anchor, so a Markdown heading works); each must still appear inside some rule line. See `docs/skills-system.md`.
 
+### Skill eval and skill pick (run old and new on the same cases)
+
+```bash
+python3 cli/vurctos.py skill-eval vibe-coding-setup --global --workdir /tmp/w1 --list-cases
+python3 cli/vurctos.py skill-eval vibe-coding-setup --global --workdir /tmp/w1 --probe        # A/A on W/orig
+python3 cli/vurctos.py skill-eval vibe-coding-setup --global --workdir /tmp/w1 [--case C ...] [--runs K] [--max-runs N] [--json]
+python3 cli/vurctos.py skill-pick make vibe-coding-setup --global --workdir /tmp/w1 [--batch B]
+python3 cli/vurctos.py skill-pick record vibe-coding-setup --global --workdir /tmp/w1 --answers "1:A,2:same,3:B"
+```
+
+`skill-eval` runs headless Claude Code (on the subscription login, never an API key) once per case per arm per run, for the base `W/orig` and the candidate `W/cand` of a `skill-snapshot --workdir` pair, and compares them grader by grader. It costs real model runs: the planned count (cases x 2 arms x runs) is refused up front when it exceeds `--max-runs` (default `eval_max_runs`), before anything runs. Cases live in `<evals_dir>/<skill>/<case>/` (`prompt.md`, `graders/*.md`, optional `files/`) with a sidecar `<evals_dir>/<skill>/_sidecars/<case>.json`; pinned judge scripts in `<evals_dir>/_judges/<sha256>/`. `--list-cases` runs nothing and prints each case's status, hash, whether its approval is current, its graders and checks, and load errors. `--probe` runs `W/orig` in both arms (finds unstable graders, and shows a targeted case fails on the base). `--agent-cmd PATH` replaces the `claude` executable (the tests use `cli/eval_stub.py`).
+
+Each run gets a fresh mirror of the home in which the skill resolves to the arm under test, an allowlist environment, shims for blocked binaries, no MCP servers and writes confined to its own cwd; its transcript is audited (billing, init, which copy was loaded and with which body, contamination, side effects, result) and a run that fails the audit is invalid and retried once. Results go to `W/eval/<batch>/`: `runs/<case>/<arm>-<i>/` (the cwd as left, `transcript.jsonl`, `stderr.txt`, `shim.log`, `run.json`), `results.json`, `batch.json` and `verdict.json`. Exit 0 pass, 1 fail (an abort, a regression, too few valid runs, or a pick for the base; also errors before the batch), 3 hold (a person still has to pick). `--json` prints the verdict.
+
+`skill-pick make` writes `W/eval/<batch>/pick.md`, a blind A/B page for the cases whose sidecar says `"judge": "human"` or `"mixed"`, and seals the key in `W/eval/<batch>/sealed/key.json`; `record` maps the answers (`A`, `B`, `same` or `both-bad`, every item once) through the key, writes `picks.json` and recomputes the verdict. `make` runs once per batch; `--batch` takes a batch name. Neither runs a model.
+
+Configured in the private `skill-loop.json`: `eval_model` (required for a run: the full model id every run must report), `eval_effort` (`low` to `max`, or null), `eval_runs` (default 2), `eval_max_runs` (default 24) and `eval_blocked_bins` (default `codex, gh, curl, wget, ssh, scp, osascript, open`). See `docs/skills-system.md` for the case format, the audit and the verdict rules.
+
 ### Aging (retire old durable lines)
 
 ```bash
