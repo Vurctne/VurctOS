@@ -82,7 +82,23 @@ A lesson about a skill is filed as a feedback entry (`vurctos remember --skill N
 
 `vurctos skill-status (--global | --project P) [--skill NAME] [--json] [--hook]` is read-only. For each skill or target with feedback it shows the pending entries (counts by signal and outcome, the oldest date), entries marked `landed` but not yet cited, cited entries that were later retracted, pending entries that name a retired rule, the current `skillver` against the one each entry was filed with, the character counts of `SKILL.md`, the rule files and the history files (`history_globs`), and a score for ordering the work: 3 per pending correction or reject, 1 per other pending failure, 3 per retracted-but-cited entry, 2 per entry naming a retired rule. `--json` prints the same data; `--hook` prints one line of numbers only and never entry text.
 
-Why the record lives in the skill's files rather than in a separate ledger: when a skill is rolled back (a restored copy, a revert, a hand edit), its citations go back with it, so the entries it had answered become pending again without anyone remembering to undo them. A ledger would keep them marked answered while the fix is gone, and the lesson would be lost silently. The opposite mistake, a forgotten citation, only shows the entry again. Checking a revision against its feedback automatically is future work; today whoever revises the skill writes the citation.
+Why the record lives in the skill's files rather than in a separate ledger: when a skill is rolled back (a restored copy, a revert, a hand edit), its citations go back with it, so the entries it had answered become pending again without anyone remembering to undo them. A ledger would keep them marked answered while the fix is gone, and the lesson would be lost silently. The opposite mistake, a forgotten citation, only shows the entry again. Whoever revises the skill writes the citation; `skill-check` (below) fails a citation that names no feedback entry for the skill and reports the evidence for the others.
+
+## Static Check
+
+Skills are edited on the spot by whichever session finds a problem, so a check has to be cheap enough to run after every edit. `vurctos skill-check` runs no model and takes seconds. It compares a candidate tree with a base tree and answers three questions:
+
+1. Did the edit break anything mechanical? New lint lines, or a file over its character budget.
+2. Did it touch what only the owner decides? Protected lines and files, and changed lines carrying a category word (for example spending or publishing).
+3. Does it claim to answer feedback it has no entry for? A newly cited `fb:<id>` must be a feedback entry for this skill.
+
+**Levels.** `fail` (exit 1) blocks; `hold` (exit 3) goes back to the owner; `pass` (exit 0). Info lines (net growth, unbudgeted rule files, pre-existing overruns, citation evidence) never change the level. The recognising patterns (`protected_line_patterns`, `protected_category_words`, `protected_files`) live in the private `skill-loop.json`, so no owner-specific text enters this repository. Protected lines are compared as one multiset over the skill's rule files (moving one between files is fine, renumbering a list item is fine); a new protected line also holds, so an editor cannot make its own rule unremovable by marking it.
+
+**The store.** `vurctos skill-snapshot NAME --accept` copies the live tree to `<evals_dir>/_snapshots/<name>/<tree hash>/` and points the `accepted` file beside it at that hash. A hash directory is never modified once complete. `skill-check NAME --since-accepted` checks live against that copy and advances `accepted` on a pass (or on a hold with `--accept`, never on a fail). `skill-snapshot NAME --workdir W` makes an `orig/` and `cand/` pair for an edit made in a copy instead; `skill-check NAME --workdir W` checks it and advances nothing.
+
+**The mirror.** Lint tools usually build their paths from `$HOME`, and skills are reached through chains of symlinks (`~/.claude/skills/x -> ~/.agents/skills/x -> <repo>/x`). To lint the base and the candidate side by side, each is run with `HOME` pointing at a mirror of the home: every entry is a symlink to the live one, except that each directory along the skill's access paths is a real directory and each access path (every hop of the chain, and the real path) is a symlink to the copy under test. Every hop has to be overlaid: an absolute link left pointing at the live tree would lead the lint straight back to live, and both runs would read the same files. A mirror holds only directories and symlinks, never file content. The two outputs are compared after replacing the mirror and copy paths and every run of digits, so line numbers and counts that move with unrelated lines do not count as new violations.
+
+See `cli/README.md` for the command lines and the configuration keys.
 
 ## Skill Storage
 

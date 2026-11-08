@@ -27,6 +27,8 @@ Current state: **v1**. A small local-first CLI exists (`cli/vurctos.py`); the co
   - `python3 cli/vurctos.py reject <card-id> --project <p> --reason "..."` - reject reviewed work: files the lesson into memory, stamps it into the card notes, re-queues the card.
   - `python3 cli/vurctos.py skill-new <name> --project <p>` - scaffold a new procedural skill in the SKILL.md format.
   - `python3 cli/vurctos.py skill-status --global [--skill <name>] [--json | --hook]` - read-only: per skill, the feedback entries (`remember --skill <name> --signal <type>`) that no `fb:<id>` citation in the skill's own files answers yet.
+  - `python3 cli/vurctos.py skill-snapshot <name> --global (--workdir W | --accept)` - copy a skill's live tree: a work pair `W/orig`, `W/cand` plus `W/manifest.json`, or the accepted baseline under `<evals_dir>/_snapshots/<name>/` (`--accept` runs no checks).
+  - `python3 cli/vurctos.py skill-check <name> --global (--workdir W | --since-accepted [--accept]) [--json]` - static check of a skill edit, no model: new lint lines (run with `HOME` set to a mirror of the home), character budgets, protected lines and files, category words, `fb:` citations; exits 0 pass, 1 fail, 3 hold; `--since-accepted` advances the baseline on a pass (on a hold only with `--accept`, never on a fail).
 - **Tests**: `python3 cli/test_vurctos.py` (stdlib `unittest`; no test framework dependency).
 - No build or lint step, and no external tools. `vurctos.bundle` / `vurctossource.zip` are local repo snapshots, not source to edit.
 

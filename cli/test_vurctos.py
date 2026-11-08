@@ -19,11 +19,13 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3634,6 +3636,939 @@ class VurctosRejectSkillTest(unittest.TestCase):
                                   str(self.proj), "--json"]))
         self.assertEqual([(t["name"], t["score"]) for t in status["targets"]],
                          [("caption-format", 3)])
+
+
+STUB_LINT = '''\
+import os, sys
+top = os.path.join(os.environ["HOME"], sys.argv[1])
+hits, files = [], 0
+for d, dirs, names in os.walk(top, followlinks=True):
+    dirs.sort()
+    for n in sorted(names):
+        if not n.endswith(".md"):
+            continue
+        p = os.path.join(d, n)
+        files += 1
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh, 1):
+                if "LINT-BAD" in line:
+                    hits.append("%s:%d: VIOLATION %s" % (p, i, line.strip()))
+print("stub-lint: %d files scanned, %d violations" % (files, len(hits)))
+for h in hits:
+    print(h)
+'''
+
+FIXTURE_SKILL_MD = (
+    "# Caption kit\n\n"
+    "1. OWNER-DECIDED: keep the source title.\n"
+    "2. Translate idioms by meaning.\n"
+    "3. Ask before you publish a caption file.\n\n"
+    "- LINT-BAD legacy wording kept for now\n")
+FIXTURE_RULES_MD = (
+    "# Rules\n\n"
+    "- [status:x] cue timing follows the source.\n"
+    "- Use the term list in scripts/term_lock.json.\n")
+
+
+class VurctosSkillCheckTest(unittest.TestCase):
+    """Static check: skill-snapshot and skill-check against a fixture home
+    in a temp dir. mirror_home, the memory root (VURCTOS_HOME) and every
+    skill are temp paths; nothing reads or writes the real home. The skill
+    is reached through `.claude/skills/caption-kit -> ../../.agents/skills/
+    caption-kit -> <home>/work/caption-kit`, has a nested skill, a history
+    file and a protected file, and a stub lint walks `$HOME/.agents/skills`."""
+
+    NAME = "caption-kit"
+    ACCESS = [".claude/skills/caption-kit", ".agents/skills/caption-kit",
+              "work/caption-kit"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.r = Path(self.tmp.name)
+        self.h = self.r / "home"
+        self.root = self.h / ".vurctos"
+        self.live = self.h / "work" / "caption-kit"
+        os.environ["VURCTOS_HOME"] = str(self.root)
+        self._write(self.live / "SKILL.md", FIXTURE_SKILL_MD)
+        self._write(self.live / "references" / "rules.md", FIXTURE_RULES_MD)
+        self._write(self.live / "references" / "CHANGELOG.md",
+                    "# Changes\n\n- 0.1.0 first version\n")
+        self._write(self.live / "scripts" / "term_lock.json",
+                    '{"title": "keep"}\n')
+        self._write(self.live / "sub-skill" / "SKILL.md", "# Nested\n")
+        self._write(self.h / ".agents" / "skills" / "other-skill" /
+                    "SKILL.md", "# Other\n")
+        self._write(self.h / "work" / "notes.txt", "sibling\n")
+        self._write(self.h / ".profile", "export EDITOR=vi\n")
+        os.symlink(self.live, self.h / ".agents" / "skills" / "caption-kit")
+        (self.h / ".claude" / "skills").mkdir(parents=True)
+        os.symlink("../../.agents/skills/caption-kit",
+                   self.h / ".claude" / "skills" / "caption-kit")
+        os.symlink("../../.agents/skills/other-skill",
+                   self.h / ".claude" / "skills" / "other-skill")
+        self.stub = self._write(self.r / "tools" / "stub_lint.py", STUB_LINT)
+        self.budget = {".agents/skills/caption-kit/SKILL.md":
+                       len(FIXTURE_SKILL_MD) + 40,
+                       "work/caption-kit/references/CHANGELOG.md": 400}
+        self._write(self.root / "budget.json", json.dumps(self.budget))
+        self._write(self.root / "skill-evals" / self.NAME / "_protected.txt",
+                    "// anchors other files point at\n"
+                    "- Use the term list in scripts/term_lock.json.\n")
+        self._config()
+        for flags in ([], ["--landed", "SKILL.md"]):
+            _out(["remember", "--global", "--what", "title dropped",
+                  "--date", "2026-11-01", "--skill", self.NAME,
+                  "--signal", "correction"] + flags)
+        _out(["remember", "--global", "--what", "other lesson", "--date",
+              "2026-11-01", "--skill", "other-skill", "--signal",
+              "correction"])
+        self.wn = 0
+
+    def tearDown(self):
+        del os.environ["VURCTOS_HOME"]
+        self.tmp.cleanup()
+
+    def _write(self, path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _config(self, **over):
+        cfg = {"skills_dirs": [str(self.h / ".claude" / "skills")],
+               "mirror_home": str(self.h),
+               "protected_line_patterns": ["OWNER-DECIDED",
+                                           r"\[status:[a-z]+\]"],
+               "protected_category_words": ["publish", "spend"],
+               "protected_files": {self.NAME: ["scripts/term_lock.json"]},
+               "lint_cmds": [[sys.executable, "-B", str(self.stub),
+                              ".agents/skills"]],
+               "budget_file": "budget.json"}
+        cfg.update(over)
+        self._write(self.root / "skill-loop.json", json.dumps(cfg))
+
+    def _run(self, *argv):
+        """(exit code, stdout, error message) of one in-process CLI call."""
+        buf, code, msg = io.StringIO(), 0, ""
+        with contextlib.redirect_stdout(buf):
+            try:
+                vurctos.main(list(argv))
+            except SystemExit as exc:
+                if isinstance(exc.code, str):
+                    code, msg = 1, exc.code
+                else:
+                    code = exc.code or 0
+        return code, buf.getvalue(), msg
+
+    def _snapshot(self):
+        self.wn += 1
+        w = self.r / "wk" / f"w{self.wn}"
+        code, out, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                   "--workdir", str(w))
+        self.assertEqual(code, 0, msg)
+        return w
+
+    def _check_w(self, w, *extra):
+        code, out, msg = self._run("skill-check", self.NAME, "--global",
+                                   "--workdir", str(w), "--json", *extra)
+        self.assertEqual(msg, "")
+        return code, json.loads(out)
+
+    def _work(self, edit):
+        """Snapshot, apply edit(W/cand), check: (code, result, W)."""
+        w = self._snapshot()
+        edit(w / "cand")
+        code, result = self._check_w(w)
+        return code, result, w
+
+    def _edit(self, path, old, new):
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _append(self, path, text):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _found(self, result, category, severity=None):
+        return [f for f in result["findings"] if f["category"] == category
+                and (severity is None or f["severity"] == severity)]
+
+    def _store(self):
+        return self.root / "skill-evals" / "_snapshots" / self.NAME
+
+    def _accepted(self):
+        return (self._store() / "accepted").read_text(encoding="utf-8")
+
+    def _accept(self):
+        code, out, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                   "--accept")
+        self.assertEqual(code, 0, msg)
+        return vurctos._skill_tree_hash(self.live)
+
+    def _since(self, *extra):
+        code, out, msg = self._run("skill-check", self.NAME, "--global",
+                                   "--since-accepted", "--json", *extra)
+        self.assertEqual(msg, "")
+        return code, json.loads(out)
+
+    # --- snapshot ---
+
+    def test_snapshot_workdir_copies_tree_with_live_hash(self):
+        """W/orig and W/cand hold the live tree's files at their relpaths and
+        hash like live.
+        Fails if: `_copy_live` skips a file `_tree_files` lists or writes it under another relpath, or W/cand is not an identical copy of W/orig."""
+        w = self._snapshot()
+        want = vurctos._skill_tree_hash(self.live)
+        rels = [rel for rel, _ in vurctos._tree_files(self.live)]
+        self.assertEqual(rels, ["SKILL.md", "references/CHANGELOG.md",
+                                "references/rules.md",
+                                "scripts/term_lock.json"])
+        for arm in ("orig", "cand"):
+            self.assertEqual(vurctos._skill_tree_hash(w / arm), want)
+            for rel in rels:
+                p = w / arm / rel
+                self.assertFalse(p.is_symlink())
+                self.assertEqual(p.read_bytes(),
+                                 (self.live / rel).read_bytes())
+
+    def test_snapshot_nested_skill_is_a_symlink_to_live(self):
+        """A nested skill is not copied: it becomes a symlink to its live
+        real path, at the same relpath.
+        Fails if: `_copy_live` copies a nested skill's content, drops its symlink, or points the symlink anywhere but the nested skill's live real path."""
+        w = self._snapshot()
+        for arm in ("orig", "cand"):
+            link = w / arm / "sub-skill"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link),
+                             os.path.realpath(self.live / "sub-skill"))
+
+    def test_snapshot_copies_symlinked_subdirectory_as_content(self):
+        """A symlinked subdirectory of the skill is copied as content: a real
+        directory with regular files in the copy.
+        Fails if: `_copy_live` keeps a symlinked subdirectory as a symlink, or skips the files reached through it."""
+        self._write(self.h / "work" / "shared-notes" / "glossary.md",
+                    "- shared term\n")
+        os.symlink(self.h / "work" / "shared-notes", self.live / "shared")
+        w = self._snapshot()
+        copy = w / "orig" / "shared"
+        self.assertFalse(copy.is_symlink())
+        self.assertTrue(stat.S_ISDIR(os.lstat(copy).st_mode))
+        self.assertFalse((copy / "glossary.md").is_symlink())
+        self.assertEqual((copy / "glossary.md").read_text(encoding="utf-8"),
+                         "- shared term\n")
+        self.assertEqual(vurctos._skill_tree_hash(w / "orig"),
+                         vurctos._skill_tree_hash(self.live))
+
+    def test_snapshot_manifest_keys(self):
+        """manifest.json carries exactly the decided keys, every hop of the
+        symlink chain as an access path, and a UTC ISO 8601 time.
+        Fails if: a manifest key is missing, renamed or extra, access_paths misses a hop of the chain or is not relative to mirror_home, or taken_at is not UTC ISO 8601."""
+        w = self._snapshot()
+        m = json.loads((w / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(m), ["access_paths", "files", "live",
+                                     "schema_version", "skill", "taken_at",
+                                     "tree"])
+        self.assertEqual(m["schema_version"], 1)
+        self.assertEqual(m["skill"], self.NAME)
+        self.assertEqual(m["live"], os.path.realpath(self.live))
+        self.assertEqual(m["access_paths"], self.ACCESS)
+        self.assertEqual(m["tree"], vurctos._skill_tree_hash(self.live))
+        self.assertEqual(m["files"], {
+            rel: hashlib.sha256(p.read_bytes()).hexdigest()
+            for rel, p in vurctos._tree_files(self.live)})
+        self.assertRegex(m["taken_at"],
+                         r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+    def test_snapshot_refuses_non_empty_workdir(self):
+        """W must not exist or must be empty.
+        Fails if: the workdir check accepts a non-empty directory or a file, or refuses an empty directory."""
+        w = self.r / "busy"
+        self._write(w / "keep.txt", "mine\n")
+        code, _, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                 "--workdir", str(w))
+        self.assertEqual(code, 1)
+        self.assertIn("must not exist or must be an empty directory", msg)
+        self.assertEqual(sorted(os.listdir(w)), ["keep.txt"])
+        code, _, _ = self._run("skill-snapshot", self.NAME, "--global",
+                               "--workdir", str(w / "keep.txt"))
+        self.assertEqual(code, 1)
+        empty = self.r / "empty"
+        empty.mkdir()
+        code, _, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                 "--workdir", str(empty))
+        self.assertEqual(code, 0, msg)
+        self.assertTrue((empty / "cand" / "SKILL.md").is_file())
+
+    def test_snapshot_copy_retries_once_then_refuses(self):
+        """A copy that does not hash like live is retried once, then
+        refused with an error naming the target, and nothing is kept.
+        Fails if: a copy whose hash differs from the live hash taken before it is kept, it is not retried exactly once, or the error does not name the target."""
+        real = vurctos._copy_live
+        calls = []
+
+        def drifting(live, dest, always):
+            calls.append(dest)
+            real(live, dest)
+            if always or len(calls) == 1:
+                (dest / "drift.md").write_text("x\n", encoding="utf-8")
+        w = self.r / "wk" / "drift"
+        with unittest.mock.patch.object(
+                vurctos, "_copy_live",
+                lambda live, dest: drifting(live, dest, True)):
+            code, _, msg = self._run("skill-snapshot", self.NAME,
+                                     "--global", "--workdir", str(w))
+        self.assertEqual(code, 1)
+        self.assertIn(self.NAME, msg)
+        self.assertIn("changed while it was being copied", msg)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse((w / "orig").exists())
+        calls.clear()
+        with unittest.mock.patch.object(
+                vurctos, "_copy_live",
+                lambda live, dest: drifting(live, dest, False)):
+            code, _, msg = self._run("skill-snapshot", self.NAME,
+                                     "--global", "--workdir", str(w))
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse((w / "orig" / "drift.md").exists())
+
+    def test_single_file_target_is_copied_and_linked_as_a_file(self):
+        """A configured target that is one file is copied as that file, its
+        access path links to the arm's file, and its budget key is the
+        access path itself.
+        Fails if: a single-file target is copied as anything but that one file, its access path in the mirror links to the arm directory instead of the file, or its budget key is not the access path itself."""
+        doc = self._write(self.h / "docs" / "dispatch.md", "# Dispatch\n")
+        self._write(self.root / "budget.json",
+                    json.dumps({"docs/dispatch.md": 20}))
+        self._config(targets={"dispatch-standard": str(doc)})
+        self.NAME = "dispatch-standard"
+        w = self._snapshot()
+        self.assertEqual(sorted(os.listdir(w / "orig")), ["dispatch.md"])
+        self.assertEqual(vurctos._skill_tree_hash(w / "orig"),
+                         vurctos._skill_tree_hash(doc))
+        m = json.loads((w / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["access_paths"], ["docs/dispatch.md"])
+        self._append(w / "cand" / "dispatch.md", "x" * 30 + "\n")
+        code, result = self._check_w(w)
+        link = w / "mirrors" / "cand" / "docs" / "dispatch.md"
+        self.assertEqual(os.readlink(link), str(w / "cand" / "dispatch.md"))
+        self.assertEqual(code, 1)
+        self.assertIn("docs/dispatch.md",
+                      self._found(result, "volume", "fail")[0]["message"])
+
+    # --- accept ---
+
+    def test_accept_bootstraps_the_baseline(self):
+        """--accept stores live, points `accepted` at it and prints the hash;
+        an existing hash directory is never rewritten.
+        Fails if: the pointer is not `<hash>` plus a newline, the store copy does not hash to its name, the hash is not printed, or a second accept rewrites an existing hash directory."""
+        code, out, msg = self._run("skill-snapshot", self.NAME, "--global",
+                                   "--accept")
+        tree = vurctos._skill_tree_hash(self.live)
+        self.assertEqual(code, 0, msg)
+        self.assertIn(tree, out)
+        self.assertEqual(self._accepted(), tree + "\n")
+        copy = self._store() / tree
+        self.assertEqual(vurctos._skill_tree_hash(copy), tree)
+        self.assertTrue((copy / "sub-skill").is_symlink())
+        marker = copy / "SKILL.md"
+        before = marker.stat().st_ino, marker.stat().st_mtime_ns
+        self._run("skill-snapshot", self.NAME, "--global", "--accept")
+        self.assertEqual((marker.stat().st_ino, marker.stat().st_mtime_ns),
+                         before)
+        self.assertEqual(sorted(p.name for p in self._store().iterdir()),
+                         ["accepted", tree])
+
+    def test_since_accepted_without_change_exits_zero(self):
+        """An unchanged live tree runs nothing and exits 0.
+        Fails if: an unchanged tree runs the check, creates a check directory, or exits non-zero."""
+        tree = self._accept()
+        code, out, msg = self._run("skill-check", self.NAME, "--global",
+                                   "--since-accepted")
+        self.assertEqual((code, msg), (0, ""))
+        self.assertIn(f"nothing changed since accepted {tree}", out)
+        self.assertFalse((self.root / "skill-work").exists())
+
+    def test_since_accepted_without_baseline_errors(self):
+        """No accepted pointer: exit 1 with the bootstrap command.
+        Fails if: a missing accepted pointer does not exit 1, or the message does not name `vurctos skill-snapshot NAME --accept`."""
+        code, _, msg = self._run("skill-check", self.NAME, "--global",
+                                 "--since-accepted")
+        self.assertEqual(code, 1)
+        self.assertIn(f"vurctos skill-snapshot {self.NAME} --accept", msg)
+        self.assertFalse((self.root / "skill-work").exists())
+
+    # --- mirror ---
+
+    def test_mirror_overlays_every_hop_of_the_chain(self):
+        """In each mirror every access path is a symlink to that arm, each
+        directory along it is real, and every other entry links to live.
+        Fails if: any hop of the chain or a directory along it is left as a link to live, an access path links to the wrong arm, or a sibling entry is not linked to its live counterpart."""
+        w = self._snapshot()
+        self._check_w(w)
+        for arm in ("base", "cand"):
+            m = w / "mirrors" / arm
+            subject = w / ("orig" if arm == "base" else "cand")
+            for rel in self.ACCESS:
+                self.assertEqual(os.readlink(m / rel), str(subject), rel)
+                parent = (m / rel).parent
+                while parent != m:
+                    self.assertFalse(parent.is_symlink(), parent)
+                    self.assertTrue(parent.is_dir(), parent)
+                    parent = parent.parent
+            for rel in (".vurctos", ".profile", ".agents/skills/other-skill",
+                        ".claude/skills/other-skill", "work/notes.txt"):
+                self.assertEqual(os.readlink(m / rel), str(self.h / rel), rel)
+
+    def test_relative_hop_resolves_against_the_physical_directory(self):
+        """A relative link inside a skills dir that is itself a symlink is
+        resolved the way the OS resolves it: against the directory the link
+        physically sits in, not the path it was reached through.
+        Fails if: `_access_paths` joins a relative link onto the lexical
+        parent of the hop (for example drops the realpath of the parent),
+        so the chain leaves the home and the real hop is never overlaid."""
+        store = self.h / "store" / "a" / "b" / "skills"
+        store.mkdir(parents=True)
+        os.symlink("../../../../work/caption-kit", store / self.NAME)
+        os.symlink("../store/a/b/skills", self.h / ".claude" / "skills2")
+        self._config(skills_dirs=[str(self.h / ".claude" / "skills2")])
+        cfg = vurctos._skill_loop_config(self.root, True)
+        mirrored, other = vurctos._access_paths(self.NAME, cfg)
+        self.assertEqual(mirrored, [".claude/skills2/caption-kit",
+                                    "store/a/b/skills/caption-kit",
+                                    "work/caption-kit"])
+        self.assertEqual(other, [])
+
+    def test_stub_lint_sees_cand_through_each_access_path(self):
+        """Linting $HOME/<access path> in the cand mirror reads cand, and in
+        the base mirror reads orig, for every access path.
+        Fails if: an access path of a mirror resolves to live or to the other arm instead of its own arm."""
+        w = self._snapshot()
+        self._append(w / "cand" / "SKILL.md", "LINT-BAD cand-only\n")
+        self._check_w(w)
+        for rel in self.ACCESS:
+            for arm, expect in (("cand", True), ("base", False)):
+                env = dict(os.environ, HOME=str(w / "mirrors" / arm))
+                out = subprocess.run(
+                    [sys.executable, "-B", str(self.stub), rel], env=env,
+                    stdout=subprocess.PIPE, universal_newlines=True,
+                    check=True).stdout
+                self.assertEqual("cand-only" in out, expect, (rel, arm))
+                self.assertIn("legacy wording", out)
+
+    def test_mirror_contains_no_regular_files(self):
+        """A mirror holds only directories and symlinks.
+        Fails if: the mirror builder copies any file content (a regular file appears anywhere in a mirror) instead of linking it."""
+        w = self._snapshot()
+        self._check_w(w)
+        seen = 0
+        for top, dirs, files in os.walk(w / "mirrors"):
+            for name in dirs + files:
+                p = Path(top) / name
+                seen += 1
+                self.assertTrue(p.is_symlink()
+                                or stat.S_ISDIR(os.lstat(p).st_mode), p)
+        self.assertGreater(seen, 10)
+
+    # --- lint delta ---
+
+    def test_new_lint_violation_fails(self):
+        """A violation only cand has is a fail, reported as the raw line.
+        Fails if: a normalised line that cand has more often than base is not reported as a lint fail with its raw cand line."""
+        code, result, w = self._work(lambda c: self._append(
+            c / "references" / "rules.md", "LINT-BAD fresh wording\n"))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+        lines = [f["message"] for f in self._found(result, "lint", "fail")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("VIOLATION LINT-BAD fresh wording", lines[0])
+        self.assertIn(str(w / "mirrors" / "cand"), lines[0])
+
+    def test_moved_lint_violation_passes(self):
+        """A pre-existing violation that only moved to another line number is
+        not new.
+        Fails if: runs of digits are not normalised to `#`, so a violation that only changed line number counts as new."""
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "SKILL.md", "# Caption kit\n", "# Caption kit\n\n\n\n"))
+        self.assertEqual((code, result["level"]), (0, "pass"),
+                         result["findings"])
+
+    def test_changed_lint_header_count_passes(self):
+        """A header line whose count changed is not a new violation.
+        Fails if: the header's changed file count is not normalised and counts as a new lint line."""
+        code, result, _ = self._work(lambda c: self._write(
+            c / "references" / "extra.md", "# Extra\n\nplain text\n"))
+        self.assertEqual((code, result["level"]), (0, "pass"),
+                         result["findings"])
+
+    def test_missing_lint_command_fails(self):
+        """A lint command that cannot start is a fail (lint_error).
+        Fails if: a lint command that cannot start is skipped, ignored or passes."""
+        self._config(lint_cmds=[[str(self.r / "no-such-lint")]])
+        code, result, _ = self._work(lambda c: None)
+        self.assertEqual(code, 1)
+        found = self._found(result, "lint", "fail")
+        self.assertTrue(found and all("lint_error" in f["message"]
+                                      for f in found), found)
+
+    def test_lint_timeout_fails(self):
+        """A lint command that times out is a fail (lint_error).
+        Fails if: a timed-out lint command is skipped or passes, or lint_timeout_s is not applied."""
+        self._config(lint_cmds=[[sys.executable, "-B", "-c",
+                                 "import time; time.sleep(30)"]],
+                     lint_timeout_s=1)
+        start = time.monotonic()
+        code, result, _ = self._work(lambda c: None)
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", self._found(result, "lint",
+                                               "fail")[0]["message"])
+
+    # --- protected content ---
+
+    def test_removed_protected_line_holds(self):
+        """A protected line missing from cand is a hold.
+        Fails if: a protected line present in base and missing from cand is not a hold, or is reported without its file."""
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "SKILL.md", "1. OWNER-DECIDED: keep the source title.\n", ""))
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        found = self._found(result, "protected", "hold")
+        self.assertEqual(len(found), 1)
+        self.assertIn("OWNER-DECIDED: keep the source title.",
+                      found[0]["message"])
+        self.assertEqual(found[0]["file"], "SKILL.md")
+
+    def test_new_protected_line_holds(self):
+        """A new line carrying a protected marker is a hold (an editor must
+        not make its own rule unremovable by marking it).
+        Fails if: a protected line present in cand and not in base is not a hold."""
+        code, result, _ = self._work(lambda c: self._append(
+            c / "references" / "rules.md", "- [status:y] my own rule.\n"))
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        found = self._found(result, "protected", "hold")
+        self.assertEqual(len(found), 1)
+        self.assertIn("[status:y] my own rule.", found[0]["message"])
+        self.assertEqual(found[0]["file"], "references/rules.md")
+
+    def test_protected_line_moved_to_another_file_passes(self):
+        """Protected lines compare as one multiset over the tree, so moving
+        one between files is allowed.
+        Fails if: protected lines are compared per file instead of over the whole tree."""
+        def move(c):
+            self._edit(c / "SKILL.md",
+                       "1. OWNER-DECIDED: keep the source title.\n", "")
+            self._append(c / "references" / "rules.md",
+                         "- OWNER-DECIDED: keep the source title.\n")
+        code, result, _ = self._work(move)
+        self.assertEqual((code, result["level"]), (0, "pass"),
+                         result["findings"])
+
+    def test_renumbered_list_marker_passes(self):
+        """Renumbered or re-bulleted list items are the same lines.
+        Fails if: leading list markers (N., N), -, *, +) are not dropped, or inner whitespace is not collapsed, before lines are compared."""
+        def renumber(c):
+            self._edit(c / "SKILL.md",
+                       "1. OWNER-DECIDED: keep the source title.\n"
+                       "2. Translate idioms by meaning.\n"
+                       "3. Ask before you publish a caption file.\n",
+                       "1. Translate idioms by meaning.\n"
+                       "2) Ask before you publish a caption file.\n"
+                       "3.   OWNER-DECIDED:  keep the source title.\n")
+            self._edit(c / "references" / "rules.md",
+                       "- [status:x] cue", "* + [status:x] cue")
+        code, result, _ = self._work(renumber)
+        self.assertEqual((code, result["level"]), (0, "pass"),
+                         result["findings"])
+
+    def test_missing_curated_line_fails(self):
+        """A curated anchor line missing from the cand rule files is a fail;
+        comment lines (`//`) in the curated list are ignored.
+        Fails if: a curated line absent from the cand rule files is not a fail, or a `//` comment line in _protected.txt is treated as a curated line."""
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "references" / "rules.md",
+            "- Use the term list in scripts/term_lock.json.\n", ""))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+        found = self._found(result, "protected", "fail")
+        self.assertEqual(len(found), 1)
+        self.assertIn("Use the term list in scripts/term_lock.json.",
+                      found[0]["message"])
+
+    def test_curated_anchor_may_be_part_of_a_longer_line(self):
+        """A curated entry is an anchor other files point at, usually a few
+        words of a longer heading or rule; it is found when some normalised
+        rule line contains it, so editing the rest of that line passes.
+        Fails if: a curated entry must equal a whole normalised line, so an
+        edit elsewhere on the anchor's line fails, or a missing fragment is
+        not a fail."""
+        self._write(self.root / "skill-evals" / self.NAME / "_protected.txt",
+                    "term list in scripts\n")
+        rules = "references/rules.md"
+        code, result, _ = self._work(lambda c: self._edit(
+            c / rules, "- Use the term list", "- Always use the term list"))
+        self.assertEqual((code, result["level"]), (0, "pass"))
+        code, result, _ = self._work(lambda c: self._edit(
+            c / rules, "term list in scripts", "term table in scripts"))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+        self.assertIn("term list in scripts",
+                      self._found(result, "protected", "fail")[0]["message"])
+
+    def test_a_markdown_heading_is_a_curated_anchor(self):
+        """Other files point at headings, so a curated entry starting with
+        `#` is an anchor, not a comment; comments start with `//`.
+        Fails if: `_load_curated` skips lines starting with `#`, so a heading
+        anchor is never checked and renaming the heading passes."""
+        self._write(self.root / "skill-evals" / self.NAME / "_protected.txt",
+                    "// headings other files point at\n## Terms\n")
+        self._write(self.live / "SKILL.md",
+                    FIXTURE_SKILL_MD + "\n## Terms\n\nKeep the list.\n")
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "SKILL.md", "## Terms\n", "## Glossary\n"))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+        self.assertIn("## Terms",
+                      self._found(result, "protected", "fail")[0]["message"])
+
+    def test_changed_protected_file_holds(self):
+        """A protected file that changed, or is missing in cand, is a hold.
+        Fails if: a protected file whose sha256 differs between base and cand, or that is missing in cand, is not a hold."""
+        code, result, _ = self._work(lambda c: self._write(
+            c / "scripts" / "term_lock.json", '{"title": "drop"}\n'))
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        self.assertEqual(self._found(result, "protected", "hold")[0]["file"],
+                         "scripts/term_lock.json")
+        code, result, _ = self._work(
+            lambda c: (c / "scripts" / "term_lock.json").unlink())
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        self.assertIn("removed", self._found(result, "protected",
+                                             "hold")[0]["message"])
+
+    def test_category_word_in_added_line_holds(self):
+        """An added line containing a category word is a hold, reported with
+        its file.
+        Fails if: an added line containing a protected_category_words entry is not a hold, or is reported without the file it is in."""
+        code, result, _ = self._work(lambda c: self._append(
+            c / "references" / "rules.md",
+            "- Spend credits after a dry run.\n"))
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        found = self._found(result, "touch", "hold")
+        self.assertEqual(len(found), 1)
+        self.assertIn("Spend credits after a dry run.", found[0]["message"])
+        self.assertEqual(found[0]["file"], "references/rules.md")
+
+    def test_category_word_in_removed_line_holds(self):
+        """A removed line containing a category word is a hold.
+        Fails if: a removed line containing a protected_category_words entry is not a hold, or is reported without the file it was in."""
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "SKILL.md", "3. Ask before you publish a caption file.\n", ""))
+        self.assertEqual((code, result["level"]), (3, "hold"))
+        found = self._found(result, "touch", "hold")
+        self.assertEqual(len(found), 1)
+        self.assertIn("removed", found[0]["message"])
+        self.assertEqual(found[0]["file"], "SKILL.md")
+
+    # --- volume ---
+
+    def test_newly_over_budget_file_fails(self):
+        """A cand file over its budget (key `<access path>/<relpath>`) that
+        base was within is a fail.
+        Fails if: a cand file over the budget of an `A/relpath` key is not a fail."""
+        code, result, _ = self._work(lambda c: self._append(
+            c / "SKILL.md", "Plain extra words. " * 4 + "\n"))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+        found = self._found(result, "volume", "fail")
+        self.assertEqual(len(found), 1)
+        self.assertIn(".agents/skills/caption-kit/SKILL.md",
+                      found[0]["message"])
+
+    def test_pre_existing_overrun_not_made_worse_passes_with_info(self):
+        """An overrun base already had is info while cand is not longer, and
+        a fail once cand grows.
+        Fails if: an overrun that base already had fails although cand is not longer than base, is not reported as info, or a longer cand passes."""
+        self.budget[".agents/skills/caption-kit/SKILL.md"] = 10
+        self._write(self.root / "budget.json", json.dumps(self.budget))
+        code, result, _ = self._work(lambda c: self._edit(
+            c / "SKILL.md", "2. Translate idioms by meaning.\n", ""))
+        self.assertEqual((code, result["level"]), (0, "pass"),
+                         result["findings"])
+        self.assertTrue(any("pre-existing" in f["message"]
+                            for f in self._found(result, "volume", "info")))
+        code, result, _ = self._work(lambda c: self._append(
+            c / "SKILL.md", "more\n"))
+        self.assertEqual((code, result["level"]), (1, "fail"))
+
+    def test_net_growth_is_reported(self):
+        """Net growth of rule files and of history files is info.
+        Fails if: net growth is not reported, its arithmetic is wrong, or history files are counted as rule files."""
+        def grow(c):
+            self._append(c / "references" / "rules.md", "123456789\n")
+            self._append(c / "references" / "CHANGELOG.md", "- 0.2\n")
+        code, result, _ = self._work(grow)
+        self.assertEqual(code, 0, result["findings"])
+        rule = len(FIXTURE_SKILL_MD) + len(FIXTURE_RULES_MD)
+        self.assertIn(f"net growth: rule files +10 chars ({rule} -> "
+                      f"{rule + 10}), history files +6 chars",
+                      [f["message"] for f in
+                       self._found(result, "volume", "info")][0])
+
+    def test_coverage_lists_rule_files_without_a_budget_key(self):
+        """Rule files with no budget key under any access path are listed;
+        with no budget file, that is said instead.
+        Fails if: a rule file with no budget key under any access path is not listed, a budgeted or history file is listed, or a missing budget_file is not reported."""
+        code, result, _ = self._work(lambda c: None)
+        self.assertEqual(code, 0)
+        files = [f.get("file") for f in self._found(result, "coverage")
+                 if "budget key" in f["message"]]
+        self.assertEqual(files, ["references/rules.md"])
+        self._config(budget_file=None)
+        code, result, _ = self._work(lambda c: None)
+        self.assertTrue(any("no budget_file configured" in f["message"]
+                            for f in self._found(result, "coverage", "info")))
+
+    # --- claims ---
+
+    def test_unknown_claim_fails(self):
+        """A newly cited id that is no feedback entry naming this target is
+        a fail.
+        Fails if: a newly cited id that is not a feedback entry, or is an entry naming another target, is not a fail."""
+        for entry_id in ("2026-11-01#9", "2026-11-01#3"):
+            code, result, _ = self._work(lambda c: self._append(
+                c / "references" / "CHANGELOG.md", f"- fb:{entry_id}\n"))
+            self.assertEqual((code, result["level"]), (1, "fail"), entry_id)
+            found = self._found(result, "claims", "fail")
+            self.assertEqual(len(found), 1)
+            self.assertIn(f"fb:{entry_id}", found[0]["message"])
+
+    def test_landed_claim_reports_landed(self):
+        """A claim whose entry has `landed:` is info with evidence landed.
+        Fails if: a claim whose entry has a `landed:` sub-line is not reported as landed, or blocks the check."""
+        code, result, _ = self._work(lambda c: self._append(
+            c / "references" / "CHANGELOG.md", "- fb:2026-11-01#2\n"))
+        self.assertEqual((code, result["level"]), (0, "pass"))
+        found = self._found(result, "claims")
+        self.assertEqual([(f["severity"], f["message"]) for f in found],
+                         [("info", "fb:2026-11-01#2 newly cited; evidence: "
+                                   "landed")])
+
+    def test_missing_evidence_claim_reports_missing(self):
+        """A claim without evidence is info MISSING; a citation base already
+        had is not a new claim.
+        Fails if: a claim whose entry has no `landed:` sub-line is not reported as MISSING, or an id already cited in base is reported again."""
+        self._append(self.live / "references" / "CHANGELOG.md",
+                     "- fb:2026-11-01#2\n")
+        code, result, _ = self._work(lambda c: self._append(
+            c / "references" / "CHANGELOG.md", "- fb:2026-11-01#1\n"))
+        self.assertEqual((code, result["level"]), (0, "pass"))
+        found = self._found(result, "claims")
+        self.assertEqual([(f["severity"], f["message"]) for f in found],
+                         [("info", "fb:2026-11-01#1 newly cited; evidence: "
+                                   "MISSING")])
+
+    # --- advancing and exit codes ---
+
+    def test_pass_advances_accepted(self):
+        """A pass moves accepted to the cand hash and stores that copy.
+        Fails if: a pass does not move accepted to the cand hash, or does not keep the checked copy in the store."""
+        old = self._accept()
+        self._append(self.live / "references" / "CHANGELOG.md", "- 0.2\n")
+        new = vurctos._skill_tree_hash(self.live)
+        code, result = self._since()
+        self.assertEqual((code, result["level"], result["advanced"]),
+                         (0, "pass", True))
+        self.assertEqual((result["base_tree"], result["cand_tree"]),
+                         (old, new))
+        self.assertEqual(self._accepted(), new + "\n")
+        self.assertEqual(vurctos._skill_tree_hash(self._store() / new), new)
+        self.assertTrue((self._store() / old).is_dir())
+
+    def test_hold_does_not_advance(self):
+        """A hold without --accept leaves accepted where it was.
+        Fails if: a hold without --accept advances accepted or stores the cand copy."""
+        old = self._accept()
+        self._edit(self.live / "SKILL.md",
+                   "1. OWNER-DECIDED: keep the source title.\n", "")
+        code, result = self._since()
+        self.assertEqual((code, result["level"], result["advanced"]),
+                         (3, "hold", False))
+        self.assertEqual(self._accepted(), old + "\n")
+        self.assertEqual(sorted(p.name for p in self._store().iterdir()),
+                         ["accepted", old])
+
+    def test_hold_with_accept_advances(self):
+        """--accept advances accepted past a hold.
+        Fails if: --since-accepted --accept does not advance accepted on a hold."""
+        self._accept()
+        self._edit(self.live / "SKILL.md",
+                   "1. OWNER-DECIDED: keep the source title.\n", "")
+        new = vurctos._skill_tree_hash(self.live)
+        code, result = self._since("--accept")
+        self.assertEqual((code, result["level"], result["advanced"]),
+                         (3, "hold", True))
+        self.assertEqual(self._accepted(), new + "\n")
+
+    def test_fail_with_accept_does_not_advance(self):
+        """A fail never advances accepted, not even with --accept.
+        Fails if: a fail advances accepted, with or without --accept, or stores the cand copy."""
+        old = self._accept()
+        self._append(self.live / "SKILL.md", "LINT-BAD again\n")
+        for extra in ((), ("--accept",)):
+            code, result = self._since(*extra)
+            self.assertEqual((code, result["level"], result["advanced"]),
+                             (1, "fail", False))
+            self.assertEqual(self._accepted(), old + "\n")
+            self.assertEqual(sorted(p.name for p in self._store().iterdir()),
+                             ["accepted", old])
+
+    def test_exit_codes_of_the_cli_process(self):
+        """The process exits 0 on pass, 1 on fail, 3 on hold, and 2 (usage)
+        for --accept without --since-accepted.
+        Fails if: the exit code for pass, fail or hold is not 0, 1 or 3, or --workdir with --accept is not a usage error."""
+        cli = str(Path(vurctos.__file__).resolve())
+        env = dict(os.environ, VURCTOS_HOME=str(self.root))
+        edits = {0: lambda c: None,
+                 1: lambda c: self._append(c / "SKILL.md", "LINT-BAD x\n"),
+                 3: lambda c: self._append(c / "SKILL.md", "Spend less.\n")}
+        for want, edit in edits.items():
+            w = self._snapshot()
+            edit(w / "cand")
+            r = subprocess.run([sys.executable, "-B", cli, "skill-check",
+                                self.NAME, "--global", "--workdir", str(w)],
+                               env=env, cwd=str(self.r),
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+            self.assertEqual(r.returncode, want, r.stdout)
+        r = subprocess.run([sys.executable, "-B", cli, "skill-check",
+                            self.NAME, "--global", "--workdir", str(w),
+                            "--accept"], env=env, cwd=str(self.r),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(r.returncode, 2)
+
+    def test_check_json_shape(self):
+        """--json prints the decided object, and check.json holds the same.
+        Fails if: a key of the result or of a finding is missing, renamed or extra, a category or severity is outside the decided sets, findings are not grouped in the decided category order, or check.json differs from the printed object."""
+        def mixed(c):
+            self._edit(c / "SKILL.md",
+                       "1. OWNER-DECIDED: keep the source title.\n", "")
+            self._append(c / "references" / "CHANGELOG.md",
+                         "- fb:2026-11-01#1\n")
+        code, result, w = self._work(mixed)
+        self.assertEqual(sorted(result), ["advanced", "base_tree",
+                                          "cand_tree", "findings", "level",
+                                          "schema_version", "skill"])
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual((result["skill"], result["level"],
+                          result["advanced"]), (self.NAME, "hold", False))
+        self.assertEqual(result["base_tree"],
+                         vurctos._skill_tree_hash(w / "orig"))
+        self.assertEqual(result["cand_tree"],
+                         vurctos._skill_tree_hash(w / "cand"))
+        order = ["protected", "touch", "volume", "lint", "coverage",
+                 "claims"]
+        cats = [f["category"] for f in result["findings"]]
+        self.assertEqual(cats, sorted(cats, key=order.index))
+        self.assertEqual({"protected", "volume", "coverage", "claims"},
+                         set(cats))
+        for f in result["findings"]:
+            self.assertTrue({"category", "severity", "message"} <= set(f)
+                            <= {"category", "severity", "message", "file"})
+            self.assertIn(f["severity"], ("fail", "hold", "info"))
+        self.assertEqual(json.loads((w / "check.json").read_text(
+            encoding="utf-8")), result)
+
+    def test_human_output_gives_level_first_then_groups(self):
+        """The human output starts with the level, then findings grouped by
+        category, each line with its severity.
+        Fails if: the first line does not start with the level, a category heading is missing or out of order, or a finding line lacks its severity."""
+        w = self._snapshot()
+        self._append(w / "cand" / "SKILL.md", "Spend less.\n")
+        code, out, _ = self._run("skill-check", self.NAME, "--global",
+                                 "--workdir", str(w))
+        lines = out.splitlines()
+        self.assertEqual(code, 3)
+        self.assertTrue(lines[0].startswith("hold: "), lines[0])
+        heads = [ln[:-1] for ln in lines if ln.endswith(":")
+                 and not ln.startswith(" ")]
+        self.assertEqual(heads, ["touch", "volume", "coverage"])
+        self.assertIn("  [hold] added line with 'spend': Spend less. "
+                      "(SKILL.md)", lines)
+
+    # --- the live tree and where the check writes ---
+
+    def _fs_state(self, skip):
+        state = {}
+        for top, dirs, files in os.walk(self.r):
+            here = Path(top)
+            dirs[:] = [d for d in dirs if here / d not in skip]
+            for name in dirs + files:
+                p = here / name
+                rel = p.relative_to(self.r).as_posix()
+                if p.is_symlink():
+                    state[rel] = ("link", os.readlink(p))
+                elif p.is_dir():
+                    state[rel] = ("dir",)
+                else:
+                    state[rel] = ("file", p.stat().st_mtime_ns,
+                                  hashlib.sha256(p.read_bytes()).hexdigest())
+        return state
+
+    def test_live_tree_unchanged_and_writes_stay_in_place(self):
+        """Snapshots and checks leave the live tree, the day logs, the index
+        and the config as they were, and write only under work_dir,
+        evals_dir and the given workdir.
+        Fails if: a snapshot or check modifies the live tree, or writes anything outside work_dir, evals_dir and the --workdir directory."""
+        skip = {self.root / "skill-work", self.root / "skill-evals",
+                self.r / "wk"}
+        self._accept()
+        self._append(self.live / "references" / "CHANGELOG.md", "- 0.2\n")
+        live_hash = vurctos._skill_tree_hash(self.live)
+        before = self._fs_state(skip)
+        self.assertEqual(self._since()[0], 0)
+        self.assertEqual(vurctos._skill_tree_hash(self.live), live_hash)
+        self.assertEqual(self._fs_state(skip), before)
+        self._edit(self.live / "SKILL.md",
+                   "1. OWNER-DECIDED: keep the source title.\n",
+                   "1. OWNER-DECIDED: keep the source title!\n")
+        live_hash = vurctos._skill_tree_hash(self.live)
+        before = self._fs_state(skip)
+        self.assertEqual(self._since("--accept")[0], 3)
+        w = self._snapshot()
+        self._append(w / "cand" / "SKILL.md", "LINT-BAD y\n")
+        self.assertEqual(self._check_w(w)[0], 1)
+        self.assertEqual(vurctos._skill_tree_hash(self.live), live_hash)
+        self.assertEqual(self._fs_state(skip), before)
+
+    def test_static_check_config_keys_are_validated(self):
+        """The new skill-loop.json keys get the decided defaults, and a
+        malformed value is an error naming the file.
+        Fails if: a default differs from the decided one, a relative path does not resolve against the memory root, or a malformed static-check value is accepted."""
+        self._write(self.root / "skill-loop.json", "{}")
+        cfg = vurctos._skill_loop_config(self.root, True)
+        self.assertEqual(
+            (cfg["evals_dir"], cfg["work_dir"], cfg["mirror_home"],
+             cfg["protected_line_patterns"], cfg["protected_category_words"],
+             cfg["protected_files"], cfg["lint_cmds"], cfg["lint_timeout_s"],
+             cfg["budget_file"]),
+            (self.root / "skill-evals", self.root / "skill-work",
+             Path("~").expanduser(), [], [], {}, [], 300, None))
+        self._config(evals_dir="ev", work_dir="wd", budget_file="b.json")
+        cfg = vurctos._skill_loop_config(self.root, True)
+        self.assertEqual((cfg["evals_dir"], cfg["work_dir"],
+                          cfg["budget_file"]),
+                         (self.root / "ev", self.root / "wd",
+                          self.root / "b.json"))
+        bad = [{"evals_dir": ""}, {"work_dir": 3}, {"mirror_home": None},
+               {"protected_line_patterns": ["("]},
+               {"protected_line_patterns": "x"},
+               {"protected_category_words": [""]},
+               {"protected_files": {"caption-kit": "scripts/x"}},
+               {"protected_files": {"caption-kit": ["/abs"]}},
+               {"protected_files": {"Bad Name": ["x"]}},
+               {"lint_cmds": ["lint"]}, {"lint_cmds": [[]]},
+               {"lint_cmds": [["lint", ""]]}, {"lint_timeout_s": 0},
+               {"lint_timeout_s": True}, {"lint_timeout_s": "5"},
+               {"budget_file": 4}, {"evaluated": 1}]
+        for data in bad:
+            self._write(self.root / "skill-loop.json", json.dumps(data))
+            with self.assertRaises(SystemExit) as cm:
+                vurctos._skill_loop_config(self.root, True)
+            self.assertIn("skill-loop.json", str(cm.exception.code), data)
 
 
 if __name__ == "__main__":

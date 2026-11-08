@@ -102,6 +102,30 @@ python3 cli/vurctos.py skill-status --global --hook
 
 Read-only (it never creates or seeds anything, not even the index or the global root). For every skill or target named by a feedback entry, or only the one given by `--skill` even when it has none, it lists the pending entries: those no `fb:<id>` citation in the skill's `.md` files answers and no later `retract` / `decline` withdraws. It also shows entries marked `landed` but not cited, cited entries a later retract withdrew, entries filed after an `fb-retired` line that name the retired rule, whether each entry was filed against the current `skillver`, character counts of `SKILL.md`, the rule files and the history files, and a score (3 per pending correction or reject, 1 per other pending failure, 3 per retracted-but-cited entry, 2 per entry naming a retired rule). `--json` prints the same data; `--hook` prints one line of numbers only and always exits 0. See `docs/skills-system.md`.
 
+### Skill snapshot and skill check (static check of a skill edit)
+
+```bash
+# after editing a skill in place: compare live with the last accepted copy
+python3 cli/vurctos.py skill-snapshot vibe-coding-setup --global --accept   # once, to bootstrap
+python3 cli/vurctos.py skill-check vibe-coding-setup --global --since-accepted [--accept] [--json]
+
+# or edit a copy: snapshot a work pair, edit W/cand/, then check it
+python3 cli/vurctos.py skill-snapshot vibe-coding-setup --global --workdir /tmp/w1
+python3 cli/vurctos.py skill-check vibe-coding-setup --global --workdir /tmp/w1 --json
+```
+
+No model, seconds. `skill-snapshot --workdir W` (W must not exist or be empty) writes two identical copies of the skill's tree, `W/orig/` and `W/cand/`, plus `W/manifest.json`; `--accept` stores the live tree as the accepted baseline under `<evals_dir>/_snapshots/<name>/<tree hash>/`, points `<evals_dir>/_snapshots/<name>/accepted` at it and prints the hash, running no checks (the bootstrap step, and the owner's explicit override). A copy holds the files the `skillver` hash covers; a nested skill becomes a symlink to its live directory.
+
+`skill-check` compares a candidate with its base: `--workdir W` checks `W/cand` against `W/orig` and advances nothing; `--since-accepted` checks a fresh copy of live against the accepted copy (exit 0 at once when nothing changed), working under `<work_dir>/checks/<name>/<UTC stamp>/`. It reports, grouped as protected, touch, volume, lint, coverage and claims:
+
+- **fail** (exit 1): a lint line the candidate has and the base has not; a lint command that cannot start or times out; a curated anchor missing (no rule line still contains it); a file newly over its character budget; an `fb:<id>` newly cited that is no feedback entry for this skill.
+- **hold** (exit 3): a protected line removed, changed or added; a protected file changed; a removed or added line containing a category word. The owner decides these.
+- **pass** (exit 0) otherwise, with info lines: net growth of rule and history files, rule files no budget covers, an overrun the base already had and the candidate did not worsen, the evidence (`landed` or `MISSING`) for each new citation.
+
+With `--since-accepted`, a pass advances `accepted` to the candidate, a hold advances only with `--accept`, and a fail never does. `--json` prints `{schema_version, skill, level, base_tree, cand_tree, advanced, findings}`, also written to `check.json`. Errors before the check exit 1, usage errors 2. The command never changes the live tree, the day logs or the index.
+
+Configured in the private `skill-loop.json`: `evals_dir` (default `<memory root>/skill-evals`), `work_dir` (default `<memory root>/skill-work`), `mirror_home` (default `~`), `protected_line_patterns` and `protected_category_words` (lists), `protected_files` (name to relpaths), `lint_cmds` (argv lists, run with `HOME` set to a mirror of `mirror_home`), `lint_timeout_s` (default 300) and `budget_file` (JSON: path relative to `mirror_home` to a character budget). Curated anchors (the words other files point at, such as a heading) go in `<evals_dir>/<name>/_protected.txt`, one per line (`//` lines are comments; a leading `#` is part of the anchor, so a Markdown heading works); each must still appear inside some rule line. See `docs/skills-system.md`.
+
 ### Aging (retire old durable lines)
 
 ```bash

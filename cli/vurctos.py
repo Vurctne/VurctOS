@@ -17,6 +17,8 @@ steps:
   vurctos reject           reject reviewed work: file the lesson, re-queue it
   vurctos skill-new        scaffold a SKILL.md for a proven repeated pattern
   vurctos skill-status     read-only: the feedback each skill has not answered
+  vurctos skill-snapshot   copy a skill's tree: a work pair or the baseline
+  vurctos skill-check      static check of a skill edit: pass, hold or fail
 
 Design rules (see AGENTS.md):
   - local-first, subscription-first, no API keys
@@ -25,6 +27,7 @@ Design rules (see AGENTS.md):
 """
 
 import argparse
+import collections
 import datetime
 import difflib
 import fnmatch
@@ -37,7 +40,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:
     import fcntl
@@ -1732,7 +1735,10 @@ SIGNAL_KIND = {"correction": "correction", "reject": "fail", "check": "fail",
                "deviation": "fail", "review": "note", "pick": "note",
                "data": "note", "retract": "note", "decline": "note"}
 SKILL_LOOP_FILE = "skill-loop.json"
-SKILL_LOOP_KEYS = ("skills_dirs", "targets", "history_globs")
+SKILL_LOOP_KEYS = ("skills_dirs", "targets", "history_globs", "evals_dir",
+                   "work_dir", "mirror_home", "protected_line_patterns",
+                   "protected_category_words", "protected_files",
+                   "lint_cmds", "lint_timeout_s", "budget_file")
 DEFAULT_HISTORY_GLOBS = ("CHANGELOG.md", "**/CHANGELOG.md", "**/HISTORY.md")
 # Never part of a target's tree (version hash, citations, sizes).
 TREE_EXCLUDED = (".git", "__pycache__", ".DS_Store", "evals")
@@ -1757,11 +1763,12 @@ def _is_feedback(subs):
 def _skill_loop_config(root, is_global):
     """The optional private config `<root>/skill-loop.json`, with defaults.
 
-    Returns {"file", "skills_dirs", "targets", "history_globs"}. `~` is
+    Returns {"file"} plus one entry per SKILL_LOOP_KEYS key. `~` is
     expanded and a relative path resolves against the memory root. A file
     that is not valid JSON, has the wrong shapes, or carries an unknown key
     (a typo would otherwise fall back to the defaults unnoticed) is an error
-    that names the file.
+    that names the file. The static-check keys (evals_dir onwards) are read
+    only by skill-snapshot and skill-check.
     """
     path = root / SKILL_LOOP_FILE
     raw = {}
@@ -1790,12 +1797,14 @@ def _skill_loop_config(root, is_global):
         if named:
             bad(f"target name {named[0]!r} must be lowercase letters, "
                 f"numbers and single hyphens")
+        _check_static_config(raw, bad)
 
     def place(value):
         p = Path(value).expanduser()
         return p if p.is_absolute() else root / p
     default_dirs = (["~/.claude/skills"] if is_global
                     else [str(root / "skills")])
+    budget = raw.get("budget_file")
     return {
         "file": path,
         "skills_dirs": [place(d) for d in
@@ -1803,7 +1812,60 @@ def _skill_loop_config(root, is_global):
         "targets": {k: place(v) for k, v in raw.get("targets", {}).items()},
         "history_globs": list(raw.get("history_globs",
                                       DEFAULT_HISTORY_GLOBS)),
+        "evals_dir": place(raw.get("evals_dir", "skill-evals")),
+        "work_dir": place(raw.get("work_dir", "skill-work")),
+        "mirror_home": place(raw.get("mirror_home", "~")),
+        "protected_line_patterns": list(
+            raw.get("protected_line_patterns", [])),
+        "protected_category_words": list(
+            raw.get("protected_category_words", [])),
+        "protected_files": {k: [PurePosixPath(r).as_posix() for r in v]
+                            for k, v in raw.get("protected_files",
+                                                {}).items()},
+        "lint_cmds": [list(c) for c in raw.get("lint_cmds", [])],
+        "lint_timeout_s": raw.get("lint_timeout_s", 300),
+        "budget_file": place(budget) if budget is not None else None,
     }
+
+
+def _check_static_config(raw, bad):
+    """Validate the static-check keys of skill-loop.json; `bad` exits with
+    an error naming the file."""
+    def strings(value):
+        return isinstance(value, list) and all(
+            isinstance(v, str) and v for v in value)
+    for key in ("evals_dir", "work_dir", "mirror_home"):
+        if key in raw and not (isinstance(raw[key], str) and raw[key]):
+            bad(f"{key} must be a non-empty path string")
+    if "budget_file" in raw and raw["budget_file"] is not None and not (
+            isinstance(raw["budget_file"], str) and raw["budget_file"]):
+        bad("budget_file must be a non-empty path string or null")
+    for key in ("protected_line_patterns", "protected_category_words"):
+        if key in raw and not strings(raw[key]):
+            bad(f"{key} must be a list of non-empty strings")
+    for pattern in raw.get("protected_line_patterns", []):
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            bad(f"protected_line_patterns: {pattern!r} is not a valid "
+                f"regex ({exc})")
+    files = raw.get("protected_files", {})
+    if not (isinstance(files, dict) and all(
+            SKILL_NAME_RE.match(k) and strings(v) for k, v in files.items())):
+        bad("protected_files must map each target name to a list of "
+            "non-empty relative paths")
+    for rels in files.values():
+        for rel in rels:
+            if rel.startswith(("/", "~")) or ".." in rel.split("/"):
+                bad(f"protected_files: {rel!r} must be a path relative to "
+                    f"the target's tree")
+    cmds = raw.get("lint_cmds", [])
+    if not (isinstance(cmds, list) and all(strings(c) and c for c in cmds)):
+        bad("lint_cmds must be a list of argv lists of non-empty strings")
+    timeout = raw.get("lint_timeout_s", 300)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) \
+            or timeout <= 0:
+        bad("lint_timeout_s must be a positive integer")
 
 
 def _find_skill(name, cfg):
@@ -1848,33 +1910,52 @@ def _tree_files(path):
     minus TREE_EXCLUDED entries and nested skills (a subdirectory with its
     own SKILL.md); a target that is one file is that file alone. Raises
     OSError when the tree cannot be read."""
+    return _tree_walk(path)[0]
+
+
+def _tree_walk(path):
+    """(files, nested): the _tree_files list, and the nested-skill
+    directories it leaves out, as sorted [(relpath, Path)]."""
     real = Path(os.path.realpath(path))
     if real.is_file():
-        return [(real.name, real)]
+        return [(real.name, real)], []
     if not real.is_dir():
         raise FileNotFoundError(f"{real} does not exist")
 
     def fail(exc):
         raise exc
-    out, seen = [], set()
+    out, nested, seen = [], [], set()
     for top, dirs, files in os.walk(real, onerror=fail, followlinks=True):
         here = Path(top)
         if os.path.realpath(top) in seen:  # a symlink loop
             dirs[:] = []
             continue
         seen.add(os.path.realpath(top))
-        dirs[:] = [d for d in dirs if d not in TREE_EXCLUDED
-                   and not (here / d / "SKILL.md").exists()]
+        keep = []
+        for d in dirs:
+            if d in TREE_EXCLUDED:
+                continue
+            if (here / d / "SKILL.md").exists():
+                nested.append(((here / d).relative_to(real).as_posix(),
+                               here / d))
+            else:
+                keep.append(d)
+        dirs[:] = keep
         out += [((here / f).relative_to(real).as_posix(), here / f)
                 for f in files if f not in TREE_EXCLUDED]
-    return sorted(out)
+    return sorted(out), sorted(nested)
 
 
 def _skill_tree_hash(path):
     """12 hex of a sha256 over the sorted lines `relpath\\0<sha256 of the
     file bytes>\\n` of the target's tree."""
+    return _files_hash(_tree_files(path))
+
+
+def _files_hash(files):
+    """The tree hash of [(relpath, Path)]."""
     lines = sorted(f"{rel}\0{hashlib.sha256(p.read_bytes()).hexdigest()}\n"
-                   for rel, p in _tree_files(path))
+                   for rel, p in files)
     return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:12]
 
 
@@ -2188,6 +2269,842 @@ def cmd_skill_status(args):
         print("\nnext: a revision answers an entry by citing fb:<id> in the "
               "target's own files (its version log line); file `remember "
               "--signal retract --supersedes <id>` for an entry found wrong")
+
+
+# --- Skill feedback loop: static check (no model, seconds) ----------------
+#
+# `skill-snapshot` copies a target's live tree, either as a work pair
+# (orig/ and cand/) for an edit made in the copy, or as the accepted
+# baseline in a store under evals_dir. `skill-check` compares a candidate
+# with its base and answers three questions: did the edit break anything
+# mechanical (new lint lines, a file over its character budget), did it
+# touch what only the owner decides (protected lines and files, changed
+# lines carrying a category word), and does it cite feedback (`fb:`) that
+# no entry backs. Levels: fail (exit 1) blocks, hold (exit 3) goes back to
+# the owner, pass (exit 0). The patterns that recognise the owner's
+# decisions live in the private config, never in this code.
+#
+# The owner's lint tools build every path from $HOME, and skills are reached
+# through chains of symlinks. So each arm is linted through a mirror of the
+# home: symlinks to live everywhere, except that every hop of the target's
+# symlink chain is overlaid with the arm. An absolute link left in place
+# would lead the lint straight back to the live tree.
+
+CHECK_SCHEMA = 1
+SNAPSHOT_SCHEMA = 1
+CHECK_CATEGORIES = ("protected", "touch", "volume", "lint", "coverage",
+                    "claims")
+CHECK_EXIT = {"pass": 0, "fail": 1, "hold": 3}
+LINT_REPORT_MAX = 20
+SNAPSHOTS_DIRNAME = "_snapshots"
+ACCEPTED_POINTER = "accepted"  # phase 4 adds `evaluated` beside it
+CURATED_FILE = "_protected.txt"
+_HASH_NAME_RE = re.compile(r"^[0-9a-f]{12}$")
+_RULE_MARKERS_RE = re.compile(r"^(?:(?:[-*+]|[0-9]+[.)])(?:\s+|$))*")
+_DIGITS_RE = re.compile(r"[0-9]+")
+
+
+def _copy_file(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    shutil.copymode(src, dst)
+
+
+def _copy_live(live, dest):
+    """Copy a live tree into the empty directory dest: the files
+    _tree_files lists, as content at their relpaths (symlinked
+    subdirectories included), and each nested skill as a symlink to its
+    live real path, so a mirror can still read it. A single-file target
+    becomes dest/<its name>, which hashes like the file itself."""
+    real = Path(os.path.realpath(live))
+    if real.is_file():
+        _copy_file(real, dest / real.name)
+        return
+    files, nested = _tree_walk(real)
+    for rel, p in files:
+        _copy_file(p, dest / rel)
+    for rel, p in nested:
+        link = dest / rel
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.realpath(p), link)
+
+
+def _snapshot_copy(name, live, dest):
+    """Copy the live tree of `name` into the new directory dest and return
+    its tree hash. The copy must hash to what live hashed to just before
+    it; a mismatch means live changed mid-copy, so it is retried once and
+    then refused, leaving nothing behind."""
+    for _ in range(2):
+        try:
+            if dest.exists():
+                shutil.rmtree(dest)
+            want = _skill_tree_hash(live)
+            dest.mkdir(parents=True)
+            _copy_live(live, dest)
+            got = _skill_tree_hash(dest)
+        except (OSError, ValueError) as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            sys.exit(f"error: cannot copy the live tree of {name}: {exc}")
+        if got == want:
+            return want
+    shutil.rmtree(dest, ignore_errors=True)
+    sys.exit(f"error: the live tree of {name} changed while it was being "
+             f"copied, twice; nothing was kept. Run it again.")
+
+
+def _arm_files(arm):
+    """The tree of a copy (an arm), as sorted [(relpath, Path)]: its
+    regular files minus TREE_EXCLUDED entries and nested skills. Symlinks
+    are not followed: in a copy they are the nested-skill links to live,
+    which may have moved since."""
+    def fail(exc):
+        raise exc
+    out = []
+    for top, dirs, files in os.walk(arm, onerror=fail):
+        here = Path(top)
+        dirs[:] = [d for d in dirs if d not in TREE_EXCLUDED
+                   and not (here / d).is_symlink()
+                   and not (here / d / "SKILL.md").exists()]
+        out += [((here / f).relative_to(arm).as_posix(), here / f)
+                for f in files if f not in TREE_EXCLUDED
+                and not (here / f).is_symlink()]
+    return sorted(out)
+
+
+def _arm_hash(arm):
+    return _files_hash(_arm_files(arm))
+
+
+def _refuse_inside(name, live, paths):
+    """Refuse a write location inside the live tree: the check never writes
+    there."""
+    real = os.path.realpath(live)
+    for p in paths:
+        rp = os.path.realpath(p)
+        if rp == real or rp.startswith(real.rstrip(os.sep) + os.sep):
+            sys.exit(f"error: {p} lies inside the live tree of {name}; "
+                     f"snapshots and checks never write there")
+
+
+def _home_relative(path, homes):
+    """path relative to the first spelling of the home it lies under, as a
+    posix string, or None."""
+    for home in homes:
+        try:
+            rel = Path(path).relative_to(home)
+        except ValueError:
+            continue
+        if rel.parts:
+            return rel.as_posix()
+    return None
+
+
+def _access_paths(name, cfg):
+    """(mirrored, other): the paths a target is reached through. For every
+    skills dir holding NAME, then for a configured target: the path, each
+    hop of its symlink chain (a relative link resolved against its link's
+    parent) and finally its real path. Paths under mirror_home are returned
+    relative to it, de-duplicated in order; the rest are not mirrored."""
+    home = cfg["mirror_home"]
+    homes = list(dict.fromkeys([os.path.abspath(home),
+                                os.path.realpath(home)]))
+    starts = [d / name for d in cfg["skills_dirs"] if (d / name).exists()]
+    if name in cfg["targets"]:
+        starts.append(cfg["targets"][name])
+    hops = []
+    for start in starts:
+        p = os.path.abspath(start)
+        hops.append(p)
+        for _ in range(40):  # a longer chain is a loop
+            if not os.path.islink(p):
+                break
+            # The OS resolves a relative link against the directory the link
+            # physically sits in, which differs from the lexical parent when
+            # that directory is reached through a symlink itself; the
+            # physical spot is then a path to the target as well.
+            phys = os.path.join(os.path.realpath(os.path.dirname(p)),
+                                os.path.basename(p))
+            if phys != p:
+                hops.append(phys)
+            p = os.path.normpath(os.path.join(os.path.dirname(phys),
+                                              os.readlink(p)))
+            hops.append(p)
+        hops.append(os.path.realpath(start))
+    mirrored, other = [], []
+    for hop in hops:
+        rel = _home_relative(hop, homes)
+        bucket, item = (mirrored, rel) if rel is not None else (other, hop)
+        if item not in bucket:
+            bucket.append(item)
+    return mirrored, other
+
+
+def _clear_mirrors(path):
+    """Remove the mirrors an earlier check left. A mirror holds only
+    directories and symlinks, so anything else there is refused, not
+    deleted."""
+    if not os.path.lexists(path):
+        return
+    for top, _, files in os.walk(path):
+        for f in files:
+            if not os.path.islink(os.path.join(top, f)):
+                sys.exit(f"error: {path} holds a regular file "
+                         f"({os.path.join(top, f)}), so it is not a mirror; "
+                         f"refusing to remove it")
+    shutil.rmtree(path)
+
+
+def _build_mirrors(home, access, arms):
+    """Build one mirror of `home` per (mirror dir, subject) in arms, all
+    from a single read of the directory listings. Every entry is a symlink
+    to its live counterpart, except that each directory along an access
+    path is a real directory and each access path is a symlink to the
+    arm's subject. No file content is copied. An access path inside
+    another one already lies in that arm and gets no overlay of its own."""
+    home = Path(home)
+    leaves = sorted({PurePosixPath(a).parts for a in access})
+    leaves = [leaf for leaf in leaves
+              if not any(o != leaf and leaf[:len(o)] == o for o in leaves)]
+    dirs = sorted({()} | {leaf[:i] for leaf in leaves
+                          for i in range(1, len(leaf))},
+                  key=lambda d: (len(d), d))
+    listing = {d: sorted(os.listdir(home.joinpath(*d))) for d in dirs}
+    overlaid = set(dirs) | set(leaves)
+    for mirror, subject in arms:
+        mirror.mkdir(parents=True)
+        for d in dirs:
+            here = mirror.joinpath(*d)
+            if d:
+                here.mkdir()
+            for entry in listing[d]:
+                if d + (entry,) not in overlaid:
+                    os.symlink(home.joinpath(*d, entry), here / entry)
+        for leaf in leaves:
+            os.symlink(subject, mirror.joinpath(*leaf))
+
+
+def _finding(category, severity, message, file=None):
+    out = {"category": category, "severity": severity, "message": message}
+    if file:
+        out["file"] = file
+    return out
+
+
+def _times(n):
+    return f" (x{n})" if n > 1 else ""
+
+
+def _lint_run(argv, mirror, cwd, timeout):
+    """(output, None) of one lint command run with HOME=mirror, stdout and
+    stderr together; (None, why) when it could not start or timed out."""
+    env = dict(os.environ, HOME=str(mirror))
+    try:
+        r = subprocess.run(argv, cwd=str(cwd), env=env,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout}s"
+    except (OSError, ValueError) as exc:
+        return None, f"could not start ({exc})"
+    return r.stdout.decode("utf-8", errors="replace"), None
+
+
+def _lint_lines(text, replacements):
+    """[(normalised, raw)] per non-empty output line: mirror paths become
+    `~`, arm paths `<subject>`, and every run of ASCII digits `#`, so line
+    numbers and counts that move with unrelated lines compare equal."""
+    out = []
+    for raw in text.splitlines():
+        line = raw
+        for old, new in replacements:
+            line = line.replace(old, new)
+        line = _DIGITS_RE.sub("#", line).strip()
+        if line:
+            out.append((line, raw))
+    return out
+
+
+def _lint_findings(cfg, cwd, mirrors, arms):
+    """The lint delta: each lint command on the base mirror and on the cand
+    mirror; a normalised line cand has more often than base is new, and
+    fails. A command that could not run fails too: it cannot pass."""
+    if not cfg["lint_cmds"]:
+        return [_finding("coverage", "info",
+                         "no lint_cmds configured: the lint delta did not "
+                         "run")]
+    reps = []
+    for path, new in [(m, "~") for m in mirrors] + \
+            [(a, "<subject>") for a in arms]:
+        for spelled in dict.fromkeys([str(path), os.path.realpath(path)]):
+            reps.append((spelled, new))
+    reps.sort(key=lambda r: -len(r[0]))
+    findings, fresh = [], []
+    for argv in cfg["lint_cmds"]:
+        label = shlex.join(argv)
+        outs = []
+        for side, mirror in zip(("base", "cand"), mirrors):
+            text, why = _lint_run(argv, mirror, cwd, cfg["lint_timeout_s"])
+            if text is None:
+                findings.append(_finding("lint", "fail",
+                                         f"lint_error: `{label}` {why} "
+                                         f"({side} run)"))
+            outs.append(text)
+        if None in outs:
+            continue
+        base = collections.Counter(n for n, _ in _lint_lines(outs[0], reps))
+        seen = collections.Counter()
+        for norm, raw in _lint_lines(outs[1], reps):
+            seen[norm] += 1
+            if seen[norm] > base[norm]:
+                fresh.append(raw.strip())
+    findings += [_finding("lint", "fail", f"new lint line: {raw}")
+                 for raw in fresh[:LINT_REPORT_MAX]]
+    if len(fresh) > LINT_REPORT_MAX:
+        findings.append(_finding("lint", "fail",
+                                 f"... and {len(fresh) - LINT_REPORT_MAX} "
+                                 f"more new lint lines"))
+    return findings
+
+
+def _norm_rule_line(line):
+    """A line as protected content compares it: stripped, leading list
+    markers (-, *, +, N., N), repeated) dropped and inner whitespace
+    collapsed, so a renumbered or re-bulleted line is the same line."""
+    return " ".join(_RULE_MARKERS_RE.sub("", line.strip()).split())
+
+
+def _is_history(rel, cfg):
+    return any(_glob_match(rel, g) for g in cfg["history_globs"])
+
+
+def _rule_line_counts(files, cfg):
+    """{relpath: Counter of normalised non-empty lines} over the rule
+    files: every .md file not matching history_globs."""
+    out = {}
+    for rel, data in files.items():
+        if rel.endswith(".md") and not _is_history(rel, cfg):
+            text = data.decode("utf-8", errors="replace")
+            out[rel] = collections.Counter(
+                n for n in map(_norm_rule_line, text.splitlines()) if n)
+    return out
+
+
+def _tree_total(per_file):
+    total = collections.Counter()
+    for counts in per_file.values():
+        total.update(counts)
+    return total
+
+
+def _line_file(line, side, other):
+    """The file a changed line is in: the first whose count of it on this
+    side exceeds the other side's, else the first that has it."""
+    empty = collections.Counter()
+    for rel in sorted(side):
+        if side[rel][line] > other.get(rel, empty)[line]:
+            return rel
+    return next((rel for rel in sorted(side) if side[rel][line]), None)
+
+
+def _protected_findings(name, cfg, base, cand, curated):
+    """Protected lines (a multiset over the whole tree, so a line may move
+    between files), curated anchor lines, protected files, and changed
+    lines carrying a category word."""
+    findings = []
+    b_lines = _rule_line_counts(base, cfg)
+    c_lines = _rule_line_counts(cand, cfg)
+    b_total, c_total = _tree_total(b_lines), _tree_total(c_lines)
+    patterns = [re.compile(p) for p in cfg["protected_line_patterns"]]
+
+    def protected(counts):
+        return collections.Counter({line: n for line, n in counts.items()
+                                    if any(p.search(line) for p in patterns)})
+    b_prot, c_prot = protected(b_total), protected(c_total)
+    for line, n in sorted((b_prot - c_prot).items()):
+        findings.append(_finding(
+            "protected", "hold", f"protected line removed or changed"
+            f"{_times(n)}: {line}", _line_file(line, b_lines, c_lines)))
+    for line, n in sorted((c_prot - b_prot).items()):
+        findings.append(_finding(
+            "protected", "hold", f"new protected line{_times(n)} (only the "
+            f"owner marks a line protected): {line}",
+            _line_file(line, c_lines, b_lines)))
+    for anchor in curated or ():  # a few words other files point at
+        if not any(anchor in line for line in c_total):
+            findings.append(_finding(
+                "protected", "fail", f"curated anchor missing from the rule "
+                f"files: {anchor}"))
+    for rel in cfg["protected_files"].get(name, []):
+        b, c = base.get(rel), cand.get(rel)
+        if b is None and c is None:
+            findings.append(_finding("coverage", "info", f"protected file "
+                                     f"{rel} is not in the tree", rel))
+        elif b is None or c is None or (hashlib.sha256(b).digest()
+                                        != hashlib.sha256(c).digest()):
+            what = ("removed" if c is None else "added" if b is None
+                    else "changed")
+            findings.append(_finding("protected", "hold",
+                                     f"protected file {what}: {rel}", rel))
+    words = cfg["protected_category_words"]
+    for label, diff, side, other in (
+            ("removed", b_total - c_total, b_lines, c_lines),
+            ("added", c_total - b_total, c_lines, b_lines)):
+        for line, n in sorted(diff.items()):
+            hit = [w for w in words if w.casefold() in line.casefold()]
+            if hit:
+                findings.append(_finding(
+                    "touch", "hold", f"{label} line with "
+                    f"{', '.join(repr(w) for w in hit)}{_times(n)}: {line}",
+                    _line_file(line, side, other)))
+    return findings
+
+
+def _chars(data):
+    return len(data.decode("utf-8", errors="replace"))
+
+
+def _volume_findings(cfg, base, cand, access, is_file, budget):
+    """Character budgets for every cand file under every access path, the
+    net growth of rule and history files, and the rule files no budget
+    key covers."""
+    findings = []
+    if budget is not None:
+        for rel in sorted(cand):
+            c = _chars(cand[rel])
+            b = _chars(base[rel]) if rel in base else None
+            for a in access:
+                key = a if is_file else f"{a}/{rel}"
+                if key not in budget or c <= budget[key]:
+                    continue
+                if b is not None and b > budget[key] and c <= b:
+                    findings.append(_finding(
+                        "volume", "info", f"pre-existing overrun, not made "
+                        f"worse: {key} {c} chars, budget {budget[key]} "
+                        f"(base {b})", rel))
+                else:
+                    was = f"base {b}" if b is not None else "new file"
+                    findings.append(_finding(
+                        "volume", "fail", f"over budget: {key} {c} chars, "
+                        f"budget {budget[key]} ({was})", rel))
+
+    def md_chars(files, history):
+        return sum(_chars(d) for rel, d in files.items()
+                   if rel.endswith(".md") and _is_history(rel, cfg) == history)
+    rb, rc = md_chars(base, False), md_chars(cand, False)
+    hb, hc = md_chars(base, True), md_chars(cand, True)
+    findings.append(_finding(
+        "volume", "info", f"net growth: rule files {rc - rb:+d} chars "
+        f"({rb} -> {rc}), history files {hc - hb:+d} chars ({hb} -> {hc})"))
+    if budget is None:
+        findings.append(_finding("coverage", "info", "no budget_file "
+                                 "configured: sizes were not checked"))
+        return findings
+    for rel in sorted(cand):
+        if rel.endswith(".md") and not _is_history(rel, cfg) and not any(
+                (a if is_file else f"{a}/{rel}") in budget for a in access):
+            findings.append(_finding("coverage", "info", f"no budget key "
+                                     f"for {rel} under any access path", rel))
+    return findings
+
+
+def _claim_findings(name, root, base, cand):
+    """`fb:` ids newly cited in cand: each must be a feedback entry naming
+    this target (a typo would leave the real entry pending, silently); the
+    evidence for the others is reported."""
+    def cited(files):
+        found = {}
+        for rel, data in sorted(files.items()):
+            if rel.endswith(".md"):
+                text = data.decode("utf-8", errors="replace")
+                for m in FB_TOKEN_RE.finditer(text):
+                    found.setdefault(m.group(1), rel)
+        return found
+    old, new = cited(base), cited(cand)
+    entries = {e["id"]: e for e in _feedback_entries(root)}
+    findings = []
+    for entry_id in sorted(set(new) - set(old), key=_entry_sort_key):
+        e = entries.get(entry_id)
+        if e is None or name not in e["skills"]:
+            findings.append(_finding(
+                "claims", "fail", f"fb:{entry_id} is not a feedback entry "
+                f"naming {name}", new[entry_id]))
+        else:
+            evidence = "landed" if e["subs"].get("landed") else "MISSING"
+            findings.append(_finding(
+                "claims", "info", f"fb:{entry_id} newly cited; evidence: "
+                f"{evidence}", new[entry_id]))
+    return findings
+
+
+def _load_budget(cfg):
+    """The budget file as {path relative to mirror_home: chars}, or None
+    when none is configured."""
+    path = cfg["budget_file"]
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: cannot read budget_file {path}: {exc}")
+    if not (isinstance(data, dict) and all(
+            isinstance(v, int) and not isinstance(v, bool)
+            for v in data.values())):
+        sys.exit(f"error: malformed budget_file {path}: it must map paths "
+                 f"relative to mirror_home to character budgets (int)")
+    return {PurePosixPath(k).as_posix(): v for k, v in data.items()}
+
+
+def _load_curated(cfg, name):
+    """(path, anchors): the curated anchors of
+    <evals_dir>/<name>/_protected.txt, normalised; each must still appear
+    inside some rule line. Anchors None when there is no such file."""
+    path = cfg["evals_dir"] / name / CURATED_FILE
+    if not path.exists():
+        return path, None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        sys.exit(f"error: cannot read {path}: {exc}")
+    lines = [_norm_rule_line(ln) for ln in text.splitlines()
+             if not ln.strip().startswith("//")]  # "#" starts headings
+    return path, [ln for ln in lines if ln]
+
+
+def _static_check(ctx, base_arm, cand_arm, check_dir, access):
+    """Every finding of one check, ordered by category. The mirrors are
+    rebuilt under check_dir/mirrors; lint runs with check_dir as cwd."""
+    cfg, name = ctx["cfg"], ctx["name"]
+    try:
+        base = {rel: p.read_bytes() for rel, p in _arm_files(base_arm)}
+        cand = {rel: p.read_bytes() for rel, p in _arm_files(cand_arm)}
+        mirrors = check_dir / "mirrors"
+        _clear_mirrors(mirrors)
+        pair = (mirrors / "base", mirrors / "cand")
+        subject = (lambda arm: arm / ctx["filename"]) if ctx["is_file"] \
+            else (lambda arm: arm)
+        _build_mirrors(cfg["mirror_home"], access,
+                       [(pair[0], subject(base_arm)),
+                        (pair[1], subject(cand_arm))])
+    except OSError as exc:
+        sys.exit(f"error: cannot prepare the check of {name}: {exc}")
+    curated_path, curated = ctx["curated"]
+    findings = _protected_findings(name, cfg, base, cand, curated)
+    if curated is None:
+        findings.append(_finding("coverage", "info", f"no curated protected "
+                                 f"lines ({curated_path} does not exist)"))
+    findings += _volume_findings(cfg, base, cand, access, ctx["is_file"],
+                                 ctx["budget"])
+    findings += _lint_findings(cfg, check_dir, pair, (base_arm, cand_arm))
+    findings += [_finding("coverage", "info", f"not mirrored (outside "
+                          f"mirror_home): {p}") for p in ctx["not_mirrored"]]
+    if not access:
+        findings.append(_finding("coverage", "info", "no access path lies "
+                                 "under mirror_home: the lint saw no arm"))
+    findings += _claim_findings(name, ctx["root"], base, cand)
+    order = {c: i for i, c in enumerate(CHECK_CATEGORIES)}
+    findings.sort(key=lambda f: order[f["category"]])
+    return findings
+
+
+def _check_level(findings):
+    severities = {f["severity"] for f in findings}
+    return ("fail" if "fail" in severities
+            else "hold" if "hold" in severities else "pass")
+
+
+def _check_target(args):
+    """(root, cfg, live): NAME validated exactly as `remember --skill`
+    validates it. The root is never created or seeded."""
+    root = _resolve_root(args, seed=False)
+    cfg = _skill_loop_config(root, getattr(args, "global_", False))
+    return root, cfg, _resolve_skill(args.name, cfg)
+
+
+def _snapshot_store(cfg, name):
+    return cfg["evals_dir"] / SNAPSHOTS_DIRNAME / name
+
+
+def _read_accepted(store):
+    """The accepted tree hash, or None when there is no usable pointer."""
+    try:
+        tree = (store / ACCEPTED_POINTER).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return tree if _HASH_NAME_RE.match(tree) and (store / tree).is_dir() \
+        else None
+
+
+def _partial_dir(store):
+    return store / f".partial-{os.getpid()}-{os.urandom(4).hex()}"
+
+
+def _store_commit(store, tmp, tree):
+    """Move a complete, verified copy into place as store/<tree>. A hash
+    directory that already exists is kept untouched."""
+    final = store / tree
+    try:
+        if final.exists():
+            raise FileExistsError(final)
+        os.rename(tmp, final)
+    except OSError:
+        if not final.is_dir():
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _store_live(name, live, store):
+    """Copy live into the store, unless its hash directory already exists;
+    return the tree hash."""
+    try:
+        tree = _skill_tree_hash(live)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: cannot read the live tree of {name}: {exc}")
+    if (store / tree).is_dir():
+        return tree
+    store.mkdir(parents=True, exist_ok=True)
+    tmp = _partial_dir(store)
+    tree = _snapshot_copy(name, live, tmp)
+    try:
+        _store_commit(store, tmp, tree)
+    except OSError as exc:
+        sys.exit(f"error: cannot store the copy of {name}: {exc}")
+    return tree
+
+
+def _store_arm(name, arm, store, tree):
+    """Keep the checked cand copy as store/<tree> (not a fresh copy of
+    live, which may have changed since the check)."""
+    if (store / tree).is_dir():
+        return
+    tmp = _partial_dir(store)
+    try:
+        shutil.copytree(arm, tmp, symlinks=True)
+        if _arm_hash(tmp) != tree:
+            shutil.rmtree(tmp, ignore_errors=True)
+            sys.exit(f"error: the checked copy of {name} no longer hashes "
+                     f"to {tree}; accepted was not advanced")
+        _store_commit(store, tmp, tree)
+    except OSError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.exit(f"error: cannot store the checked copy of {name}: {exc}")
+
+
+def _write_accepted(store, tree):
+    _atomic_write(store / ACCEPTED_POINTER, tree + "\n")
+
+
+def _new_check_dir(parent):
+    """A new, unique <parent>/<UTC stamp>[-n] directory."""
+    parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ")
+    n = 1
+    while True:
+        d = parent / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            d.mkdir()
+            return d
+        except FileExistsError:
+            n += 1
+
+
+def cmd_skill_snapshot(args):
+    """Copy a target's live tree: a work pair to edit (--workdir), or the
+    accepted baseline (--accept, the bootstrap and the owner's override;
+    it runs no checks)."""
+    root, cfg, live = _check_target(args)
+    name = args.name
+    if args.accept:
+        store = _snapshot_store(cfg, name)
+        _refuse_inside(name, live, [store])
+        tree = _store_live(name, live, store)
+        _write_accepted(store, tree)
+        print(f"accepted {tree}")
+        print(f"  {name}: baseline copy at {store / tree}")
+        return
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    if w.exists() and not (w.is_dir() and not any(w.iterdir())):
+        sys.exit(f"error: --workdir {w} must not exist or must be an empty "
+                 f"directory")
+    _refuse_inside(name, live, [w])
+    access, other = _access_paths(name, cfg)
+    tree = _snapshot_copy(name, live, w / "orig")
+    try:
+        shutil.copytree(w / "orig", w / "cand", symlinks=True)
+        if _skill_tree_hash(w / "cand") != tree:
+            raise OSError("cand/ does not hash like orig/")
+        files = {rel: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for rel, p in _arm_files(w / "orig")}
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: cannot prepare {w / 'cand'}: {exc}")
+    manifest = {
+        "schema_version": SNAPSHOT_SCHEMA, "skill": name,
+        "live": os.path.realpath(live), "access_paths": access,
+        "tree": tree, "files": files,
+        "taken_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")}
+    (w / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    print(f"snapshot of {name} (tree {tree}) in {w}")
+    print(f"  orig/ and cand/: {len(files)} file(s); edit cand/ only")
+    print(f"  access paths: {', '.join(access) or '(none under mirror_home)'}")
+    for p in other:
+        print(f"  not mirrored (outside mirror_home): {p}")
+    print(f"next: vurctos skill-check {name} {_scope_flag(args)} --workdir "
+          f"{shlex.quote(str(w))}")
+
+
+def _check_result(name, level, base_tree, cand_tree, advanced, findings):
+    return {"schema_version": CHECK_SCHEMA, "skill": name, "level": level,
+            "base_tree": base_tree, "cand_tree": cand_tree,
+            "advanced": advanced, "findings": findings}
+
+
+def _print_check(args, result, notes=()):
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"{result['level']}: skill-check {result['skill']} (base "
+          f"{result['base_tree']}, cand {result['cand_tree']})")
+    for category in CHECK_CATEGORIES:
+        group = [f for f in result["findings"]
+                 if f["category"] == category]
+        if group:
+            print(f"{category}:")
+        for f in group:
+            where = f" ({f['file']})" if f.get("file") else ""
+            print(f"  [{f['severity']}] {f['message']}{where}")
+    if not result["findings"]:
+        print("no findings")
+    for note in notes:
+        print(note)
+
+
+def _check_workdir(args, ctx):
+    """Base W/orig, cand W/cand; nothing is advanced."""
+    name = ctx["name"]
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    _refuse_inside(name, ctx["live"], [w])
+    path = w / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: {path} is required; run `vurctos skill-snapshot "
+                 f"{name} --workdir W` first ({exc})")
+    if not (isinstance(manifest, dict)
+            and manifest.get("schema_version") == SNAPSHOT_SCHEMA
+            and isinstance(manifest.get("files"), dict)
+            and isinstance(manifest.get("access_paths"), list)
+            and all(isinstance(a, str) for a in manifest["access_paths"])
+            and isinstance(manifest.get("live"), str)):
+        sys.exit(f"error: malformed {path}")
+    if manifest.get("skill") != name:
+        sys.exit(f"error: {path} is a snapshot of "
+                 f"{manifest.get('skill')!r}, not {name}")
+    base_arm, cand_arm = w / "orig", w / "cand"
+    try:
+        base_tree, cand_tree = _arm_hash(base_arm), _arm_hash(cand_arm)
+    except OSError as exc:
+        sys.exit(f"error: cannot read {w}/orig and {w}/cand: {exc}")
+    if base_tree != manifest.get("tree"):
+        sys.exit(f"error: {base_arm} no longer matches its manifest (tree "
+                 f"{base_tree}, manifest {manifest.get('tree')}); edit cand/ "
+                 f"only, and take a fresh snapshot")
+    files, live = manifest["files"], manifest["live"]
+    only = next(iter(files)) if len(files) == 1 else None
+    ctx["is_file"] = only == PurePosixPath(live).name and \
+        not os.path.isdir(live)
+    ctx["filename"] = only
+    ctx["not_mirrored"] = _access_paths(name, ctx["cfg"])[1]
+    findings = _static_check(ctx, base_arm, cand_arm, w,
+                             manifest["access_paths"])
+    level = _check_level(findings)
+    result = _check_result(name, level, base_tree, cand_tree, False,
+                           findings)
+    _atomic_write(w / "check.json",
+                  json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    _print_check(args, result)
+    return level
+
+
+def _check_since_accepted(args, ctx):
+    """Base the accepted store copy, cand a fresh copy of live; advance
+    accepted on pass, or on hold with --accept, never on fail."""
+    cfg, name, live = ctx["cfg"], ctx["name"], ctx["live"]
+    store = _snapshot_store(cfg, name)
+    accepted = _read_accepted(store)
+    if accepted is None:
+        sys.exit(f"error: no accepted baseline for {name} "
+                 f"({store / ACCEPTED_POINTER}); run `vurctos skill-snapshot "
+                 f"{name} --accept {_scope_flag(args)}` first")
+    _refuse_inside(name, live, [cfg["work_dir"], cfg["evals_dir"]])
+    base_arm = store / accepted
+    try:
+        if _arm_hash(base_arm) != accepted:
+            sys.exit(f"error: the accepted copy {base_arm} no longer hashes "
+                     f"to its name; re-accept with `vurctos skill-snapshot "
+                     f"{name} --accept {_scope_flag(args)}`")
+        now = _skill_tree_hash(live)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: cannot read {name}: {exc}")
+
+    def unchanged(tree):
+        if args.json:
+            _print_check(args, _check_result(name, "pass", accepted, tree,
+                                             False, []))
+        else:
+            print(f"nothing changed since accepted {accepted} ({name})")
+        return "pass"
+    if now == accepted:
+        return unchanged(now)
+    check_dir = _new_check_dir(cfg["work_dir"] / "checks" / name)
+    cand_arm = check_dir / "cand"
+    cand_tree = _snapshot_copy(name, live, cand_arm)
+    if cand_tree == accepted:
+        return unchanged(cand_tree)
+    real = Path(os.path.realpath(live))
+    ctx["is_file"], ctx["filename"] = real.is_file(), real.name
+    access, ctx["not_mirrored"] = _access_paths(name, cfg)
+    findings = _static_check(ctx, base_arm, cand_arm, check_dir, access)
+    level = _check_level(findings)
+    advanced, notes = False, []
+    if level == "fail":
+        notes.append("not advanced: a fail is never accepted, not even with "
+                     "--accept")
+    elif level == "hold" and not args.accept:
+        notes.append("not advanced: a hold goes back to the owner; once they "
+                     "decide to keep it, rerun with --accept")
+    elif _read_accepted(store) != accepted:
+        notes.append("not advanced: accepted moved during the check; run "
+                     "the check again")
+    else:
+        _store_arm(name, cand_arm, store, cand_tree)
+        _write_accepted(store, cand_tree)
+        advanced = True
+        notes.append(f"accepted advanced to {cand_tree}")
+    result = _check_result(name, level, accepted, cand_tree, advanced,
+                           findings)
+    _atomic_write(check_dir / "check.json",
+                  json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    _print_check(args, result, notes + [f"check: {check_dir}"])
+    return level
+
+
+def cmd_skill_check(args):
+    """The static check of a skill edit: no model, seconds. Exit 0 pass,
+    1 fail (or an error before the check), 3 hold."""
+    if args.accept and not args.since_accepted:
+        args.usage_error("--accept goes with --since-accepted")
+    root, cfg, live = _check_target(args)
+    ctx = {"root": root, "cfg": cfg, "name": args.name, "live": live,
+           "budget": _load_budget(cfg),
+           "curated": _load_curated(cfg, args.name)}
+    level = (_check_workdir(args, ctx) if args.workdir
+             else _check_since_accepted(args, ctx))
+    if CHECK_EXIT[level]:
+        sys.exit(CHECK_EXIT[level])
 
 
 # --- Dispatch: run one board card via headless Claude (Milestone: agent) ---
@@ -2986,6 +3903,47 @@ def build_parser():
                           help="print one line of numbers only (no entry "
                                "text, no rule refs); always exits 0")
     p_ss.set_defaults(func=cmd_skill_status)
+
+    p_snp = sub.add_parser("skill-snapshot",
+                           help="copy a skill's live tree: a work pair to "
+                                "edit, or the accepted baseline")
+    p_snp.add_argument("name", help="skill folder name or configured target")
+    p_snp.add_argument("--project", default=None,
+                       help="project folder (default: cwd)")
+    p_snp.add_argument("--global", dest="global_", action="store_true",
+                       help="use the user-level memory at ~/.vurctos")
+    p_snp_to = p_snp.add_mutually_exclusive_group(required=True)
+    p_snp_to.add_argument("--workdir", metavar="W",
+                          help="write W/orig, W/cand and W/manifest.json "
+                               "(W must not exist or be empty)")
+    p_snp_to.add_argument("--accept", action="store_true",
+                          help="store live as the accepted baseline; runs "
+                               "no checks (bootstrap, or the owner's "
+                               "override)")
+    p_snp.set_defaults(func=cmd_skill_snapshot)
+
+    p_chk = sub.add_parser("skill-check",
+                           help="static check of a skill edit, no model: "
+                                "pass (0), fail (1) or hold (3)")
+    p_chk.add_argument("name", help="skill folder name or configured target")
+    p_chk.add_argument("--project", default=None,
+                       help="project folder (default: cwd)")
+    p_chk.add_argument("--global", dest="global_", action="store_true",
+                       help="use the user-level memory at ~/.vurctos")
+    p_chk_base = p_chk.add_mutually_exclusive_group(required=True)
+    p_chk_base.add_argument("--workdir", metavar="W",
+                            help="compare W/cand with W/orig from "
+                                 "skill-snapshot --workdir; advances "
+                                 "nothing")
+    p_chk_base.add_argument("--since-accepted", action="store_true",
+                            help="compare live with the accepted baseline; "
+                                 "a pass advances it")
+    p_chk.add_argument("--accept", action="store_true",
+                       help="with --since-accepted: also advance on a hold "
+                            "(never on a fail)")
+    p_chk.add_argument("--json", action="store_true",
+                       help="print the result as JSON")
+    p_chk.set_defaults(func=cmd_skill_check, usage_error=p_chk.error)
 
     return p
 
