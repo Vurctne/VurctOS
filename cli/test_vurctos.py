@@ -5233,11 +5233,13 @@ class VurctosSkillEvalTest(unittest.TestCase):
             self.assertEqual((s["user_md_link"], s["sessions"],
                               s["reflections"], s["hooks"]),
                              (False, [], True, False))
+            specs = os.path.realpath(self.h / "specs")
             self.assertEqual(s["allow"], [
-                f"Read(/{home}/{a}/**)" for a in self.ACCESS] + [
-                f"Read(/{wr / arm}/**)", f"Read(/{home}/specs/**)",
-                f"Read(/{os.path.realpath(self.h / 'specs')}/**)",
-                "Bash(ls *)"])
+                r for a in self.ACCESS for r in (
+                    f"Read(/{home}/{a})", f"Read(/{home}/{a}/**)")] + [
+                f"Read(/{wr / arm})", f"Read(/{wr / arm}/**)",
+                f"Read(/{home}/specs)", f"Read(/{home}/specs/**)",
+                f"Read(/{specs})", f"Read(/{specs}/**)", "Bash(ls *)"])
             self.assertFalse(os.path.lexists(home))
         self.assertEqual(sorted(os.listdir(seen[0]["home"].parent)),
                          ["cwd", "run.json", "shim.log", "stderr.txt",
@@ -5498,6 +5500,62 @@ class VurctosSkillEvalTest(unittest.TestCase):
         self._one_run(["run codex exec do-it"])
         log = self._batch_dir() / "runs" / "basic" / "base-1" / "shim.log"
         self.assertEqual(log.read_text(encoding="utf-8"), "codex exec do-it\n")
+
+    def test_a4_denials_outside_scope_are_recorded_not_invalid(self):
+        """A4 counts a permission denial only when it touches what the run may
+        read: the subject in any spelling, a read root, or the cwd (or when
+        it names no path). A denial elsewhere is recorded in run.json under
+        denied_outside and leaves the run valid.
+        Fails if: a denial for a search across the whole skills folder or an
+        unrelated absolute path makes the run invalid or is not recorded, or a
+        denial inside the subject's mirror spelling or the cwd leaves the run
+        valid."""
+        outside = ('result-event {"permission_denials": ['
+                   '{"tool_name": "Grep", "tool_use_id": "a", "tool_input": '
+                   '{"pattern": "x", "path": "~/.claude/skills"}}, '
+                   '{"tool_name": "Glob", "tool_use_id": "b", "tool_input": '
+                   '{"pattern": "/nowhere/specs/03*"}}]}')
+        rec = self._one_run([outside])
+        self.assertTrue(rec["valid"], rec["invalid"])
+        self.assertEqual([d["tool"] for d in rec["denied_outside"]],
+                         ["Grep", "Glob"])
+        for inside in ("~/.claude/skills/caption-kit/references/x.md",
+                       "notes/plan.md"):
+            with self.subTest(inside):
+                shutil.rmtree(self.evals, ignore_errors=True)
+                rec = self._one_run([
+                    'result-event {"permission_denials": [{"tool_name": '
+                    '"Read", "tool_use_id": "c", "tool_input": {"file_path": '
+                    + json.dumps(inside) + '}}]}'])
+                self.assertFalse(rec["valid"])
+                self.assertTrue(any(r.startswith(
+                    "A4 side effect: 1 permission denial(s) (Read)")
+                    for r in rec["invalid"]), rec["invalid"])
+
+    def test_settings_allow_the_directory_itself(self):
+        """Every directory the run may read gets both `Read(/dir)` and
+        `Read(/dir/**)`: the subject's spellings, the arm's real path and a
+        read-root folder; a read-root file gets only its own rule.
+        Fails if: a directory gets only its `/**` rule (a search whose path is
+        the directory itself is then refused), or a file read root gets a
+        `/**` rule."""
+        home = self.r / "settings-home"
+        (home / "specs").mkdir(parents=True)
+        (home / "specs" / "one.md").write_text("x", encoding="utf-8")
+        arm = self.r / "arm"
+        arm.mkdir()
+        ctx = {"access": [".claude/skills/caption-kit"]}
+        case = {"read_roots": ["specs", "specs/one.md"], "allow_rules": []}
+        allow = vurctos._eval_settings(ctx, case, home, arm)["permissions"][
+            "allow"]
+        real_home = os.path.realpath(home)
+        for d in (f"{home}/.claude/skills/caption-kit",
+                  os.path.realpath(arm), f"{home}/specs",
+                  f"{real_home}/specs"):
+            self.assertIn(f"Read(/{d})", allow)
+            self.assertIn(f"Read(/{d}/**)", allow)
+        self.assertIn(f"Read(/{home}/specs/one.md)", allow)
+        self.assertNotIn(f"Read(/{home}/specs/one.md/**)", allow)
 
     def test_a5_result_error_is_invalid(self):
         """A5: a result event with is_error true or a subtype other than

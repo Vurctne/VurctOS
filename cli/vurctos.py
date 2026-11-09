@@ -3950,13 +3950,20 @@ def _eval_settings(ctx, case, home, subject):
     the subject and of each read root (a read outside the cwd is refused
     unless both the mirror spelling and the resolved path are allowed),
     then the case's own rules. No hooks."""
-    allow = [f"Read(/{home}/{a}/**)" for a in ctx["access"]]
-    allow.append(f"Read(/{os.path.realpath(subject)}/**)")
+    # A directory gets two rules: `dir/**` covers what is inside it, and the
+    # bare `dir` covers a search (Grep, Glob) whose path is the directory
+    # itself, which `dir/**` alone refuses (measured on a real run).
+    allow = []
+    for a in ctx["access"]:
+        allow += [f"Read(/{home}/{a})", f"Read(/{home}/{a}/**)"]
+    real = os.path.realpath(subject)
+    allow += [f"Read(/{real})", f"Read(/{real}/**)"]
     for r in case["read_roots"]:
         m = home / r
-        tail = "/**" if os.path.isdir(m) else ""
         for spelled in dict.fromkeys([str(m), os.path.realpath(m)]):
-            allow.append(f"Read(/{spelled}{tail})")
+            allow.append(f"Read(/{spelled})")
+            if os.path.isdir(m):
+                allow.append(f"Read(/{spelled}/**)")
     allow += case["allow_rules"]
     return {"permissions": {"allow": allow}}
 
@@ -4156,9 +4163,59 @@ def _eval_forbidden(ctx, arm):
             for p in dict.fromkeys(out)]
 
 
-def _eval_audit(ctx, case, arm, home, cwd, run_dir, rc, timed_out):
+_DENIAL_PATH_KEYS = ("file_path", "path", "notebook_path")
+_GLOB_CHARS_RE = re.compile(r"[*?\[{]")
+
+
+def _eval_denial_path(denial, home, cwd):
+    """The absolute path a denied tool call asked for, or None."""
+    inp = denial.get("tool_input") if isinstance(denial, dict) else None
+    if not isinstance(inp, dict):
+        return None
+    raw = next((inp[k] for k in _DENIAL_PATH_KEYS
+                if isinstance(inp.get(k), str) and inp[k]), None)
+    pattern = inp.get("pattern")
+    if raw is None and isinstance(pattern, str) and \
+            pattern.startswith(("/", "~")):
+        raw = _GLOB_CHARS_RE.split(pattern, 1)[0] or None
+    if raw is None:
+        return None
+    if raw.startswith("~"):
+        raw = str(home) + raw[1:]
+    return os.path.normpath(os.path.join(str(cwd), raw))
+
+
+def _eval_denial_in_scope(ctx, case, arm, home, cwd, denial):
+    """True when a denial touches what the run is entitled to read: the
+    subject in any spelling, its read roots, or the cwd. A denial without a
+    path counts as in scope. A denial elsewhere (a search across every skill,
+    a folder the case does not list) only means the agent wandered; it is
+    recorded, and the run stays valid."""
+    path = _eval_denial_path(denial, home, cwd)
+    if path is None:
+        return True
+    roots = [str(home / a) for a in ctx["access"]]
+    roots.append(os.path.realpath(ctx["arms"][arm]))
+    for r in case["read_roots"]:
+        roots += [str(home / r), os.path.realpath(home / r)]
+    roots += [str(cwd), os.path.realpath(cwd)]
+    return any(path == r or _inside(path, r) for r in roots)
+
+
+def _eval_denial_brief(denial):
+    if not isinstance(denial, dict):
+        return {"tool": "?", "input": None}
+    return {"tool": str(denial.get("tool_name")),
+            "input": denial.get("tool_input")}
+
+
+def _eval_audit(ctx, case, arm, home, cwd, run_dir, rc, timed_out,
+                outside=None):
     """(reasons, events, text): every audit rule the run fails. Any reason
-    makes the run invalid; the audit judges validity, not quality."""
+    makes the run invalid; the audit judges validity, not quality. Denials
+    outside the run's scope go into `outside` (a list) instead."""
+    if outside is None:
+        outside = []
     events, text, bad = _eval_events(run_dir / "transcript.jsonl")
     reasons = []
     # A0: the process ended normally and the stream is whole.
@@ -4265,11 +4322,16 @@ def _eval_audit(ctx, case, arm, home, cwd, run_dir, rc, timed_out):
             reasons.append("A4 side effect: the result has no "
                            "permission_denials list")
         elif denials:
-            tools = sorted({str(d.get("tool_name")) if isinstance(d, dict)
-                            else "?" for d in denials})
-            reasons.append(f"A4 side effect: {len(denials)} permission "
-                           f"denial(s) ({', '.join(tools)}); the skill ran "
-                           f"without something it asked for")
+            inside = [d for d in denials
+                      if _eval_denial_in_scope(ctx, case, arm, home, cwd, d)]
+            outside[:] = [_eval_denial_brief(d) for d in denials
+                          if not any(d is x for x in inside)]
+            if inside:
+                tools = sorted({str(d.get("tool_name")) if isinstance(d, dict)
+                                else "?" for d in inside})
+                reasons.append(f"A4 side effect: {len(inside)} permission "
+                               f"denial(s) ({', '.join(tools)}); the skill "
+                               f"ran without something it asked for")
     # A5: the run itself reports success.
     if results and (results[0].get("is_error") is not False
                     or results[0].get("subtype") != "success"):
@@ -4408,8 +4470,9 @@ def _eval_run(ctx, case, arm, i, retry):
             _eval_argv(ctx, case), cwd, env, case["timeout"],
             run_dir / "transcript.jsonl", run_dir / "stderr.txt")
         seconds = round(time.monotonic() - start, 3)
+        outside = []
         reasons, events, text = _eval_audit(ctx, case, arm, home, cwd,
-                                            run_dir, rc, timed_out)
+                                            run_dir, rc, timed_out, outside)
         created = [f for f in _eval_files(cwd) if f not in placed]
         grades, checks = ({}, {}) if reasons else _eval_grade(
             ctx, case, run_dir, cwd, events, text, created, env)
@@ -4420,7 +4483,8 @@ def _eval_run(ctx, case, arm, i, retry):
     record = {"case": case["name"], "arm": arm, "run": i, "retry": retry,
               "dir": rel, "valid": not reasons, "invalid": reasons,
               "seconds": seconds, "returncode": rc, "timed_out": timed_out,
-              "created": created, "grades": grades, "checks": checks}
+              "created": created, "grades": grades, "checks": checks,
+              "denied_outside": outside}
     _eval_write_run(ctx, record)
     return record
 
