@@ -6779,5 +6779,1140 @@ class VurctosSkillEvalTest(unittest.TestCase):
         self.assertLess(elapsed, 20, f"batch took {elapsed:.1f}s")
 
 
+
+APPLY_OLD_MD = "# Old\n- A retired rule.\n"
+APPLY_NEW_MD = "# New\n- Keep it under 80 characters.\n"
+APPLY_LOG = "# Changelog\n\n- first version\n"
+
+
+class VurctosSkillApplyTest(unittest.TestCase):
+    """skill-apply against the eval runner's fixture home (temp dirs only,
+    the agent is cli/eval_stub.py). The live skill gains a history file
+    (CHANGELOG.md) and a file the candidate removes; the standard candidate
+    changes SKILL.md, adds references/new.md, removes references/old.md and
+    appends to CHANGELOG.md."""
+
+    NAME = VurctosSkillEvalTest.NAME
+    MODEL = VurctosSkillEvalTest.MODEL
+    tearDown = VurctosSkillEvalTest.tearDown
+    _write = VurctosSkillEvalTest._write
+    _config = VurctosSkillEvalTest._config
+    _control = VurctosSkillEvalTest._control
+    _run = VurctosSkillEvalTest._run
+    _snapshot = VurctosSkillEvalTest._snapshot
+    _cand_edit = VurctosSkillEvalTest._cand_edit
+    _case = VurctosSkillEvalTest._case
+    _sidecar = VurctosSkillEvalTest._sidecar
+    _side_update = VurctosSkillEvalTest._side_update
+    _list = VurctosSkillEvalTest._list
+    _hashes = VurctosSkillEvalTest._hashes
+    _approve = VurctosSkillEvalTest._approve
+    _judge = VurctosSkillEvalTest._judge
+    _eval = VurctosSkillEvalTest._eval
+    _batch_dir = VurctosSkillEvalTest._batch_dir
+    _fs_state = VurctosSkillEvalTest._fs_state
+
+    def setUp(self):
+        VurctosSkillEvalTest.setUp(self)
+        self._write(self.live / "CHANGELOG.md", APPLY_LOG)
+        self._write(self.live / "references" / "old.md", APPLY_OLD_MD)
+        self.store = self.evals / "_snapshots" / self.NAME
+
+    # --- helpers ---
+
+    def _standard_edit(self):
+        cand = self.w / "cand"
+        self._cand_edit("A short caption.", "A shorter caption.")
+        self._write(cand / "references" / "new.md", APPLY_NEW_MD)
+        os.remove(cand / "references" / "old.md")
+        with open(cand / "CHANGELOG.md", "a", encoding="utf-8") as fh:
+            fh.write("- a shorter caption\n")
+
+    def _ready(self, cases=("c1", "c2", "c3"), approve=None, side=None,
+               edit=None, check_code=0, eval_code=0):
+        """Cases, a snapshot, the standard candidate (plus edit), then a
+        real skill-check and skill-eval batch with the stub."""
+        for name in cases:
+            self._case(name, body=f"Write the caption for {name}.",
+                       side=(side or {}).get(name))
+        self._approve(*(cases if approve is None else approve))
+        self._snapshot()
+        self._standard_edit()
+        if edit:
+            edit()
+        code, out, msg = self._run("skill-check", self.NAME, "--global",
+                                   "--workdir", str(self.w))
+        self.assertEqual(code, check_code, out + msg)
+        code, verdict, msg = self._eval("--runs", "1", "--max-runs", "99")
+        self.assertEqual(code, eval_code, msg)
+        return verdict
+
+    def _argv(self, name=None):
+        return ["skill-apply", name or self.NAME, "--global", "--workdir",
+                str(self.w)]
+
+    def _check(self, *extra, name=None):
+        """(exit code, apply-check result or None, message) of --check
+        --json."""
+        code, out, msg = self._run(*self._argv(name), "--check", "--json",
+                                   *extra)
+        return code, json.loads(out) if out.strip() else None, msg
+
+    def _check_text(self, *extra, name=None):
+        return self._run(*self._argv(name), "--check", *extra)
+
+    def _apply(self, digest, *extra, name=None):
+        return self._run(*self._argv(name), "--approved-hash", digest,
+                         *extra)
+
+    def _state(self, *extra):
+        args = vurctos.build_parser().parse_args(
+            self._argv() + ["--check"] + list(extra))
+        return vurctos._apply_state(args)
+
+    def _live_state(self):
+        out = {}
+        for top, dirs, files in os.walk(self.live):
+            for f in files:
+                p = Path(top) / f
+                out[p.relative_to(self.live).as_posix()] = p.read_bytes()
+        return out
+
+    def _pointer(self, name):
+        p = self.store / name
+        return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+    def _edit_json(self, path, **over):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.update(over)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2)
+                        + "\n", encoding="utf-8")
+
+    def _ready_hash(self, **opts):
+        self._ready(**opts)
+        code, res, msg = self._check()
+        self.assertEqual((code, res["level"]), (0, "ready"), res)
+        return res["hash"]
+
+    def _assert_blocked(self, code, words, old=None, extra=(), sole=True):
+        """--check is blocked by a reason `code` containing `words`, shows
+        no hash, every --approved-hash (the old one, the current internal
+        one) is refused, and live, the pointers and W/apply stay as they
+        were."""
+        before = self._live_state()
+        rc, res, msg = self._check(*extra)
+        self.assertEqual((rc, res["level"]), (1, "blocked"), msg)
+        self.assertIsNone(res["hash"])
+        self.assertIsNone(res["command"])
+        hits = [r for r in res["reasons"]
+                if r["code"] == code and words in r["message"]]
+        self.assertTrue(hits, res["reasons"])
+        if sole:
+            self.assertEqual(len(res["reasons"]), 1, res["reasons"])
+        rc, out, msg = self._check_text(*extra)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("approval hash:", out)
+        for digest in {self._state(*extra)["hash"], old or "0" * 16}:
+            rc, out, msg = self._apply(digest, *extra)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("nothing applied", msg)
+        self.assertEqual(self._live_state(), before)
+        self.assertFalse((self.w / "apply").exists())
+        self.assertIsNone(self._pointer("evaluated"))
+        return res
+
+    # --- applying ---
+
+    def test_apply_ready_puts_the_candidate_live(self):
+        """A ready candidate applies: the changed, added and removed entries
+        land, the removed file is moved into W/apply/removed/, live hashes
+        to the cand tree, accepted and evaluated point at it, and
+        applied.json records the apply.
+        Fails if: a changed, added or removed entry does not land, the removed file is deleted instead of moved to W/apply/removed/, live does not hash to the cand tree afterwards, accepted or evaluated is not set to the cand tree, or applied.json is not written."""
+        digest = self._ready_hash()
+        cand = self.w / "cand"
+        cand_tree = vurctos._arm_hash(cand)
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 0, msg)
+        live = self._live_state()
+        for rel in ("SKILL.md", "references/new.md", "CHANGELOG.md",
+                    "references/rules.md"):
+            self.assertEqual(live[rel], (cand / rel).read_bytes(), rel)
+        self.assertNotIn("references/old.md", live)
+        moved = self.w / "apply" / "removed" / "references" / "old.md"
+        self.assertEqual(moved.read_text(encoding="utf-8"), APPLY_OLD_MD)
+        self.assertEqual(vurctos._skill_tree_hash(self.live), cand_tree)
+        self.assertEqual(self._pointer("accepted"), cand_tree)
+        self.assertEqual(self._pointer("evaluated"), cand_tree)
+        self.assertEqual(vurctos._arm_hash(self.store / cand_tree),
+                         cand_tree)
+        rec = json.loads((self.w / "apply" / "applied.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual((rec["skill"], rec["hash"], rec["cand_tree"],
+                          rec["batch"]),
+                         (self.NAME, digest, cand_tree,
+                          self._batch_dir().name))
+        self.assertEqual([(a["action"], a["path"]) for a in rec["applied"]],
+                         [("remove", "references/old.md"),
+                          ("add", "references/new.md"),
+                          ("change", "SKILL.md"),
+                          ("change", "CHANGELOG.md")])
+        self.assertEqual([m["path"] for m in rec["moved"]],
+                         ["references/old.md"])
+        self.assertRegex(rec["applied_utc"], r"Z$")
+        real = os.path.realpath(self.live)
+        for rel in ("SKILL.md", "references/new.md", "references/old.md",
+                    "CHANGELOG.md"):
+            self.assertIn(f"  {real}/{rel}\n", out)
+
+    def test_cand_edited_after_check_blocks_and_refuses_old_hash(self):
+        """T18: cand/ edited after --check is blocked (the binding to
+        check.json and the verdict breaks), and the hash --check printed is
+        refused.
+        Fails if: cand/ edited after --check still yields ready or a hash, or the old hash is accepted."""
+        digest = self._ready_hash()
+        with open(self.w / "cand" / "SKILL.md", "a", encoding="utf-8") as fh:
+            fh.write("3. One more rule.\n")
+        before = self._live_state()
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out)
+        self.assertIn("nothing applied", msg)
+        self.assertEqual(self._live_state(), before)
+        res = self._assert_blocked("B2", "rerun skill-check and skill-eval",
+                                   old=digest, sole=False)
+        self.assertEqual([r["code"] for r in res["reasons"]], ["B2", "B2"])
+
+    def test_live_edited_after_snapshot_blocks_and_leaves_live(self):
+        """Another edit to live after the snapshot (even to a file the
+        candidate does not touch) blocks: the apply would destroy it.
+        Fails if: the live race check (B3) is skipped, or an apply proceeds over a live tree that no longer hashes to the snapshot."""
+        digest = self._ready_hash()
+        rules = self.live / "references" / "rules.md"
+        rules.write_text("# Rules\n- Be short.\n- Edited elsewhere.\n",
+                         encoding="utf-8")
+        before = self._live_state()
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self._live_state(), before)
+        res = self._assert_blocked("B3", "take a fresh snapshot", old=digest)
+        self.assertIn("another edit landed", res["reasons"][0]["message"])
+
+    def test_stale_hash_is_refused(self):
+        """An approval hash goes stale when check.json is rewritten, when
+        picks are recorded, or when another batch becomes the one judged;
+        apply recomputes the hash instead of trusting the one --check
+        printed.
+        Fails if: an approval hash stays valid after check.json is rewritten, after picks.json appears, or once a newer batch is the default one, or apply accepts the hash --check printed without recomputing it."""
+        h1 = self._ready_hash()
+        before = self._live_state()
+        check = self.w / "check.json"
+        data = json.loads(check.read_text(encoding="utf-8"))
+        data["findings"].append({"category": "volume", "severity": "info",
+                                 "message": "an extra note"})
+        check.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        code, out, msg = self._apply(h1)
+        self.assertEqual(code, 1)
+        self.assertIn("approval is stale or wrong; run --check again", msg)
+        code, res, msg = self._check()
+        self.assertEqual((code, res["level"]), (0, "ready"))
+        h2 = res["hash"]
+        self.assertNotEqual(h2, h1)
+        bd = self._batch_dir()
+        self._write(bd / "picks.json", json.dumps(
+            {"schema_version": 1, "batch": bd.name, "answers": {},
+             "picks": {}, "recorded_at": "2026-11-09T00:00:00Z"}))
+        code, out, msg = self._apply(h2)
+        self.assertEqual(code, 1)
+        self.assertIn("stale", msg)
+        code, res, msg = self._check()
+        h3 = res["hash"]
+        self.assertNotIn(h3, (h1, h2))
+        code, verdict, msg = self._eval("--runs", "1", "--max-runs", "99")
+        self.assertEqual(code, 0, msg)
+        self.assertNotEqual(self._batch_dir(), bd)
+        code, out, msg = self._apply(h3)
+        self.assertEqual(code, 1)
+        self.assertIn("stale", msg)
+        self.assertEqual(self._live_state(), before)
+        self.assertFalse((self.w / "apply").exists())
+        code, res, msg = self._check("--batch", bd.name)
+        self.assertEqual(res["hash"], h3)
+        self.assertIn(f"--batch {bd.name} --approved-hash {h3}",
+                      res["command"])
+        code, res, msg = self._check()
+        self.assertNotIn(res["hash"], (h1, h2, h3))
+        self.assertEqual(self._apply(res["hash"])[0], 0)
+
+    def test_human_case_needs_picks_and_rerecorded_picks_go_stale(self):
+        """A human-judged case blocks until its pick is recorded; once
+        picked the result is ready, and picks recorded again (even with the
+        same verdict) make the earlier hash stale.
+        Fails if: human_pending is ignored, or picks.json recorded after --check leaves the earlier hash valid."""
+        self._ready(cases=("c1", "c2", "c3", "c4"),
+                    side={"c4": {"judge": "human"}}, eval_code=3)
+        self._assert_blocked("B4", "record the picks first")
+        with unittest.mock.patch.object(vurctos, "_pick_rng",
+                                        lambda: random.Random(3)):
+            self.assertEqual(self._run("skill-pick", "make", self.NAME,
+                                       "--global", "--workdir",
+                                       str(self.w))[0], 0)
+
+        def record(answer):
+            code, out, msg = self._run("skill-pick", "record", self.NAME,
+                                       "--global", "--workdir", str(self.w),
+                                       "--answers", f"1:{answer}")
+            self.assertEqual(code, 0, msg)
+        record("same")
+        bd = self._batch_dir()
+        verdict = (bd / "verdict.json").read_bytes()
+        code, res, msg = self._check()
+        self.assertEqual((code, res["level"]), (0, "ready"), res)
+        h1 = res["hash"]
+        os.remove(bd / "picks.json")
+        record("both-bad")
+        self.assertEqual((bd / "verdict.json").read_bytes(), verdict)
+        code, out, msg = self._apply(h1)
+        self.assertEqual(code, 1)
+        self.assertIn("stale", msg)
+        code, res, msg = self._check()
+        self.assertNotEqual(res["hash"], h1)
+        self.assertEqual(self._apply(res["hash"])[0], 0)
+
+    def test_held_check_exits_3_and_applies_with_its_hash(self):
+        """A hold finding in check.json makes the result held (exit 3), one
+        reason per hold finding quoting its category and message; the owner
+        can still apply it with the hash.
+        Fails if: a hold finding in check.json does not give held (exit 3) with a reason quoting its category and message, or a held result cannot be applied with its hash."""
+        self._config(protected_category_words=["publish"])
+        self._ready(edit=lambda: self._cand_edit(
+            "2. Write the caption to out.md.\n",
+            "2. Write the caption to out.md.\n3. Never publish without "
+            "asking.\n"), check_code=3)
+        finding = [f for f in json.loads((self.w / "check.json").read_text(
+            encoding="utf-8"))["findings"] if f["severity"] == "hold"][0]
+        code, out, msg = self._check_text()
+        self.assertEqual(code, 3, out + msg)
+        self.assertTrue(out.startswith("held: skill-apply caption-kit"))
+        self.assertIn(f"  [hold] H1 skill-check hold: [{finding['category']}]"
+                      f" {finding['message']}", out)
+        digest = re.search(r"approval hash: ([0-9a-f]{16})", out).group(1)
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 0, msg)
+        self.assertIn("3. Never publish without asking.",
+                      (self.live / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_invalid_runs_hold(self):
+        """Invalid runs in the batch hold the result with one reason giving
+        their count and cases.
+        Fails if: a verdict with invalid_runs is ready, or the reason does not give the count and the cases."""
+        self._ready()
+        self._edit_json(self._batch_dir() / "verdict.json", invalid_runs=[
+            {"case": "c2", "arm": "cand", "run": 1, "reasons": ["A5"]},
+            {"case": "c2", "arm": "base", "run": 1, "reasons": ["A5"]}])
+        code, res, msg = self._check()
+        self.assertEqual((code, res["level"]), (3, "held"))
+        self.assertEqual(res["reasons"], [
+            {"code": "H2", "severity": "hold",
+             "message": "2 invalid run(s) in the batch: c2"}])
+        self.assertRegex(res["hash"], r"^[0-9a-f]{16}$")
+
+    # --- blocked, one predicate each ---
+
+    def test_probe_batch_blocks(self):
+        """A verdict marked probe (both arms ran W/orig) blocks, even when
+        its arms match.
+        Fails if: a probe batch is accepted."""
+        old = self._ready_hash()
+        bd = self._batch_dir()
+        self._edit_json(bd / "verdict.json", probe=True)
+        self._assert_blocked("B4", "probe", old=old,
+                             extra=("--batch", bd.name))
+
+    def test_aborted_verdict_blocks(self):
+        """An aborted batch blocks.
+        Fails if: a verdict whose aborted is not null is accepted."""
+        old = self._ready_hash()
+        self._edit_json(self._batch_dir() / "verdict.json",
+                        aborted="login preflight failed")
+        self._assert_blocked("B4", "aborted: login preflight failed",
+                             old=old)
+
+    def test_fail_verdict_blocks(self):
+        """A batch with a regression (verdict fail) blocks.
+        Fails if: a fail verdict is accepted."""
+        self._ready(edit=lambda: self._cand_edit(
+            "write out.md TITLE: the source title", "write out.md no title"),
+            eval_code=1)
+        self._assert_blocked("B4", "the verdict is fail")
+
+    def test_suite_not_ok_blocks(self):
+        """Fewer than 3 approved cases with a runner-judged grader blocks.
+        Fails if: a verdict with suite_ok false is accepted."""
+        self._ready(approve=("c1", "c2"))
+        self._assert_blocked("B4", "suite_ok false")
+
+    def test_case_edited_after_batch_blocks(self):
+        """A case edited after the batch no longer hashes to what the batch
+        recorded, so the verdict is not about it.
+        Fails if: a case whose hash differs from the one in batch.json is accepted."""
+        old = self._ready_hash()
+        prompt = self.evals / self.NAME / "c2" / "prompt.md"
+        prompt.write_text(prompt.read_text(encoding="utf-8").replace(
+            "for c2", "for clip two"), encoding="utf-8")
+        res = self._assert_blocked("B5", "a case or judge changed after the "
+                                         "batch", old=old)
+        self.assertIn("c2: hash", res["reasons"][0]["message"])
+
+    def test_judge_edited_after_batch_blocks(self):
+        """A sibling file edited in a judge directory a case references
+        blocks (the directory no longer hashes to its name).
+        Fails if: a judge directory that no longer hashes to its name is accepted."""
+        digest = self._judge()
+        check = {"checks": [{"name": "judge-title", "argv": [
+            sys.executable, "{judge:%s/judge.py}" % digest,
+            "{cwd}/out.md"]}]}
+        old = self._ready_hash(side={"c1": check})
+        words = self.evals / "_judges" / digest / "words.json"
+        words.write_text('["TITLE:", "caption"]\n', encoding="utf-8")
+        res = self._assert_blocked("B5", "rerun skill-eval", old=old)
+        self.assertIn("judge directory hashes to",
+                      res["reasons"][0]["message"])
+
+    def test_fail_check_blocks(self):
+        """A failed skill-check blocks.
+        Fails if: check.json level fail is accepted."""
+        old = self._ready_hash()
+        self._edit_json(self.w / "check.json", level="fail")
+        self._assert_blocked("B6", "skill-check failed", old=old)
+
+    def test_links_block(self):
+        """skill-apply writes regular files only: an entry live reaches
+        through a symlink (here a file shared with another tree) and a
+        symlink the candidate adds both block, and the shared file stays.
+        Fails if: a planned entry that live reaches through a symlink, or a symlink cand adds, is applied instead of blocked."""
+        shared = self._write(self.h / "work" / "shared.md",
+                             "# Shared\n- One rule for two skills.\n")
+        os.symlink(shared, self.live / "references" / "shared.md")
+        self._ready(edit=lambda: self._write(
+            self.w / "cand" / "references" / "shared.md",
+            "# Shared\n- Edited here.\n"))
+        os.symlink("rules.md", self.w / "cand" / "references" / "alias.md")
+        res = self._assert_blocked("B7", "change references/shared.md",
+                                   sole=False)
+        self.assertEqual([r["code"] for r in res["reasons"]], ["B7", "B7"])
+        self.assertIn("references/alias.md", res["reasons"][0]["message"])
+        self.assertTrue(os.path.islink(self.live / "references" /
+                                       "shared.md"))
+        self.assertEqual(shared.read_text(encoding="utf-8"),
+                         "# Shared\n- One rule for two skills.\n")
+
+    # --- the apply itself ---
+
+    def test_mid_apply_stop_restores_nothing_and_moves_no_pointer(self):
+        """Another session edits a live file the apply has not reached yet:
+        the apply stops at that entry, keeps the entries before it, never
+        writes the history file, restores nothing, moves no pointer and
+        records the stop in stopped.json.
+        Fails if: the per-entry re-hash before os.replace is skipped (the other edit is overwritten), the history file is written, a pointer moves after the stop, an earlier entry is restored, or stopped.json does not record where it stopped."""
+        self.assertEqual(self._run("skill-snapshot", self.NAME, "--global",
+                                   "--accept")[0], 0)
+        base = self._pointer("accepted")
+        digest = self._ready_hash()
+        skill = self.live / "SKILL.md"
+        new_md = os.path.realpath(self.live / "references" / "new.md")
+        other = skill.read_text(encoding="utf-8") + "Edited elsewhere.\n"
+        real_replace = os.replace
+
+        def replace(src, dst, *a, **k):
+            real_replace(src, dst, *a, **k)
+            if os.path.realpath(dst) == new_md:
+                skill.write_text(other, encoding="utf-8")
+        with unittest.mock.patch.object(vurctos.os, "replace",
+                                        side_effect=replace):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stopped", msg)
+        self.assertEqual(skill.read_text(encoding="utf-8"), other)
+        self.assertEqual((self.live / "references" / "new.md").read_text(
+            encoding="utf-8"), APPLY_NEW_MD)
+        self.assertFalse((self.live / "references" / "old.md").exists())
+        self.assertEqual((self.w / "apply" / "removed" / "references" /
+                          "old.md").read_text(encoding="utf-8"),
+                         APPLY_OLD_MD)
+        self.assertEqual((self.live / "CHANGELOG.md").read_text(
+            encoding="utf-8"), APPLY_LOG)
+        self.assertEqual((self._pointer("accepted"),
+                          self._pointer("evaluated")), (base, None))
+        self.assertFalse((self.w / "apply" / "applied.json").exists())
+        rec = json.loads((self.w / "apply" / "stopped.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(rec["stopped_at"],
+                         {"path": "SKILL.md", "action": "change"})
+        self.assertIn("live changed since the snapshot", rec["reason"])
+        self.assertEqual([(r["action"], r["path"])
+                          for r in rec["replaced"]],
+                         [("add", "references/new.md")])
+        self.assertEqual([m["path"] for m in rec["moved"]],
+                         ["references/old.md"])
+        self.assertEqual([(e["action"], e["path"])
+                          for e in rec["not_applied"]],
+                         [("change", "SKILL.md"), ("change", "CHANGELOG.md")])
+        self.assertIn("stopped: skill-apply caption-kit at change SKILL.md",
+                      out)
+
+    def test_history_file_is_the_last_write(self):
+        """Live is changed in the decided order: remove, add, change, and
+        the history file (history_globs) after all others.
+        Fails if: a history file is written before another entry, or removes, adds and changes are not applied in that order."""
+        digest = self._ready_hash()
+        real = os.path.realpath(self.live)
+        calls, real_replace, real_rename = [], os.replace, os.rename
+
+        def note(path):
+            path = os.path.realpath(path)
+            if path.startswith(real + os.sep):
+                calls.append(os.path.relpath(path, real))
+
+        def replace(src, dst, *a, **k):
+            note(dst)
+            return real_replace(src, dst, *a, **k)
+
+        def rename(src, dst, *a, **k):
+            note(src)
+            return real_rename(src, dst, *a, **k)
+        with unittest.mock.patch.object(vurctos.os, "replace",
+                                        side_effect=replace), \
+                unittest.mock.patch.object(vurctos.os, "rename",
+                                           side_effect=rename):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(calls, ["references/old.md", "references/new.md",
+                                 "SKILL.md", "CHANGELOG.md"])
+
+    def test_second_apply_from_same_workdir_is_refused(self):
+        """A workdir applies once.
+        Fails if: a second apply from the same workdir is not refused up front with "already applied from this workdir", or --check after the apply still offers a hash."""
+        digest = self._ready_hash()
+        self.assertEqual(self._apply(digest)[0], 0)
+        live = self._live_state()
+        applied = (self.w / "apply" / "applied.json").read_bytes()
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1)
+        self.assertTrue(msg.startswith("error: nothing applied: already "
+                                       "applied from this workdir"), msg)
+        code, res, msg = self._check()
+        self.assertEqual((code, res["hash"]), (1, None))
+        self.assertIn("B9", [r["code"] for r in res["reasons"]])
+        self.assertEqual(self._live_state(), live)
+        self.assertEqual((self.w / "apply" / "applied.json").read_bytes(),
+                         applied)
+
+    def test_single_file_target_applies(self):
+        """A target that is one file is applied as a tree of one file; a
+        candidate that adds a second file to it is blocked.
+        Fails if: a single-file target is not replaced in place with the cand file, its pointers are not set, or a candidate adding a file beside it is applied."""
+        note = self._write(self.h / "work" / "note-rule.md",
+                           "# Note rule\n- Say it once.\n")
+        self._config(targets={"note-rule": str(note)})
+        self.w = self.r / "wk" / "single"
+        code, out, msg = self._run("skill-snapshot", "note-rule", "--global",
+                                   "--workdir", str(self.w))
+        self.assertEqual(code, 0, msg)
+        cand = self.w / "cand"
+        self._write(cand / "note-rule.md", "# Note rule\n- Say it twice.\n")
+        extra = self._write(cand / "extra.md", "# Extra\n")
+
+        def judged():
+            base, tree = (vurctos._arm_hash(self.w / "orig"),
+                          vurctos._arm_hash(cand))
+            self._write(self.w / "check.json", json.dumps(
+                {"schema_version": 1, "skill": "note-rule", "level": "pass",
+                 "base_tree": base, "cand_tree": tree, "advanced": False,
+                 "findings": []}))
+            bd = self.w / "eval" / "20261109T120000Z"
+            self._write(bd / "batch.json", json.dumps(
+                {"schema_version": 1, "skill": "note-rule",
+                 "batch": bd.name, "probe": False, "model": self.MODEL,
+                 "cases": []}))
+            self._write(bd / "verdict.json", json.dumps(
+                {"schema_version": 1, "skill": "note-rule",
+                 "batch": bd.name, "probe": False, "level": "pass",
+                 "aborted": None, "arms": {"base": base, "cand": tree},
+                 "graders": [], "not_worse": True, "suite_ok": True,
+                 "invalid_runs": [], "human_pending": []}))
+            return tree
+        judged()
+        code, res, msg = self._check(name="note-rule")
+        self.assertEqual((code, res["level"]), (1, "blocked"), msg)
+        self.assertEqual([r["code"] for r in res["reasons"]], ["B8"])
+        os.remove(extra)
+        tree = judged()
+        code, res, msg = self._check(name="note-rule")
+        self.assertEqual((code, res["level"]), (0, "ready"), res)
+        self.assertEqual([(c["action"], c["path"]) for c in res["changes"]],
+                         [("change", "note-rule.md")])
+        code, out, msg = self._apply(res["hash"], name="note-rule")
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(note.read_text(encoding="utf-8"),
+                         "# Note rule\n- Say it twice.\n")
+        self.assertEqual(sorted(os.listdir(note.parent)),
+                         ["caption-kit", "note-rule.md"])
+        self.assertEqual(vurctos._skill_tree_hash(note), tree)
+        store = self.evals / "_snapshots" / "note-rule"
+        self.assertEqual([(store / p).read_text(encoding="utf-8").strip()
+                          for p in ("accepted", "evaluated")], [tree, tree])
+
+    def test_writes_only_live_workdir_and_store(self):
+        """--check writes only W/apply-check.json; an apply changes only the
+        live target, W and the snapshot store: not the cases, the judges,
+        the memory root, its day logs or another skill.
+        Fails if: --check or an apply writes anything outside the live target, the workdir and the snapshot store."""
+        self.assertEqual(self._run("skill-snapshot", self.NAME, "--global",
+                                   "--accept")[0], 0)
+        self._ready()
+        skip = {self.live, self.w, self.store, self.log}
+        before = self._fs_state(skip)
+        outside_w = self._fs_state({self.w, self.log})
+        only_w = {self.r / p for p in os.listdir(self.r) if p != "wk"}
+        inside_w = self._fs_state(only_w)
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(self._fs_state({self.w, self.log}), outside_w)
+        after = self._fs_state(only_w)
+        new = (self.w / "apply-check.json").relative_to(self.r).as_posix()
+        self.assertEqual(set(after) - set(inside_w), {new})
+        self.assertEqual({k: after[k] for k in inside_w}, inside_w)
+        self.assertEqual(self._apply(res["hash"])[0], 0)
+        self.assertEqual(self._fs_state(skip), before)
+
+    def test_approval_hash_is_computed_as_decided(self):
+        """The approval hash is 16 hex of sha256 over the canonical JSON of
+        the skill, the manifest bytes, the cand tree, the check.json bytes,
+        the batch name, the verdict bytes, the picks bytes (or null) and the
+        sorted planned changes (path, action, new sha256, permission
+        bits), computed here independently.
+        Fails if: the approval hash leaves out or alters any decided part (skill, manifest bytes, cand tree, check bytes, batch, verdict bytes, picks, planned changes) or its canonical JSON form."""
+        digest = self._ready_hash()
+        bd = self._batch_dir()
+
+        def sha(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        def tree(arm):
+            files = {}
+            for top, dirs, names in os.walk(arm):
+                for n in names:
+                    p = Path(top) / n
+                    files[p.relative_to(arm).as_posix()] = p
+            return files
+        orig, cand = tree(self.w / "orig"), tree(self.w / "cand")
+        lines = sorted(f"{rel}\0{sha(p)}\n" for rel, p in cand.items())
+        cand_tree = hashlib.sha256("".join(lines).encode()).hexdigest()[:12]
+        changes = []
+        for rel in sorted(set(orig) | set(cand)):
+            if rel not in orig:
+                changes.append([rel, "add", sha(cand[rel]),
+                                os.stat(cand[rel]).st_mode & 0o777])
+            elif rel not in cand:
+                changes.append([rel, "remove", None, None])
+            elif sha(orig[rel]) != sha(cand[rel]):
+                changes.append([rel, "change", sha(cand[rel]),
+                                os.stat(cand[rel]).st_mode & 0o777])
+        self.assertEqual(len(changes), 4)
+        want = hashlib.sha256(json.dumps({
+            "skill": self.NAME, "manifest": sha(self.w / "manifest.json"),
+            "cand_tree": cand_tree, "check": sha(self.w / "check.json"),
+            "batch": bd.name, "verdict": sha(bd / "verdict.json"),
+            "picks": None, "changes": changes}, sort_keys=True,
+            ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8")).hexdigest()[:16]
+        self.assertEqual(digest, want)
+
+    def test_check_output_and_apply_check_json(self):
+        """--check prints the level, the reasons, the planned changes in
+        apply order, the character delta and the exact apply command, and
+        writes the same content to W/apply-check.json (--json prints it).
+        Fails if: --check does not write apply-check.json with the content --json prints, or its text omits the level, the planned changes, the character delta, the approval hash or the exact apply command."""
+        self._ready()
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(json.loads((self.w / "apply-check.json").read_text(
+            encoding="utf-8")), res)
+        code, out, msg = self._check_text()
+        self.assertEqual(code, 0, msg)
+        digest = res["hash"]
+        removed = len(APPLY_OLD_MD)
+        self.assertEqual(
+            [(c["action"], c["path"], c["chars"]["delta"])
+             for c in res["changes"]],
+            [("remove", "references/old.md", -removed),
+             ("add", "references/new.md", len(APPLY_NEW_MD)),
+             ("change", "SKILL.md", 2),
+             ("change", "CHANGELOG.md", len("- a shorter caption\n"))])
+        total = len(APPLY_NEW_MD) - removed + 2 + len("- a shorter caption\n")
+        self.assertEqual(res["chars"]["delta"], total)
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("ready: skill-apply caption-kit"))
+        self.assertIn("reasons: none", lines)
+        self.assertIn(f"  remove references/old.md ({-removed:+d} chars)",
+                      lines)
+        grown = len("- a shorter caption\n")
+        self.assertIn(f"  change CHANGELOG.md (+{grown} chars; history "
+                      f"file, written last)", lines)
+        self.assertIn(f"text files: {total:+d} chars", out)
+        self.assertIn(f"approval hash: {digest}", lines)
+        command = (f"vurctos skill-apply caption-kit --global --workdir "
+                   f"{shlex.quote(str(self.w))} --approved-hash {digest}")
+        self.assertEqual(res["command"], command)
+        self.assertIn(f"`{command}`", out)
+
+    def test_inputs_are_validated_first(self):
+        """A missing or malformed input is an error naming its file, and
+        --batch takes a batch name, not a path; the default batch skips a
+        probe batch.
+        Fails if: a missing or malformed manifest.json, check.json, batch.json, verdict.json or picks.json is not an error naming that file, --batch accepts a path, or the default batch is a probe."""
+        self._ready()
+        bd = self._batch_dir()
+        code, res, msg = self._check()
+        self.assertEqual((code, res["batch"]), (0, bd.name))
+        self.assertEqual(self._eval("--probe", "--runs", "1",
+                                    "--max-runs", "99")[0], 0)
+        self.assertNotEqual(self._batch_dir(), bd)
+        code, res, msg = self._check()
+        self.assertEqual((code, res["batch"]), (0, bd.name))
+        for path, broken in (
+                (self.w / "check.json", None),
+                (self.w / "check.json", '{"skill": "caption-kit"}'),
+                (self.w / "manifest.json", None),
+                (bd / "batch.json", None),
+                (bd / "batch.json", "[1]"),
+                (bd / "batch.json", '{"skill": "caption-kit", "batch": "%s", '
+                                    '"cases": [{"name": 5}]}' % bd.name),
+                (bd / "verdict.json", None),
+                (bd / "verdict.json", '{"skill": "caption-kit", "batch": "%s",'
+                                      ' "probe": "no"}' % bd.name),
+                (bd / "picks.json", "not json")):
+            keep = path.read_bytes() if path.exists() else None
+            if broken is None:
+                path.rename(path.with_name(path.name + ".away"))
+            else:
+                path.write_text(broken, encoding="utf-8")
+            code, res, msg = self._check("--batch", bd.name)
+            self.assertEqual(code, 1, (path, broken))
+            self.assertIn(str(path), msg, (path, broken))
+            if broken is None:
+                path.with_name(path.name + ".away").rename(path)
+            elif keep is None:
+                path.unlink()
+            else:
+                path.write_bytes(keep)
+        self.assertEqual(self._check("--batch", bd.name)[0], 0)
+        code, res, msg = self._check("--batch", str(bd))
+        self.assertEqual(code, 1)
+        self.assertIn("not a path", msg)
+
+
+    # --- gaps found by the phase 6 mutation review, and the fixes after it ---
+
+    def _apply_with_edit(self, digest, edit):
+        """Apply, letting another writer change live right after the apply
+        recomputed every predicate (B3 has passed) and before the first
+        entry is written."""
+        real = vurctos._apply_state
+
+        def wrapped(args):
+            st = real(args)
+            if not args.check:
+                edit()
+            return st
+        with unittest.mock.patch.object(vurctos, "_apply_state", wrapped):
+            return self._apply(digest)
+
+    def test_add_path_taken_mid_apply_stops(self):
+        """An add whose path another writer creates mid-apply stops there.
+        Fails if: the add check is skipped, so the other writer's new file is
+        overwritten or the apply reports success."""
+        digest = self._ready_hash()
+        new = self.live / "references" / "new.md"
+        code, out, msg = self._apply_with_edit(
+            digest, lambda: new.write_text("# Other session\n",
+                                           encoding="utf-8"))
+        self.assertEqual(code, 1, out + msg)
+        self.assertEqual(new.read_text(encoding="utf-8"), "# Other session\n")
+        self.assertIsNone(self._pointer("evaluated"))
+
+    def test_removed_file_edited_mid_apply_stops(self):
+        """A file the candidate removes, edited by another writer mid-apply,
+        stops the apply and stays in live.
+        Fails if: the remove skips its re-hash, so the edited file is moved
+        away and the apply reports success."""
+        digest = self._ready_hash()
+        old = self.live / "references" / "old.md"
+        code, out, msg = self._apply_with_edit(
+            digest, lambda: old.write_text("# Old\n- Edited elsewhere.\n",
+                                           encoding="utf-8"))
+        self.assertEqual(code, 1, out + msg)
+        self.assertEqual(old.read_text(encoding="utf-8"),
+                         "# Old\n- Edited elsewhere.\n")
+        self.assertIsNone(self._pointer("evaluated"))
+
+    def test_history_file_edited_mid_apply_stops(self):
+        """A history file edited by another writer mid-apply stops the apply
+        at that file and keeps the other entry.
+        Fails if: history files skip the re-hash, so the other session's
+        version-log entry is overwritten."""
+        digest = self._ready_hash()
+        log = self.live / "CHANGELOG.md"
+        other = APPLY_LOG + "- another session's entry\n"
+        code, out, msg = self._apply_with_edit(
+            digest, lambda: log.write_text(other, encoding="utf-8"))
+        self.assertEqual(code, 1, out + msg)
+        self.assertEqual(log.read_text(encoding="utf-8"), other)
+        self.assertIsNone(self._pointer("evaluated"))
+
+    def test_untouched_file_edited_mid_apply_moves_no_pointer(self):
+        """A file the candidate does not touch, edited mid-apply, is caught by
+        the final hash check: no pointer moves, no applied.json, and the stop
+        says every entry (history included) was written.
+        Fails if: the final hash check is skipped, a pointer or applied.json
+        is written before it, or the stop claims the history files were not
+        written."""
+        self.assertEqual(self._run("skill-snapshot", self.NAME, "--global",
+                                   "--accept")[0], 0)
+        base = self._pointer("accepted")
+        digest = self._ready_hash()
+        rules = self.live / "references" / "rules.md"
+        other = "# Rules\n- Be short.\n- Edited elsewhere.\n"
+        code, out, msg = self._apply_with_edit(
+            digest, lambda: rules.write_text(other, encoding="utf-8"))
+        self.assertEqual(code, 1, out + msg)
+        self.assertEqual(rules.read_text(encoding="utf-8"), other)
+        self.assertEqual((self._pointer("accepted"),
+                          self._pointer("evaluated")), (base, None))
+        self.assertFalse((self.w / "apply" / "applied.json").exists())
+        rec = json.loads((self.w / "apply" / "stopped.json").read_text(
+            encoding="utf-8"))
+        self.assertIn("applied, but live now hashes to", rec["reason"])
+        self.assertEqual(rec["history_written"], ["CHANGELOG.md"])
+        self.assertIn("every planned entry was written", out)
+        self.assertIn("no pointer moved", out)
+
+    def test_entry_stop_says_no_history_written(self):
+        """A stop at an entry before the history files says no history file
+        was written.
+        Fails if: stopped.json or the message do not say which history files
+        were written."""
+        digest = self._ready_hash()
+        skill = self.live / "SKILL.md"
+        code, out, msg = self._apply_with_edit(
+            digest, lambda: skill.write_text("# Edited elsewhere\n",
+                                             encoding="utf-8"))
+        self.assertEqual(code, 1, out + msg)
+        rec = json.loads((self.w / "apply" / "stopped.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(rec["history_written"], [])
+        self.assertIn("no history file was written", out)
+
+    def test_edit_after_the_entry_check_is_not_overwritten(self):
+        """An edit that lands after an entry's first check, while its temp
+        file is being prepared, is caught by the second check made right
+        before the swap: the apply stops, the edit survives, the temp file is
+        gone.
+        Fails if: the temp file is prepared after the only check (the edit is
+        overwritten and the apply reports success), or the temp file is left
+        in live."""
+        digest = self._ready_hash()
+        skill = os.path.realpath(self.live / "SKILL.md")
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *a, **k):
+            real_chmod(path, mode, *a, **k)
+            if os.path.basename(str(path)).startswith(".SKILL.md."):
+                with open(skill, "a", encoding="utf-8") as fh:
+                    fh.write("Edited elsewhere.\n")
+        with unittest.mock.patch.object(vurctos.os, "chmod", side_effect=chmod):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out + msg)
+        self.assertTrue(Path(skill).read_text(encoding="utf-8").endswith(
+            "Edited elsewhere.\n"))
+        self.assertEqual([f for f in os.listdir(self.live)
+                          if f.endswith(".tmp")], [])
+        self.assertIsNone(self._pointer("evaluated"))
+
+    def test_configured_history_globs_written_last(self):
+        """Under the owner's history_globs (a non-ASCII version-log name in any
+        folder and references/governance.md), every history file is written
+        after all other entries, temp files sit beside their target, and the
+        hash is the canonical JSON of the decided parts.
+        Fails if: only the default globs are used, a glob matches the base
+        name only, only the first glob is used, a temp file is made outside
+        the target's directory, or the hash JSON escapes non-ASCII paths."""
+        hist = "\u7248\u672c\u8bb0\u5f55.md"
+        self._config(history_globs=["**/" + hist, "references/governance.md",
+                                    "CHANGELOG.md"])
+        self._write(self.live / hist, "# Log\n- v1\n")
+        self._write(self.live / "references" / "governance.md",
+                    "# Governance\n- v1\n")
+
+        def edit():
+            for rel in (hist, "references/governance.md"):
+                with open(self.w / "cand" / rel, "a", encoding="utf-8") as fh:
+                    fh.write("- v2\n")
+            with open(self.w / "cand" / "references" / "rules.md", "a",
+                      encoding="utf-8") as fh:
+                fh.write("- Keep the title.\n")
+        digest = self._ready_hash(edit=edit)
+        bd = self._batch_dir()
+
+        def sha(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        def tree(arm):
+            files = {}
+            for top, dirs, names in os.walk(arm):
+                for n in names:
+                    p = Path(top) / n
+                    files[p.relative_to(arm).as_posix()] = p
+            return files
+        orig, cand = tree(self.w / "orig"), tree(self.w / "cand")
+        lines = sorted(f"{rel}\0{sha(p)}\n" for rel, p in cand.items())
+        cand_tree = hashlib.sha256("".join(lines).encode()).hexdigest()[:12]
+        changes = []
+        for rel in sorted(set(orig) | set(cand)):
+            mode = (os.stat(cand[rel]).st_mode & 0o777) if rel in cand \
+                else None
+            if rel not in orig:
+                changes.append([rel, "add", sha(cand[rel]), mode])
+            elif rel not in cand:
+                changes.append([rel, "remove", None, None])
+            elif sha(orig[rel]) != sha(cand[rel]):
+                changes.append([rel, "change", sha(cand[rel]), mode])
+        want = hashlib.sha256(json.dumps({
+            "skill": self.NAME, "manifest": sha(self.w / "manifest.json"),
+            "cand_tree": cand_tree, "check": sha(self.w / "check.json"),
+            "batch": bd.name, "verdict": sha(bd / "verdict.json"),
+            "picks": None, "changes": changes}, sort_keys=True,
+            ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8")).hexdigest()[:16]
+        self.assertEqual(digest, want)
+        real = os.path.realpath(self.live)
+        calls, pairs = [], []
+        real_replace, real_rename = os.replace, os.rename
+
+        def note(path):
+            path = os.path.realpath(path)
+            if path.startswith(real + os.sep):
+                calls.append(os.path.relpath(path, real))
+
+        def replace(src, dst, *a, **k):
+            note(dst)
+            if os.path.realpath(dst).startswith(real + os.sep):
+                pairs.append((os.path.dirname(os.path.abspath(src)),
+                              os.path.dirname(os.path.abspath(dst))))
+            return real_replace(src, dst, *a, **k)
+
+        def rename(src, dst, *a, **k):
+            note(src)
+            return real_rename(src, dst, *a, **k)
+        with unittest.mock.patch.object(vurctos.os, "replace", side_effect=replace), \
+                unittest.mock.patch.object(vurctos.os, "rename", side_effect=rename):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(calls[:4], ["references/old.md", "references/new.md",
+                                     "SKILL.md", "references/rules.md"])
+        self.assertEqual(sorted(calls[4:]),
+                         sorted(["CHANGELOG.md", "references/governance.md",
+                                 hist]))
+        for src_dir, dst_dir in pairs:
+            self.assertEqual(src_dir, dst_dir)
+
+    def test_mode_is_applied_and_hashed(self):
+        """The cand file's permission bits are written (special bits dropped)
+        and are part of the approval hash: a chmod on cand/ after --check
+        makes the old hash stale.
+        Fails if: the mode is not written, setuid survives, or a mode change
+        after --check still applies with the old hash."""
+        script = self._write(self.live / "scripts" / "run.sh",
+                             "#!/bin/sh\necho one\n")
+        os.chmod(script, 0o644)
+
+        def edit():
+            p = self.w / "cand" / "scripts" / "run.sh"
+            p.write_text("#!/bin/sh\necho two\n", encoding="utf-8")
+            os.chmod(p, 0o755)
+        digest = self._ready_hash(edit=edit)
+        cand_script = self.w / "cand" / "scripts" / "run.sh"
+        os.chmod(cand_script, 0o700)
+        code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stale", msg)
+        os.chmod(cand_script, 0o4755)  # setuid is dropped on the way live
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, res)
+        code, out, msg = self._apply(res["hash"])
+        self.assertEqual(code, 0, msg)
+        self.assertEqual(script.read_text(encoding="utf-8"),
+                         "#!/bin/sh\necho two\n")
+        self.assertEqual(stat.S_IMODE(os.stat(script).st_mode), 0o755)
+
+    def test_folder_turned_into_file_blocks(self):
+        """A candidate that replaces a folder with a file of the same name is
+        blocked at --check (the apply could never finish).
+        Fails if: --check offers a hash for it."""
+        self._write(self.live / "extras" / "a.md", "# A\n")
+
+        def edit():
+            shutil.rmtree(self.w / "cand" / "extras")
+            self._write(self.w / "cand" / "extras", "now a file\n")
+        self._ready(edit=edit)
+        self._assert_blocked("B10", "is a folder in live", sole=False)
+
+    def test_store_failure_reports_the_pointers_as_they_are(self):
+        """When writing `evaluated` fails after `accepted` moved, the stop
+        reports the pointers as they now are instead of claiming none moved.
+        Fails if: the message says no pointer moved although accepted now
+        points at the candidate."""
+        digest = self._ready_hash()
+        real_write = vurctos._atomic_write
+
+        def write(path, text):
+            if Path(path).name == vurctos.EVALUATED_POINTER:
+                raise OSError("simulated: cannot write evaluated")
+            return real_write(path, text)
+        with unittest.mock.patch.object(vurctos, "_atomic_write", side_effect=write):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out + msg)
+        cand = json.loads((self.w / "apply" / "stopped.json").read_text(
+            encoding="utf-8"))["cand_tree"]
+        self.assertEqual(self._pointer("accepted"), cand)
+        self.assertNotIn("no pointer moved", out)
+        self.assertIn(f"accepted now {cand}", out)
+
+    def test_leftover_temp_file_is_named(self):
+        """A temp file left in live by a killed apply makes --check block, and
+        the reason names it, so the owner knows what to remove.
+        Fails if: the B3 reason does not name the leftover file."""
+        self._ready()
+        leftover = self.live / ".SKILL.md.skill-apply-4242.tmp"
+        leftover.write_text("half\n", encoding="utf-8")
+        res = self._assert_blocked("B3", "skill-apply-4242.tmp", sole=False)
+        self.assertTrue(res["reasons"])
+
+    def test_earlier_stopped_apply_is_kept(self):
+        """A new attempt after a stopped one renames the old W/apply aside and
+        keeps the files it moved.
+        Fails if: the earlier W/apply is deleted, losing the live files the
+        stopped attempt moved there."""
+        digest = self._ready_hash()
+        skill = self.live / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        new_md = os.path.realpath(self.live / "references" / "new.md")
+        real_replace = os.replace
+
+        def replace(src, dst, *a, **k):
+            real_replace(src, dst, *a, **k)
+            if os.path.realpath(dst) == new_md:
+                skill.write_text(text + "Edited elsewhere.\n",
+                                 encoding="utf-8")
+        with unittest.mock.patch.object(vurctos.os, "replace", side_effect=replace):
+            code, out, msg = self._apply(digest)
+        self.assertEqual(code, 1, out)
+        os.remove(self.live / "references" / "new.md")
+        shutil.copy2(self.w / "orig" / "references" / "old.md",
+                     self.live / "references" / "old.md")
+        skill.write_text(text, encoding="utf-8")
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, res)
+        code, out, msg = self._apply(res["hash"])
+        self.assertEqual(code, 0, msg)
+        kept = self.w / "apply-stopped-1" / "removed" / "references" / "old.md"
+        self.assertEqual(kept.read_text(encoding="utf-8"), APPLY_OLD_MD)
+        self.assertTrue((self.w / "apply-stopped-1" / "stopped.json")
+                        .exists())
+
+    def test_default_batch_skips_unfinished(self):
+        """A newer batch without verdict.json is not the default batch.
+        Fails if: the default batch is a newer unfinished one."""
+        self._ready()
+        bd = self._batch_dir()
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, msg)
+        digest = res["hash"]
+        newer = bd.parent / "29991231T235959Z"
+        newer.mkdir()
+        (newer / "batch.json").write_text(json.dumps(
+            {"skill": self.NAME, "batch": newer.name}), encoding="utf-8")
+        code, res, msg = self._check()
+        self.assertEqual(code, 0, msg)
+        self.assertEqual((res["batch"], res["hash"]), (bd.name, digest))
+
+    def test_orig_edited_blocks(self):
+        """B1: W/orig edited after the judging blocks.
+        Fails if: an orig that no longer hashes to its manifest is ready."""
+        digest = self._ready_hash()
+        shutil.copy(self.w / "cand" / "SKILL.md", self.w / "orig" / "SKILL.md")
+        self._assert_blocked("B1", "no longer hashes to its manifest",
+                             old=digest)
+
+    def test_other_base_blocks(self):
+        """B2: check.json judging another base blocks.
+        Fails if: a check.json base_tree other than the manifest tree is
+        ready."""
+        digest = self._ready_hash()
+        self._edit_json(self.w / "check.json", base_tree="0" * 12)
+        self._assert_blocked("B2", "another base was judged", old=digest)
+
+    def test_noop_candidate_blocks(self):
+        """B3: a candidate equal to the base blocks with nothing to apply.
+        Fails if: a no-op candidate is ready."""
+        def edit():
+            shutil.rmtree(self.w / "cand")
+            shutil.copytree(self.w / "orig", self.w / "cand", symlinks=True)
+        self._ready(edit=edit)
+        res = self._assert_blocked("B3", "nothing to apply", sole=False)
+        self.assertEqual(res["changes"], [])
+
+    def test_skill_resolving_elsewhere_blocks(self):
+        """B3: the skill now resolving to another folder (same tree) blocks.
+        Fails if: a skill whose real path moved since the snapshot is ready."""
+        digest = self._ready_hash()
+        copy = self.h / "work" / "caption-kit-copy"
+        shutil.copytree(self.live, copy, symlinks=True)
+        link = self.h / ".agents" / "skills" / self.NAME
+        os.remove(link)
+        os.symlink(copy, link)
+        self._assert_blocked("B3", "now resolves to", old=digest)
+
+    def test_link_swapped_in_mid_apply_stops(self):
+        """A live folder swapped for a link to a shared folder mid-apply stops
+        the apply; the shared folder is not written through.
+        Fails if: the apply-time link check is skipped and the apply writes
+        into the shared folder."""
+        digest = self._ready_hash()
+        shared = self.h / "work" / "shared-refs"
+
+        def edit():
+            shutil.copytree(self.live / "references", shared)
+            shutil.rmtree(self.live / "references")
+            os.symlink(shared, self.live / "references")
+        code, out, msg = self._apply_with_edit(digest, edit)
+        self.assertEqual(code, 1, out + msg)
+        self.assertEqual(sorted(os.listdir(shared)), ["old.md", "rules.md"])
+        self.assertEqual((shared / "old.md").read_text(encoding="utf-8"),
+                         APPLY_OLD_MD)
+
+    def test_workdir_inside_live_refused(self):
+        """A workdir inside the live tree (in a folder the tree hash skips)
+        is refused.
+        Fails if: --check runs on a workdir that lies inside live."""
+        self._ready()
+        inner = self.live / "evals" / "w"
+        inner.parent.mkdir()
+        shutil.move(str(self.w), str(inner))
+        self.w = inner
+        code, res, msg = self._check()
+        self.assertEqual(code, 1, (res, msg))
+        self.assertIn("lies inside the live tree", msg)
+
 if __name__ == "__main__":
     unittest.main()

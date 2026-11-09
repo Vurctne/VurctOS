@@ -144,6 +144,17 @@ Each run gets a fresh mirror of the home in which the skill resolves to the arm 
 
 Configured in the private `skill-loop.json`: `eval_model` (required for a run: the full model id every run must report), `eval_effort` (`low` to `max`, or null), `eval_runs` (default 2), `eval_max_runs` (default 24) and `eval_blocked_bins` (default `codex, gh, curl, wget, ssh, scp, osascript, open`). See `docs/skills-system.md` for the case format, the audit and the verdict rules.
 
+### Skill apply (put a judged candidate live)
+
+```bash
+python3 cli/vurctos.py skill-apply vibe-coding-setup --global --workdir /tmp/w1 --check [--batch B] [--json]
+python3 cli/vurctos.py skill-apply vibe-coding-setup --global --workdir /tmp/w1 --approved-hash <hash>
+```
+
+`--check` changes nothing outside `W` (it writes `W/apply-check.json`, the same content `--json` prints). It reads `W/manifest.json`, `W/check.json` and the batch's `batch.json`, `verdict.json` and `picks.json` (`--batch` takes a batch name; default: the latest batch that is not a probe), and answers **ready** (exit 0), **held** (exit 3: the static check held, or the batch has invalid runs; the owner may still approve) or **blocked** (exit 1: `orig/` or `cand/` changed since they were judged, live changed since the snapshot, a probe, aborted or failing batch, pending picks, fewer than 3 approved judged cases, a case or judge changed after the batch, a failed static check, a symlink change, a folder turned into a file, or an earlier apply from this workdir). It prints every reason, the planned changes in apply order with their character deltas, and, unless blocked, the approval hash and the exact command to apply it.
+
+`--approved-hash H` recomputes everything and refuses (exit 1, nothing written) when blocked, when `H` is not the current hash, or when `W/apply/applied.json` exists. It then changes live: removes, adds, changes, history files (`history_globs`) last; each live file is re-hashed before and again right after its temp file is written, then the temp file is renamed into place, and a removed file is moved to `W/apply/removed/`. On success it stores the candidate's copy, points `accepted` and `evaluated` at it, writes `W/apply/applied.json` and prints the changed live paths for an explicit-path commit. A stop restores nothing, writes `W/apply/stopped.json` (what was written, which history files, where the pointers are) and exits 1; a stop at an entry moves no pointer, while a stop after the last entry means every file, history included, was written. The command never runs git, a model or any other subprocess. See `docs/skills-system.md`.
+
 ### Aging (retire old durable lines)
 
 ```bash

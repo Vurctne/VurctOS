@@ -133,6 +133,31 @@ A billing failure, a failed login preflight, loader failures (A2 or A3 after the
 
 **The blind pick.** `vurctos skill-pick make` writes a page for the cases a person judges: per case the prompt, then outputs A and B (final message and created files), drawn at random per case. Paths (as given, resolved, or written `~/...`) are replaced with neutral placeholders, an arm's directory with `<skill>` on both sides, and the page is refused if it would still reveal the workdir, an arm directory name, a run label such as `cand-1`, a hash or the batch id; its own text never names the arms. A page is made once per batch, so answers written on it always map through its own key. The key that maps A and B back is sealed beside it with its sha256 recorded. `vurctos skill-pick record --answers "1:A,2:same"` maps the answers through the key (refusing a key that changed) and recomputes the verdict.
 
+## Putting a candidate live
+
+`vurctos skill-apply NAME --workdir W` is the only door from a judged candidate (`W/cand`) to the live skill. `--check` evaluates the predicates below and prints the planned changes and, unless blocked, an approval hash; `--approved-hash H` applies only while `H` is still the hash of exactly what was judged. The tool never applies on its own: a person passes the hash, or a private task of theirs does under a standing authorization they wrote. It also never runs git or any other subprocess; it prints the changed live paths so the caller can commit them by explicit path.
+
+**Block** (no hash; any hash refused):
+
+- B1 `W/orig` no longer hashes to the snapshot: the base the candidate was judged against is gone.
+- B2 `W/cand` (and the snapshot) must hash to what `check.json` and the verdict recorded. Otherwise something other than what was judged would go live; edit `cand/`, then rerun the check and the eval.
+- B3 live must still hash to the snapshot, and the skill must still resolve to the same real path. Skills are edited by many sessions; applying over a later edit would destroy it silently. A candidate identical to its base also blocks (nothing to apply).
+- B4 the verdict: a probe batch (both arms ran the base), an aborted batch, a `fail` verdict, picks still pending for a human-judged case, or a suite with fewer than 3 approved cases that the runner can judge.
+- B5 every case of the batch must still load and hash as it did, and every judge directory it references must still hash to its name. Otherwise the verdict is about other cases.
+- B6 a `fail` from the static check.
+- B7 a symlink the candidate adds, removes or retargets, or an entry live reaches through a symlink. The tree hash does not cover links, and writing through one could change a file another skill shares, so such a change is made by hand.
+- B8 a single-file target can only have its one file changed.
+- B9 the workdir was already applied.
+- B10 an added file whose path is a folder in live (a folder turned into a file): the apply could never finish, so that change is made by hand.
+
+**Hold** (the owner may still approve with the hash after reading them): a `hold` from the static check (one reason per hold finding, quoting it), and invalid runs in the batch.
+
+**The hash** is 16 hex of a sha256 over the skill name, the bytes of `W/manifest.json`, the candidate's tree hash, the bytes of `check.json`, the batch name, the bytes of `verdict.json` and of `picks.json` (if any), and the planned changes (path, action, sha256 of the new bytes, permission bits; special bits such as setuid are dropped on the way live). Any edit to any of them makes an old hash stale, and the apply recomputes everything from the files as they are then rather than trusting what `--check` printed.
+
+**The apply** compares the two copies file by file (add, change, remove) and changes live in that order: removes, then adds, then changes, with files matching `history_globs` (the version log whose `fb:` citations mark feedback answered) after all others. Before each entry the live file is hashed again; it must still be what the snapshot saw (or, for an add, absent). New content goes to a temp file beside its target, the live file is checked once more, and the temp file is renamed into place at once, so each file is old or new, never half. An edit can still be lost if it lands in the moment between that last check and the rename; the filesystem offers no compare-and-swap for file content. A removed file is moved to `W/apply/removed/`, never deleted. When live then hashes to the candidate, the candidate's copy is stored under `<evals_dir>/_snapshots/<name>/` and both `accepted` and `evaluated` point at it (`evaluated` is the tree last put live by an apply), and `W/apply/applied.json` records the apply. A workdir applies once.
+
+**A stop** restores nothing, because restoring could overwrite the other session's edit. The entries already done stay done, and `W/apply/stopped.json` lists what was replaced, what was moved, where it stopped, which history files were written and where the pointers are. A stop at an entry (a live file changed under the apply, or an OS error) comes before the history files unless it is at one of them, so usually no feedback is marked answered and no pointer moves; the fix is a fresh snapshot and a candidate redone on it. A stop after the last entry (live no longer hashes to the candidate because another file changed meanwhile, or the snapshot store could not be updated) comes after everything was written, history files included: live holds the candidate plus the other change, and the stop says so and reports the pointers as they are. Look at the other change before the next snapshot. A temp file left by a killed apply makes the next `--check` block, and the reason names it.
+
 ## Skill Storage
 
 Repository-level skills live in the top-level `skills/` directory, each as its own SKILL.md directory. Project-specific skill notes can also live inside a project folder under `skills/` when the skill is still experimental.

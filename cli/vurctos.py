@@ -21,6 +21,7 @@ steps:
   vurctos skill-check      static check of a skill edit: pass, hold or fail
   vurctos skill-eval       run a skill's eval cases on two copies, headlessly
   vurctos skill-pick       a blind pick page for cases only a person can judge
+  vurctos skill-apply      put a judged candidate live (approval hash)
 
 Design rules (see AGENTS.md):
   - local-first, subscription-first, no API keys
@@ -2335,7 +2336,10 @@ CHECK_CATEGORIES = ("protected", "touch", "volume", "lint", "coverage",
 CHECK_EXIT = {"pass": 0, "fail": 1, "hold": 3}
 LINT_REPORT_MAX = 20
 SNAPSHOTS_DIRNAME = "_snapshots"
-ACCEPTED_POINTER = "accepted"  # phase 6 adds `evaluated` beside it
+# `evaluated` holds the tree last put live by skill-apply (phase 7 measures
+# live drift against it).
+ACCEPTED_POINTER = "accepted"
+EVALUATED_POINTER = "evaluated"
 CURATED_FILE = "_protected.txt"
 _HASH_NAME_RE = re.compile(r"^[0-9a-f]{12}$")
 _RULE_MARKERS_RE = re.compile(r"^(?:(?:[-*+]|[0-9]+[.)])(?:\s+|$))*")
@@ -5144,6 +5148,681 @@ def cmd_skill_pick(args):
         _pick_record(args, w, bd, batch, results)
 
 
+# --- Putting a candidate live: skill-apply ---------------------------------
+#
+# skill-check and skill-eval judge W/cand against W/orig; skill-apply is the
+# only door from that judged candidate to the live skill. It opens only with
+# an approval hash bound to exactly the snapshot, candidate, check and eval
+# batch that were judged (the reflect-apply pattern). The tool never applies
+# on its own and never runs git or any other subprocess: a person, or a
+# caller holding their standing authorization, passes the hash. Three
+# failures matter most:
+#
+#   - Something other than what was judged goes live: cand/ edited after the
+#     eval, a case or judge changed after the batch, a stale or probe batch,
+#     a hash reused for another candidate. Every input is re-read and the
+#     hash recomputed at apply time.
+#   - A concurrent edit is lost: live must still hash to the snapshot, and
+#     each entry is re-hashed immediately before it is replaced. A stop
+#     restores nothing, since restoring could overwrite the other edit.
+#   - A half-applied skill looks applied: history files (the version log,
+#     whose fb: citations mark feedback answered) are written last, and no
+#     pointer moves unless live ends up hashing to the candidate.
+
+APPLY_SCHEMA = 1
+APPLY_EXIT = {"ready": 0, "blocked": 1, "held": 3}
+APPLY_ORDER = ("remove", "add", "change")
+
+
+def _apply_input(path):
+    """(object, bytes) of a required JSON input; exits naming the file when
+    it is missing or not a JSON object."""
+    try:
+        data = path.read_bytes()
+        obj = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: skill-apply needs {path} ({exc})")
+    if not isinstance(obj, dict):
+        sys.exit(f"error: malformed {path}: the top level must be a JSON "
+                 f"object")
+    return obj, data
+
+
+def _apply_batch_dir(wr, batch):
+    """W/eval/<batch>, or the latest batch by name whose verdict.json says
+    probe: false (a probe ran W/orig in both arms and judged nothing)."""
+    root = wr / "eval"
+    if batch:
+        if not _BATCH_NAME_RE.match(batch):
+            sys.exit(f"error: --batch takes the name of a batch in {root} "
+                     f"(such as 20261108T133120Z), not a path")
+        if not (root / batch).is_dir():
+            sys.exit(f"error: no batch {batch} in {root}")
+        return root / batch
+    found = []
+    for d in (root.iterdir() if root.is_dir() else []):
+        m = _BATCH_NAME_RE.match(d.name)
+        if not m:
+            continue
+        try:
+            verdict = json.loads((d / "verdict.json").read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(verdict, dict) and verdict.get("probe") is False:
+            found.append(((m.group(1), int(m.group(2) or 1)), d))
+    if not found:
+        sys.exit(f"error: no finished eval batch (other than a probe) in "
+                 f"{root}; run vurctos skill-eval first")
+    return max(found)[1]
+
+
+def _apply_inputs(w, wr, name, batch_arg):
+    """Every input skill-apply reads, validated before anything else:
+    {manifest, check, batch, verdict, bd, bytes: {manifest, check, verdict,
+    picks}}."""
+    manifest = _read_manifest(w, name)
+    mpath = w / "manifest.json"
+    try:
+        mbytes = mpath.read_bytes()
+        same = json.loads(mbytes.decode("utf-8")) == manifest
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        sys.exit(f"error: {mpath} changed while it was being read; run it "
+                 f"again")
+    files, tree = manifest["files"], manifest.get("tree")
+    lines = sorted(f"{rel}\0{sha}\n" for rel, sha in files.items())
+    if not (isinstance(tree, str) and _HASH_NAME_RE.match(tree)
+            and all(isinstance(s, str) and _HEX64_RE.match(s)
+                    for s in files.values())
+            and hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+            [:12] == tree):
+        sys.exit(f"error: malformed {mpath}: its files do not hash to its "
+                 f"tree")
+    cpath = w / "check.json"
+    check, cbytes = _apply_input(cpath)
+    if check.get("skill") != name:
+        sys.exit(f"error: {cpath} is a check of {check.get('skill')!r}, not "
+                 f"{name}")
+    findings = check.get("findings")
+    if not (check.get("level") in CHECK_EXIT
+            and isinstance(check.get("base_tree"), str)
+            and isinstance(check.get("cand_tree"), str)
+            and isinstance(findings, list)
+            and all(isinstance(f, dict) and all(
+                isinstance(f.get(k), str)
+                for k in ("category", "severity", "message"))
+                for f in findings)):
+        sys.exit(f"error: malformed {cpath}; rerun vurctos skill-check "
+                 f"{name} --workdir W")
+    bd = _apply_batch_dir(wr, batch_arg)
+    bpath, vpath, ppath = (bd / "batch.json", bd / "verdict.json",
+                           bd / "picks.json")
+    batch, _ = _apply_input(bpath)
+    verdict, vbytes = _apply_input(vpath)
+    pbytes = None
+    if os.path.lexists(ppath):
+        picks, pbytes = _apply_input(ppath)
+        if not isinstance(picks.get("picks"), dict):
+            sys.exit(f"error: malformed {ppath}: no picks object")
+    for path, obj in ((bpath, batch), (vpath, verdict)):
+        if obj.get("skill") != name or obj.get("batch") != bd.name:
+            sys.exit(f"error: {path} belongs to {obj.get('skill')!r} batch "
+                     f"{obj.get('batch')!r}, not {name} batch {bd.name}")
+    cases = batch.get("cases")
+    if not (isinstance(cases, list)
+            and all(isinstance(c, dict) and isinstance(c.get("hash"), str)
+                    and isinstance(c.get("name"), str)
+                    and "/" not in c["name"]
+                    and c["name"] not in ("", ".", "..") for c in cases)
+            and (batch.get("model") is None
+                 or isinstance(batch["model"], str))):
+        sys.exit(f"error: malformed {bpath}: cases must list each case's "
+                 f"name and hash")
+    arms = verdict.get("arms")
+    if not (isinstance(verdict.get("probe"), bool)
+            and (verdict.get("aborted") is None
+                 or isinstance(verdict["aborted"], str))
+            and verdict.get("level") in CHECK_EXIT
+            and isinstance(verdict.get("suite_ok"), bool)
+            and isinstance(verdict.get("human_pending"), list)
+            and isinstance(verdict.get("invalid_runs"), list)
+            and all(isinstance(r, dict) for r in verdict["invalid_runs"])
+            and isinstance(arms, dict)
+            and all(isinstance(arms.get(a), str) for a in EVAL_ARMS)):
+        sys.exit(f"error: malformed {vpath}")
+    return {"manifest": manifest, "check": check, "batch": batch,
+            "verdict": verdict, "bd": bd,
+            "bytes": {"manifest": mbytes, "check": cbytes,
+                      "verdict": vbytes, "picks": pbytes}}
+
+
+def _apply_plan(orig, cand):
+    """The planned changes, comparing the arms entry by entry as _arm_files
+    sees them, sorted by path: add (only in cand), change (both, different
+    content), remove (only in orig). Each holds the cand bytes and mode it
+    would write, so what is written is exactly what was hashed."""
+    o, c = dict(_arm_files(orig)), dict(_arm_files(cand))
+    plan = []
+    for rel in sorted(set(o) | set(c)):
+        before = o[rel].read_bytes() if rel in o else None
+        after = c[rel].read_bytes() if rel in c else None
+        if before == after:
+            continue
+        plan.append({
+            "path": rel,
+            "action": ("add" if before is None else
+                       "remove" if after is None else "change"),
+            "sha256": (hashlib.sha256(after).hexdigest()
+                       if after is not None else None),
+            "mode": os.stat(c[rel]).st_mode & 0o777 if rel in c else None,
+            "before": before, "after": after})
+    return plan
+
+
+def _arm_links(arm):
+    """{relpath: link text} of the symlinks in an arm, which _arm_files
+    leaves out (in a copy they are the nested-skill links to live), walked
+    with the same pruning."""
+    def fail(exc):
+        raise exc
+    out = {}
+    for top, dirs, files in os.walk(arm, onerror=fail):
+        here = Path(top)
+        for n in dirs + files:
+            if n not in TREE_EXCLUDED and os.path.islink(here / n):
+                out[(here / n).relative_to(arm).as_posix()] = \
+                    os.readlink(here / n)
+        dirs[:] = [d for d in dirs if d not in TREE_EXCLUDED
+                   and not (here / d).is_symlink()
+                   and not (here / d / "SKILL.md").exists()]
+    return out
+
+
+def _apply_live_link(target, rel, action):
+    """The first symlink on the way from the live target to rel (rel itself
+    included unless it is to be added), or None."""
+    p, parts = Path(target), PurePosixPath(rel).parts
+    for i, part in enumerate(parts):
+        p = p / part
+        if i == len(parts) - 1 and action == "add":
+            return None
+        if os.path.islink(p):
+            return p
+        if not os.path.lexists(p):
+            return None
+    return None
+
+
+def _apply_chars(data):
+    """Characters of a file's bytes (0 when absent), or None for binary."""
+    if data is None:
+        return 0
+    if b"\0" in data:
+        return None
+    try:
+        return len(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        return None
+
+
+def _apply_state(args):
+    """Read every input and evaluate the predicates, the planned changes and
+    the approval hash from the files as they are now. Writes nothing."""
+    _, cfg, live = _check_target(args)
+    name = args.name
+    w = Path(os.path.abspath(os.path.expanduser(args.workdir)))
+    _refuse_inside(name, live, [w, _snapshot_store(cfg, name)])
+    wr = Path(os.path.realpath(w))
+    inp = _apply_inputs(w, wr, name, args.batch)
+    manifest, check = inp["manifest"], inp["check"]
+    batch, verdict, bd = inp["batch"], inp["verdict"], inp["bd"]
+    tree, target = manifest["tree"], manifest["live"]
+    reasons = []
+
+    def add(code, severity, message):
+        reasons.append({"code": code, "severity": severity,
+                        "message": message})
+
+    def arm_hash(arm):
+        try:
+            return _arm_hash(arm)
+        except OSError:
+            return None
+    base_now, cand_now = arm_hash(wr / "orig"), arm_hash(wr / "cand")
+    if base_now != tree:
+        add("B1", "block", f"{w / 'orig'} no longer hashes to its manifest "
+                           f"(now {base_now}, manifest {tree}); edit cand/ "
+                           f"only, and take a fresh snapshot")
+    for label, want in (("check.json cand_tree", check["cand_tree"]),
+                        ("verdict.json arms.cand", verdict["arms"]["cand"])):
+        if cand_now != want:
+            add("B2", "block", f"cand/ hashes to {cand_now} but {label} is "
+                               f"{want}: cand/ changed after it was judged; "
+                               f"rerun skill-check and skill-eval after "
+                               f"editing cand/")
+    for label, want in (("check.json base_tree", check["base_tree"]),
+                        ("verdict.json arms.base", verdict["arms"]["base"])):
+        if tree != want:
+            add("B2", "block", f"the snapshot's tree is {tree} but {label} "
+                               f"is {want}: another base was judged; rerun "
+                               f"skill-check and skill-eval on this workdir")
+    try:
+        live_now = _skill_tree_hash(live)
+    except (OSError, ValueError):
+        live_now = None
+    if os.path.realpath(live) != target:
+        add("B3", "block", f"{name} now resolves to "
+                           f"{os.path.realpath(live)}, not to {target} where "
+                           f"the snapshot was taken; take a fresh snapshot")
+    elif live_now != tree:
+        left = _apply_leftovers(target)
+        add("B3", "block", f"live hashes to {live_now}, not to the "
+                           f"snapshot's {tree}: another edit landed after "
+                           f"the snapshot; take a fresh snapshot and redo "
+                           f"the candidate on it" + (
+                               f" (live holds temp files a killed apply "
+                               f"left: {', '.join(left)}; remove them when "
+                               f"no apply is running)" if left else ""))
+    if cand_now is not None and cand_now == tree:
+        add("B3", "block", "nothing to apply: cand/ hashes like the base")
+    if verdict["probe"]:
+        add("B4", "block", "the batch is a probe: both arms ran W/orig, so "
+                           "it judged nothing about cand/; run skill-eval "
+                           "without --probe")
+    if verdict["aborted"] is not None:
+        add("B4", "block", f"the batch aborted: {verdict['aborted']}")
+    if verdict["level"] == "fail":
+        add("B4", "block", "the verdict is fail (a regression, too few "
+                           "valid runs, an abort or a pick for the base)")
+    if verdict["human_pending"]:
+        add("B4", "block", f"record the picks first: "
+                           f"{', '.join(map(str, verdict['human_pending']))} "
+                           f"wait for a person (skill-pick make, then "
+                           f"skill-pick record)")
+    if not verdict["suite_ok"]:
+        add("B4", "block", "fewer than 3 approved cases with a runner-judged "
+                           "grader (suite_ok false)")
+    changed, cache = [], {}
+    for c in batch["cases"]:
+        try:
+            case = _load_case(cfg, name, c["name"], batch.get("model"), cache)
+        except (_CaseError, OSError) as exc:
+            changed.append(f"{c['name']}: {exc}")
+            continue
+        if case["hash"] != c["hash"]:
+            changed.append(f"{c['name']}: hash {case['hash']}, the batch ran "
+                           f"{c['hash']}")
+    if changed:
+        add("B5", "block", "a case or judge changed after the batch; rerun "
+                           "skill-eval (" + "; ".join(changed) + ")")
+    if check["level"] == "fail":
+        add("B6", "block", "skill-check failed (check.json level fail); fix "
+                           "cand/ and rerun skill-check")
+    elif check["level"] == "hold":
+        holds = [f for f in check["findings"] if f["severity"] == "hold"]
+        for f in holds:
+            where = f" ({f['file']})" if f.get("file") else ""
+            add("H1", "hold", f"skill-check hold: [{f['category']}] "
+                              f"{f['message']}{where}")
+        if not holds:
+            add("H1", "hold", "skill-check level hold")
+    if verdict["invalid_runs"]:
+        runs = verdict["invalid_runs"]
+        cases = dict.fromkeys(str(r.get("case")) for r in runs)
+        add("H2", "hold", f"{len(runs)} invalid run(s) in the batch: "
+                          f"{', '.join(cases)}")
+    try:
+        plan = _apply_plan(wr / "orig", wr / "cand")
+        links = (_arm_links(wr / "orig"), _arm_links(wr / "cand"))
+    except OSError as exc:
+        sys.exit(f"error: cannot read {w / 'orig'} and {w / 'cand'}: {exc}")
+    odd = sorted(rel for rel in set(links[0]) | set(links[1])
+                 if links[0].get(rel) != links[1].get(rel))
+    if odd:
+        add("B7", "block", f"cand/ adds, removes or retargets a symlink "
+                           f"({', '.join(odd)}); the tree hash does not "
+                           f"cover links and skill-apply writes regular "
+                           f"files only, so make that change by hand")
+    files = manifest["files"]
+    only = next(iter(files)) if len(files) == 1 else None
+    is_file = only == PurePosixPath(target).name and \
+        not os.path.isdir(target)
+    if is_file:
+        stray = [f"{e['action']} {e['path']}" for e in plan
+                 if (e["action"], e["path"]) != ("change", only)]
+        if stray:
+            add("B8", "block", f"{name} is a single file, so cand/ can only "
+                               f"change {only} (not: {', '.join(stray)})")
+    else:
+        for e in plan:
+            spot = Path(target) / e["path"]
+            if e["action"] == "add" and os.path.isdir(spot) \
+                    and not os.path.islink(spot):
+                add("B10", "block", f"add {e['path']}: {e['path']} is a "
+                                    f"folder in live; turning a folder into "
+                                    f"a file is done by hand")
+            hop = _apply_live_link(target, e["path"], e["action"])
+            if hop:
+                add("B7", "block", f"{e['action']} {e['path']}: live reaches "
+                                   f"it through the symlink {hop}; "
+                                   f"skill-apply never writes through or "
+                                   f"replaces a link, so apply it by hand")
+    if (wr / "apply" / "applied.json").exists():
+        add("B9", "block", f"already applied from this workdir "
+                           f"({wr / 'apply' / 'applied.json'}); take a "
+                           f"fresh snapshot for the next edit")
+    level = ("blocked" if any(r["severity"] == "block" for r in reasons)
+             else "held" if reasons else "ready")
+    raw = inp["bytes"]
+
+    def sha(data):
+        return hashlib.sha256(data).hexdigest() if data is not None else None
+    digest = hashlib.sha256(json.dumps({
+        "skill": name, "manifest": sha(raw["manifest"]),
+        "cand_tree": cand_now, "check": sha(raw["check"]),
+        "batch": bd.name, "verdict": sha(raw["verdict"]),
+        "picks": sha(raw["picks"]),
+        "changes": sorted([e["path"], e["action"], e["sha256"], e["mode"]]
+                          for e in plan)},
+        sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    order = sorted(plan, key=lambda e: (_is_history(e["path"], cfg),
+                                        APPLY_ORDER.index(e["action"]),
+                                        e["path"]))
+    rows, total = [], {"before": 0, "after": 0}
+    for e in order:
+        b, a = _apply_chars(e["before"]), _apply_chars(e["after"])
+        text = a is not None and b is not None
+        if text:
+            total["before"] += b
+            total["after"] += a
+        rows.append({"path": e["path"], "action": e["action"],
+                     "sha256": e["sha256"],
+                     "history": _is_history(e["path"], cfg),
+                     "chars": ({"before": b, "after": a, "delta": a - b}
+                               if text else None)})
+    total["delta"] = total["after"] - total["before"]
+    command = (f"vurctos skill-apply {name} {_scope_flag(args)} --workdir "
+               f"{shlex.quote(str(w))}"
+               + (f" --batch {bd.name}" if args.batch else "")
+               + f" --approved-hash {digest}")
+    blocked = level == "blocked"
+    result = {
+        "schema_version": APPLY_SCHEMA, "skill": name, "level": level,
+        "workdir": str(w), "batch": bd.name, "base_tree": tree,
+        "cand_tree": cand_now, "live_tree": live_now, "reasons": reasons,
+        "changes": rows, "chars": total,
+        "hash": None if blocked else digest,
+        "command": None if blocked else command}
+    return {"cfg": cfg, "name": name, "w": w, "wr": wr, "level": level,
+            "hash": digest, "result": result, "order": order,
+            "manifest": manifest, "batch": bd.name, "base_tree": tree,
+            "cand_tree": cand_now, "target": Path(target),
+            "is_file": is_file}
+
+
+def _print_apply_check(result, path):
+    r = result
+    print(f"{r['level']}: skill-apply {r['skill']} (batch {r['batch']}, base "
+          f"{r['base_tree']}, cand {r['cand_tree']}, live {r['live_tree']})")
+    print("reasons:" if r["reasons"] else "reasons: none")
+    for x in r["reasons"]:
+        print(f"  [{x['severity']}] {x['code']} {x['message']}")
+    print("changes, in apply order:" if r["changes"] else "changes: none")
+    for c in r["changes"]:
+        size = (f"{c['chars']['delta']:+d} chars" if c["chars"]
+                else "binary")
+        print(f"  {c['action']} {c['path']} ({size}"
+              f"{'; history file, written last' if c['history'] else ''})")
+    t = r["chars"]
+    print(f"text files: {t['delta']:+d} chars ({t['before']} -> "
+          f"{t['after']})")
+    if r["hash"]:
+        print(f"approval hash: {r['hash']}")
+        print(f"next: once the owner approves this result, run "
+              f"`{r['command']}`")
+    else:
+        print("no approval hash while blocked: fix the block reasons, then "
+              "run --check again")
+    print(f"check: {path}")
+
+
+def _apply_mismatch(entry, dst, want, target, is_file):
+    """Why the live entry may not be replaced now, or None: an add needs a
+    free path; a change or remove needs the regular file the snapshot saw,
+    reached without a link."""
+    if not is_file:
+        hop = _apply_live_link(target, entry["path"], entry["action"])
+        if hop:
+            return f"live reaches it through the symlink {hop}"
+    if entry["action"] == "add":
+        return "the path exists in live now" if os.path.lexists(dst) \
+            else None
+    if os.path.islink(dst) or not os.path.isfile(dst):
+        return "it is no longer a regular file in live"
+    try:
+        got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"it cannot be read ({exc})"
+    return None if got == want else \
+        "live changed since the snapshot (another edit landed)"
+
+
+APPLY_TMP_RE = re.compile(r"^\..+\.skill-apply-[0-9]+\.tmp$")
+
+
+def _apply_leftovers(target):
+    """Temp files a killed apply left in live (relpaths, sorted)."""
+    base = Path(target)
+    if not base.is_dir():
+        base = base.parent
+        names = [n for n in os.listdir(base) if APPLY_TMP_RE.match(n)]
+        return sorted(names)
+    out = []
+    for top, dirs, files in os.walk(base):
+        for n in files:
+            if APPLY_TMP_RE.match(n):
+                out.append((Path(top) / n).relative_to(base).as_posix())
+    return sorted(out)
+
+
+def _apply_prepare(dst, data, mode):
+    """A new temp file beside dst holding data with mode, ready to be
+    renamed into place. It is made before the entry's last check so that
+    the check and the rename follow each other as closely as possible."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f".{dst.name}.skill-apply-{os.getpid()}.tmp"
+    open(tmp, "xb").close()  # never reuses a file it did not create
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, mode)
+    except OSError:
+        os.unlink(tmp)
+        raise
+    return tmp
+
+
+def _apply_run(args, st):
+    """Apply the planned entries to live (see Decided order), then advance
+    the store pointers; a stop writes W/apply/stopped.json and exits 1."""
+    name, w, wr, cfg = st["name"], st["w"], st["wr"], st["cfg"]
+    apply_dir = wr / "apply"
+    scope = _scope_flag(args)
+    if (apply_dir / "applied.json").exists():
+        sys.exit(f"error: nothing applied: already applied from this "
+                 f"workdir ({apply_dir / 'applied.json'}); take a fresh "
+                 f"snapshot for the next edit")
+    if st["level"] == "blocked":
+        listed = "\n".join(f"  [{x['severity']}] {x['code']} {x['message']}"
+                           for x in st["result"]["reasons"])
+        sys.exit(f"error: nothing applied: blocked\n{listed}")
+    if not args.approved_hash:
+        sys.exit(f"error: nothing applied: no --approved-hash given; run "
+                 f"`vurctos skill-apply {name} {scope} --workdir "
+                 f"{shlex.quote(str(w))} --check` first")
+    if args.approved_hash != st["hash"]:
+        sys.exit(f"error: nothing applied: approval is stale or wrong; run "
+                 f"--check again (`vurctos skill-apply {name} {scope} "
+                 f"--workdir {shlex.quote(str(w))} --check`), show the "
+                 f"result to the owner, and apply with the hash it prints")
+    if os.path.lexists(apply_dir):  # an earlier apply that stopped
+        n = 1
+        while os.path.lexists(wr / f"apply-stopped-{n}"):
+            n += 1
+        os.rename(apply_dir, wr / f"apply-stopped-{n}")
+        print(f"kept the earlier stopped apply as {wr / f'apply-stopped-{n}'}")
+    apply_dir.mkdir()
+    target, order, files = st["target"], st["order"], st["manifest"]["files"]
+    record = {"schema_version": APPLY_SCHEMA, "skill": name,
+              "hash": st["hash"], "batch": st["batch"],
+              "base_tree": st["base_tree"], "cand_tree": st["cand_tree"]}
+    applied, replaced, moved = [], [], []
+    store = _snapshot_store(cfg, name)
+
+    def pointers():
+        ev = store / EVALUATED_POINTER
+        return (_read_accepted(store),
+                ev.read_text(encoding="utf-8").strip() if ev.exists()
+                else None)
+    before = pointers()
+
+    def stop(i, why):
+        entry = order[i] if i < len(order) else None
+        history = [x["path"] for x in replaced + moved
+                   if _is_history(x["path"], cfg)]
+        now = pointers()
+        rec = dict(record, replaced=replaced, moved=moved,
+                   history_written=history,
+                   pointers={"accepted": now[0], "evaluated": now[1]},
+                   stopped_at=({"path": entry["path"],
+                                "action": entry["action"]}
+                               if entry else None),
+                   reason=why,
+                   not_applied=[{"path": e["path"], "action": e["action"]}
+                                for e in order[i:]],
+                   stopped_utc=_utc_now())
+        _atomic_write(apply_dir / "stopped.json",
+                      json.dumps(rec, ensure_ascii=False, indent=2) + "\n")
+        if args.json:
+            print(json.dumps(rec, ensure_ascii=False, indent=2))
+        else:
+            where = (f" at {entry['action']} {entry['path']}" if entry
+                     else "")
+            print(f"stopped: skill-apply {name}{where}: {why}")
+            for r in replaced:
+                print(f"  replaced: {r['live']}")
+            for m in moved:
+                print(f"  moved: {m['from']} -> {m['to']}")
+            for e in order[i:]:
+                print(f"  not applied: {e['action']} {e['path']}")
+            if entry is None:
+                print("every planned entry was written, history files "
+                      "included: live holds the candidate plus whatever "
+                      "else changed")
+            print(f"history files written: {', '.join(history)}" if history
+                  else "no history file was written, so no feedback is "
+                       "marked answered")
+            print("nothing was restored (that could overwrite another "
+                  "edit)")
+            print("no pointer moved" if now == before else
+                  f"pointers: accepted now {now[0]}, evaluated now {now[1]}")
+            print("take a fresh snapshot and redo the candidate on it" if entry
+                  else "look at the other edit first, then take a fresh "
+                       "snapshot before the next apply")
+            print(f"record: {apply_dir / 'stopped.json'}")
+        sys.exit(f"error: the apply of {name} stopped: {why}")
+
+    for i, e in enumerate(order):
+        rel = e["path"]
+        dst = target if st["is_file"] else target / rel
+        why = _apply_mismatch(e, dst, files.get(rel), target, st["is_file"])
+        if why:
+            stop(i, why)
+        try:
+            if e["action"] == "remove":
+                to = apply_dir / "removed" / rel
+                to.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dst), str(to))
+                moved.append({"path": rel, "from": str(dst), "to": str(to)})
+            else:
+                tmp = _apply_prepare(dst, e["after"], e["mode"])
+                # the last check right before the swap: an edit that landed
+                # while the temp file was written is not overwritten (a
+                # window of one hash read remains; the final tree check
+                # below still sees later edits to other files)
+                why = _apply_mismatch(e, dst, files.get(rel), target,
+                                      st["is_file"])
+                if why:
+                    os.unlink(tmp)
+                    stop(i, why)
+                try:
+                    os.replace(tmp, dst)
+                except OSError:
+                    os.unlink(tmp)
+                    raise
+                replaced.append({"path": rel, "action": e["action"],
+                                 "live": str(dst)})
+        except OSError as exc:
+            stop(i, f"{type(exc).__name__}: {exc}")
+        applied.append({"path": rel, "action": e["action"],
+                        "live": str(dst)})
+    try:
+        now = _skill_tree_hash(target)
+    except (OSError, ValueError):
+        now = None
+    if now != st["cand_tree"]:
+        stop(len(order), f"applied, but live now hashes to {now}, not to "
+                         f"the candidate's {st['cand_tree']}")
+    try:
+        _store_arm(name, wr / "cand", store, st["cand_tree"])
+        _write_accepted(store, st["cand_tree"])
+        _atomic_write(store / EVALUATED_POINTER, st["cand_tree"] + "\n")
+    except SystemExit as exc:
+        stop(len(order), f"live hashes to the candidate, but the snapshot "
+                         f"store was not updated ({exc.code})")
+    except OSError as exc:
+        stop(len(order), f"live hashes to the candidate, but the snapshot "
+                         f"store was not updated ({exc})")
+    rec = dict(record, applied=applied, moved=moved, applied_utc=_utc_now())
+    _atomic_write(apply_dir / "applied.json",
+                  json.dumps(rec, ensure_ascii=False, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(rec, ensure_ascii=False, indent=2))
+        return
+    print(f"applied: skill-apply {name} (batch {st['batch']}, cand tree "
+          f"{st['cand_tree']}, {len(applied)} entr"
+          f"{'y' if len(applied) == 1 else 'ies'})")
+    for m in moved:
+        print(f"  moved away: {m['from']} -> {m['to']}")
+    print("changed live paths (commit these by explicit path):")
+    for a in applied:
+        print(f"  {a['live']}")
+    print(f"accepted and evaluated now point at {st['cand_tree']} "
+          f"({store})")
+    print(f"record: {apply_dir / 'applied.json'}")
+
+
+def cmd_skill_apply(args):
+    """Put a judged candidate live. --check prints the predicates, the
+    planned changes and the approval hash (exit 0 ready, 3 held, 1
+    blocked); --approved-hash applies them when that hash is still the
+    current one. Never runs git or any other subprocess."""
+    st = _apply_state(args)
+    if not args.check:
+        return _apply_run(args, st)
+    path = st["w"] / "apply-check.json"
+    _atomic_write(path, json.dumps(st["result"], ensure_ascii=False,
+                                   indent=2) + "\n")
+    if args.json:
+        print(json.dumps(st["result"], ensure_ascii=False, indent=2))
+    else:
+        _print_apply_check(st["result"], path)
+    if APPLY_EXIT[st["level"]]:
+        sys.exit(APPLY_EXIT[st["level"]])
+
+
 # --- Dispatch: run one board card via headless Claude (Milestone: agent) ---
 #
 # The dispatcher automates the reader/writer role the Orchestrator does by
@@ -6049,6 +6728,33 @@ def build_parser():
             q.add_argument("--json", action="store_true",
                            help="print the recomputed verdict as JSON")
         q.set_defaults(func=cmd_skill_pick)
+
+    p_apl = sub.add_parser("skill-apply",
+                           help="put a judged candidate live: --check gives "
+                                "ready (0), held (3) or blocked (1) and an "
+                                "approval hash; --approved-hash applies it")
+    p_apl.add_argument("name", help="skill folder name or configured target")
+    p_apl.add_argument("--project", default=None,
+                       help="project folder (default: cwd)")
+    p_apl.add_argument("--global", dest="global_", action="store_true",
+                       help="use the user-level memory at ~/.vurctos")
+    p_apl.add_argument("--workdir", metavar="W", required=True,
+                       help="the work pair that skill-check and skill-eval "
+                            "judged")
+    p_apl.add_argument("--batch", metavar="B",
+                       help="the eval batch name (default: the latest in "
+                            "W/eval/ that is not a probe)")
+    p_apl_do = p_apl.add_mutually_exclusive_group(required=True)
+    p_apl_do.add_argument("--check", action="store_true",
+                          help="print the predicates, the planned changes "
+                               "and the approval hash; change nothing "
+                               "outside W")
+    p_apl_do.add_argument("--approved-hash", metavar="H",
+                          help="the hash --check printed for the result the "
+                               "owner approved")
+    p_apl.add_argument("--json", action="store_true",
+                       help="print the result as JSON")
+    p_apl.set_defaults(func=cmd_skill_apply)
 
     return p
 
